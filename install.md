@@ -51,7 +51,7 @@ magpie plugin add github:<owner>/<repo>
 1. 看板守护进程由插件宿主懒加载拉起，**不一定立刻就绪**（详见 README「生命周期」）。等宿主加载过本插件后，检查 `<magpie 配置目录>/workbuddy-tasks/state/daemon.json` 是否出现（内含 `pid / port / key / version / startedAt`）。
 2. `curl http://127.0.0.1:<port>/api/hello` 返回 `{"name":"workbuddy-tasks",...}`（不需要密钥）；`ready:true` 表示引擎文件齐全。
 3. 带密钥 `GET /api/state`：`accounts` 非空；若 `notice` 提示找不到配置目录，给守护进程设 `MAGPIE_CONFIG_DIR`（Docker 里通常是 `/config/magpie`）后重启 magpie。
-4. 守护进程就绪后打开看板 `http://127.0.0.1:<port>/`（首次访问按提示把 `daemon.json` 里的 `key` 粘进去，存在 sessionStorage）；「立即运行」或工具 `workbuddy_tasks_run` 启动一轮，`workbuddy_tasks_wait` 能看到逐步进度。
+4. 守护进程就绪后打开看板 `http://127.0.0.1:<port>/`（首次访问按提示把 `daemon.json` 里的 `key` 粘进去，存在 sessionStorage）。批量按钮共四个：「批量接任务」（只接取，不点亮）、「批量做任务」（完整流水线：接取 → 点亮 → 领奖）、「只领奖」（补领停在「待领奖」的任务）、「每日签到」（手动补签；自动签到仍归官方插件）。也可用工具 `workbuddy_tasks_run` 启动一轮、`workbuddy_tasks_wait` 看逐步进度。
 
 ## 3. 本地沙箱测试（不碰你真实的 magpie）
 
