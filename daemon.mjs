@@ -12,6 +12,7 @@
 //   WB_CONFIG_DIR   magpie 配置目录（读 plugins.json、账号凭据）
 //   WB_DAEMON_KEY   API 密钥；缺省时生成并写进 daemon.json
 //   WB_DAEMON_PORT  期望端口；缺省 4390，被占用则向后找，再不行用随机端口
+//   WB_DAEMON_ADDR  监听地址；缺省 127.0.0.1（Docker 内可设 0.0.0.0，只到容器网桥）
 //   WB_MANAGED      =1 表示由 magpie 宿主拉起（plugins.json 条目消失时允许自杀）
 //   MAGPIE_ADDR     magpie 网关地址（host:port），如 127.0.0.1:3499
 // 命令行：--addr <host:port|host|:port>  --port <n>  --cfg <dir>  --state <dir>
@@ -54,7 +55,7 @@ const LEG_NAMES = { growth: "成长任务", travel: "猫猫旅行", night: "夜�
 const HISTORY_CAP = 2000
 
 const DEFAULT_SETTINGS = {
-  scheduler: true, // 小时窗口排程总开关
+  scheduler: false, // 小时窗口排程总开关：默认停用，须由用户在看板里显式点一次「启用排程」才生效
   claim: true, // 完成后自动领奖
   legs: ["growth", "travel"], // 手动运行未指定 legs 时的默认腿
   gapMs: 1500, // 账号之间的基础间隔（手动）；排程时 runner 另加 2–5s 抖动
@@ -127,7 +128,9 @@ function parseArgs(argv = process.argv.slice(2)) {
 
 // "0.0.0.0:4390" | "0.0.0.0" | ":4390" | "4390"
 function parseAddr(s, fallbackPort) {
-  let host = "127.0.0.1"
+  // 默认只绑回环；Docker 里容器内回环外部不可达，可用 WB_DAEMON_ADDR 改成 0.0.0.0
+  // （仅暴露到容器网桥，配合 SSH 隧道访问，切勿把该端口发布到公网）
+  let host = String(process.env.WB_DAEMON_ADDR ?? "").trim() || "127.0.0.1"
   let port = fallbackPort
   if (typeof s === "string" && s.trim()) {
     const t = s.trim()

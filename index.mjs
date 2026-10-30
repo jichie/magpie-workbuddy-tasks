@@ -16,6 +16,8 @@
 // 非 off 则 ensureDaemon()（健康则复用，不健康才 spawn detached 守护进程），
 // 并注册退出钩子——若守护进程是本会话拉起的，退场时通知它退出。
 
+import { dirname } from "node:path"
+import { fileURLToPath } from "node:url"
 import {
   DEFAULT_PORT,
   PROVIDER_ID,
@@ -37,11 +39,11 @@ const VERSION = "0.1.0"
 const TOOL_PREFIX = "workbuddy_tasks" // 契约 §6 的工具名前缀（magpie 还会加上插件短名前缀）
 
 // 本文件自己的目录（daemon.mjs 与它同目录）
+// 注意：返回的是「目录」，不是 daemon.mjs 的路径——ensureDaemon 会在其下再 join "daemon.mjs"。
+// 早先这里把 ./daemon.mjs 的 URL 直接当目录返回，导致真实宿主里拼出 …/daemon.mjs/daemon.mjs。
 function hereDir() {
   try {
-    const raw = decodeURIComponent(new URL("./daemon.mjs", import.meta.url).href.replace(/^file:\/\//, ""))
-    if (process.platform === "win32") return raw.replace(/^\//, "").replace(/\//g, "\\")
-    return raw
+    return dirname(fileURLToPath(import.meta.url))
   } catch {
     return "."
   }
@@ -167,9 +169,11 @@ export const WorkBuddyTasksPlugin = async (input, options) => {
 
   // 用户在 plugins.json options 里可写 dashboardUrl（给 page 入口卡跳转看板用）
   const dashboardUrl = typeof options?.dashboardUrl === "string" ? options.dashboardUrl : ""
+  // Docker 里容器内回环外部不可达：options.listenAddress 可写 "0.0.0.0"（只到容器网桥）
+  const listenAddress = typeof options?.listenAddress === "string" ? options.listenAddress.trim() : ""
 
   // 拉起守护进程（不阻塞插件加载太久：ensureDaemon 自带 8s 预算，失败也不炸）
-  const boot = ensureDaemon({ cfgDir, pluginDir: dir, log })
+  const boot = ensureDaemon({ cfgDir, pluginDir: dir, log, addr: listenAddress })
     .then((r) => {
       if (r?.error) log("守护进程：" + r.error)
       else if (r?.info) log(`守护进程就绪：127.0.0.1:${r.info.port}${r.spawned ? "（本次拉起）" : "（复用已有）"}`)
@@ -187,7 +191,7 @@ export const WorkBuddyTasksPlugin = async (input, options) => {
     const r = await boot
     if (r?.info) return r.info
     // 第一次没起来，给一次快速重试的机会
-    const retry = await ensureDaemon({ cfgDir, pluginDir: dir, log, budgetMs: 3000 }).catch(() => null)
+    const retry = await ensureDaemon({ cfgDir, pluginDir: dir, log, budgetMs: 3000, addr: listenAddress }).catch(() => null)
     if (retry?.info) return retry.info
     return null
   })

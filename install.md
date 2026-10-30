@@ -53,6 +53,25 @@ magpie plugin add github:<owner>/<repo>
 3. 带密钥 `GET /api/state`：`accounts` 非空；若 `notice` 提示找不到配置目录，给守护进程设 `MAGPIE_CONFIG_DIR`（Docker 里通常是 `/config/magpie`）后重启 magpie。
 4. 守护进程就绪后打开看板 `http://127.0.0.1:<port>/`（首次访问按提示把 `daemon.json` 里的 `key` 粘进去，存在 sessionStorage）。批量按钮共四个：「批量接任务」（只接取，不点亮）、「批量做任务」（完整流水线：接取 → 点亮 → 领奖）、「只领奖」（补领停在「待领奖」的任务）、「每日签到」（手动补签；自动签到仍归官方插件）。也可用工具 `workbuddy_tasks_run` 启动一轮、`workbuddy_tasks_wait` 看逐步进度。
 
+## 2b. Docker 里跑 magpie（实测环境：ghcr.io/yetone/magpie，配置卷 /config）
+
+文件夹插件必须存在于**容器可见的目录**里。数据卷在宿主机是 `<卷>/config`，容器内是 `/config`：
+
+```bash
+# 从宿主机把插件目录放进配置卷（用 docker exec 以 uid 65532 写入，避免权限问题）
+tar cf - magpie-workbuddy-tasks | docker exec -i magpie sh -c \
+  'mkdir -p /config/magpie/plugins-local && tar xf - -C /config/magpie/plugins-local'
+docker exec magpie magpie plugin add /config/magpie/plugins-local/magpie-workbuddy-tasks
+```
+
+看板默认只听 `127.0.0.1`——那是**容器自己的**回环，宿主机和其他机器都进不去。两种办法：
+
+- 在「插件 → 已安装 → 选项」里把 `listenAddress` 设为 `"0.0.0.0"`：守护进程改听容器网桥地址（如 `172.17.x.x:4390`），只在该网桥内可达，**没有** `-p` 发布就不出宿主机；再从你自己的电脑打一条隧道看网页：
+  `ssh -L 4390:172.17.x.x:4390 <nas-user>@<nas-host>` → 浏览器开 `http://127.0.0.1:4390/`，密钥见容器内 `/config/magpie/workbuddy-tasks/state/daemon.json` 的 `key`。
+- 或者重建容器加 `-p 127.0.0.1:4390:4390`（把容器 4390 映射到宿主机回环），同样只走 SSH 隧道访问。
+
+`MAGPIE_CONFIG_DIR` 在容器里通常是 `/config/magpie`；插件的 `input.directory` 会直接给出该路径，一般不用设。别把这个端口发布到公网或开放的 LAN——看板能驱动你已登录的 WorkBuddy 账号。
+
 ## 3. 本地沙箱测试（不碰你真实的 magpie）
 
 给 magpie 一个独立的 HOME，像官方文档那样：

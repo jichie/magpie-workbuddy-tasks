@@ -170,7 +170,7 @@ export function interpreter() {
 //   off      —— control.json.desired === 'off'，宿主不该拉起
 //   spawned  —— 本次是否由我们 spawn（exit 钩子据此决定要不要叫它退场）
 //   info     —— 就绪守护进程的 {pid,port,key,...}；没就绪时为 null
-export async function ensureDaemon({ cfgDir, pluginDir, log = () => {}, budgetMs = SPAWN_BUDGET_MS } = {}) {
+export async function ensureDaemon({ cfgDir, pluginDir, log = () => {}, budgetMs = SPAWN_BUDGET_MS, addr = "" } = {}) {
   if (!cfgDir) {
     return { info: null, spawned: false, error: "无法定位 magpie 配置目录（可设 MAGPIE_CONFIG_DIR 环境变量）" }
   }
@@ -203,6 +203,7 @@ export async function ensureDaemon({ cfgDir, pluginDir, log = () => {}, budgetMs
     WB_STATE_DIR: stateDir,
     WB_DAEMON_KEY: key,
     WB_DAEMON_PORT: String(port),
+    ...(addr ? { WB_DAEMON_ADDR: String(addr) } : {}),
     WB_MANAGED: "1", // 由 magpie 宿主拉起：plugins.json 里条目消失时允许自杀
   }
   let child
