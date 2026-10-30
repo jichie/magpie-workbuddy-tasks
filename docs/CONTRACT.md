@@ -114,17 +114,27 @@ class JobRunner {
 ## 3. daemon HTTP API（前端唯一依赖；全部 JSON；除 `/api/hello` 外都要 key）
 
 鉴权：`Authorization: Bearer <daemon key>` 或 `?k=<daemon key>`；key 由 `index.mjs` 生成存 `state/daemon.json`。
-绑定：`127.0.0.1` 默认；`--addr 0.0.0.0` 才对外（README 强调只在局域网/VPN 用）。
+绑定：`127.0.0.1` 默认；链路 `options.listenAddress → WB_DAEMON_ADDR → --addr`，设 `0.0.0.0`/`::` 才对外
+（README 强调只在局域网/VPN 用；真实绑定 host 由 daemon 心跳写进 `daemon.json` 的 `host`，三处日志/提示同口径）。
 
 ```
 GET  /api/hello                 -> {name, version, ready}
-GET  /api/state                 -> {accounts:[{uid,nickname,masked,domain,expiresInMs,expiresInDays,tasksEnabled,eligible,
+GET  /api/state                 -> {bindHost, port, reachableHint,
+                                    accounts:[{uid,nickname,masked,domain,expiresInMs,expiresInDays,tasksEnabled,eligible,
                                              snapshot:{tasks:[{code,title,acceptStatus,progress:{current,target},
                                              rewardCredit,rewardEnergy,jumpUrl,taskType}],energy,streak,days,updatedISO}}],
                                     scheduler:{enabled,nextRuns[[leg,hour]],lastCycle,
                                                holds:[{uid,nickname,releasedAt}]},
                                     job:Job|null, stats:{creditsToday,energyToday,runs},
                                     settings:{claim,legs,gapMs,hours:{...},host:{chat,bill,web}}}
+                                    // bindHost/port/reachableHint：守护进程真实绑定的 host 与端口
+                                    // （host 来自 daemon.json，由 daemon 心跳写入；port 为实际绑定端口，
+                                    // 被占用顺延后可能与配置值不同）。bindHost 为 0.0.0.0/:: 时
+                                    // reachableHint = 「仅容器网桥/局域网可达，请用 SSH 隧道或局域网地址访问，
+                                    // 切勿发布到公网」（lifecycle.bindHint 的同一句口径），否则为 ""。
+                                    // 前端拼可点开的看板地址用 bindHost:port；**绝不把 daemon key
+                                    // 放进任何响应、页面或日志**——key 只存在 state/daemon.json（0600），
+                                    // 看板拿到后只存浏览器 sessionStorage，不得回显到 URL 或导出。
                                     // snapshot.tasks 的字段名 = §2 的规范 Task（daemon 只做投影，不猜第二种拼写）；
                                     // acceptStatus 是上游字符串状态（"not_accepted"|"accepted"|"completed"|"claimed"）
                                     // scheduler.holds = 真正的风控冷却名单（403/11140），不是「没进 job 的账号」；

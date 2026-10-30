@@ -21,6 +21,7 @@ import { fileURLToPath } from "node:url"
 import {
   DEFAULT_PORT,
   PROVIDER_ID,
+  bindHint,
   daemonKey,
   ensureDaemon,
   interpreter,
@@ -173,10 +174,17 @@ export const WorkBuddyTasksPlugin = async (input, options) => {
   const listenAddress = typeof options?.listenAddress === "string" ? options.listenAddress.trim() : ""
 
   // 拉起守护进程（不阻塞插件加载太久：ensureDaemon 自带 8s 预算，失败也不炸）
+  // A：就绪日志打印真实绑定地址（daemon.json 的 host，由 daemon 心跳写入），
+  // 绑定 0.0.0.0/:: 时补一句与 daemon 启动日志 / reachableHint 相同口径的提示。
   const boot = ensureDaemon({ cfgDir, pluginDir: dir, log, addr: listenAddress })
     .then((r) => {
       if (r?.error) log("守护进程：" + r.error)
-      else if (r?.info) log(`守护进程就绪：127.0.0.1:${r.info.port}${r.spawned ? "（本次拉起）" : "（复用已有）"}`)
+      else if (r?.info) {
+        const bindHost = r.info.host || "127.0.0.1"
+        log(`守护进程就绪：${bindHost}:${r.info.port}${r.spawned ? "（本次拉起）" : "（复用已有）"}`)
+        const hint = bindHint(bindHost)
+        if (hint) log(`监听 ${bindHost}:${r.info.port}：${hint}`)
+      }
       return r
     })
     .catch((e) => ({ info: null, spawned: false, error: short(e) }))
@@ -450,5 +458,6 @@ export const _internal = {
   fmtTasks,
   makeDaemonClient,
   hereDir,
+  bindHint,
   _sleepUntil: sleepUntil,
 }

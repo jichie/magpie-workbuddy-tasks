@@ -106,7 +106,16 @@ export function readDaemonInfo(stateDir) {
     if (!raw || typeof raw !== "object") return null
     const port = Number(raw.port)
     if (!raw.pid || !Number.isFinite(port) || port <= 0) return null
-    return { pid: Number(raw.pid), port, key: String(raw.key ?? ""), version: raw.version, startedAt: raw.startedAt }
+    return {
+      pid: Number(raw.pid),
+      port,
+      key: String(raw.key ?? ""),
+      version: raw.version,
+      startedAt: raw.startedAt,
+      // daemon 实际绑定的 host（daemon.mjs 心跳写入）；旧版 daemon.json 没有该
+      // 字段时按默认绑定 127.0.0.1 读，保证宿主日志不会把通配绑定误报成回环。
+      host: typeof raw.host === "string" && raw.host ? raw.host : "127.0.0.1",
+    }
   } catch {
     return null
   }
@@ -118,6 +127,24 @@ export function writeDaemonInfo(stateDir, info) {
 
 export function daemonKey() {
   return randomBytes(24).toString("base64url")
+}
+
+// ---- 绑定地址口径（A/B 共用，三处一致） ---------------------------------
+//
+// daemon 实际绑定的 host 由 daemon.mjs 写进 daemon.json（readDaemonInfo 读出），
+// 以下三处必须用同一句话，避免「日志说 127.0.0.1、实际绑 0.0.0.0」这类误导：
+//   1. daemon.mjs 启动日志（「监听 <host>:<port>：<提示>」）
+//   2. index.mjs 宿主日志（ensureDaemon 就绪后同格式补一句）
+//   3. /api/state 顶层 reachableHint（前端展示用，见 docs/CONTRACT.md §3）
+export const WILDCARD_HINT = "仅容器网桥/局域网可达，请用 SSH 隧道或局域网地址访问，切勿发布到公网"
+
+export function isWildcardHost(host) {
+  const h = String(host ?? "").trim()
+  return h === "0.0.0.0" || h === "::"
+}
+
+export function bindHint(host) {
+  return isWildcardHost(host) ? WILDCARD_HINT : ""
 }
 
 // ---- 进程与健康探测 ----------------------------------------------------

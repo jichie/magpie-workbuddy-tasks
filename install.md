@@ -36,6 +36,15 @@ git push -u origin main
 magpie plugin add github:<owner>/<repo>
 ```
 
+> **首次 add 可能提示 `the plugin's load didn't finish in 20s` —— 冷启动一次性开销，不是插件坏了。**
+> magpie 的插件宿主给每个插件 **20 s** 的加载时限（宿主代码 `loadWait = 20 * 1000`），而首次加载时
+> Bun 运行时要**现场从 npm 源拉取 `@opencode-ai/plugin`**（注册工具必须用它，插件自身零依赖也要走这一步）。
+> 在群晖 Docker（x86_64，magpie v0.1.1876）实测：冷缓存首次解析 **45.5 s**，热缓存 **23 ms**；
+> 本插件自身的 `import index.mjs` 仅 12 ms、工厂函数仅 4 ms（守护进程已在跑的复用路径），都不是瓶颈。
+> 第一次 add 超时后，Bun 的拉取仍在后台完成并写入缓存，**再 add 一次（或在插件管理里停用→启用一次）即可
+> 正常加载**（provider `workbuddy-tasks` + 5 个工具全部注册成功）。全新环境还可能先下载插件运行用的
+> Bun 本体（实测一次 ~60 s，且 GitHub 下载偶发失败需重试），同样只需一次。
+
 然后在 magpie 应用里打开「**插件管理**」，**启用**本插件（安装后若未自动启用）。启用后：
 
 - 侧栏「插件」分组出现「**WorkBuddy 任务**」入口卡；
@@ -66,8 +75,8 @@ docker exec magpie magpie plugin add /config/magpie/plugins-local/magpie-workbud
 
 看板默认只听 `127.0.0.1`——那是**容器自己的**回环，宿主机和其他机器都进不去。两种办法：
 
-- 在「插件 → 已安装 → 选项」里把 `listenAddress` 设为 `"0.0.0.0"`：守护进程改听容器网桥地址（如 `172.17.x.x:4390`），只在该网桥内可达，**没有** `-p` 发布就不出宿主机；再从你自己的电脑打一条隧道看网页：
-  `ssh -L 4390:172.17.x.x:4390 <nas-user>@<nas-host>` → 浏览器开 `http://127.0.0.1:4390/`，密钥见容器内 `/config/magpie/workbuddy-tasks/state/daemon.json` 的 `key`。
+- 在「插件 → 已安装 → 选项」里把 `listenAddress` 设为 `"0.0.0.0"`：守护进程会绑定容器内**所有接口**（`0.0.0.0`），宿主机只能经**容器网桥 IP** 访问（用 `docker inspect magpie` 查容器 IP，如 `172.17.x.x` / `172.31.x.x`）——**没有** `-p` 发布就不出宿主机。改完后 `GET /api/state` 会带 `bindHost:"0.0.0.0"` 与 `reachableHint`（提示只到容器网桥、走 SSH 隧道）。再从你自己的电脑打一条隧道看网页：
+  `ssh -L 4390:<容器IP>:4390 <nas-user>@<nas-host>` → 浏览器开 `http://127.0.0.1:4390/`，密钥见容器内 `/config/magpie/workbuddy-tasks/state/daemon.json` 的 `key`（**不要**把 key 贴进 URL 分享给别人）。
 - 或者重建容器加 `-p 127.0.0.1:4390:4390`（把容器 4390 映射到宿主机回环），同样只走 SSH 隧道访问。
 
 `MAGPIE_CONFIG_DIR` 在容器里通常是 `/config/magpie`；插件的 `input.directory` 会直接给出该路径，一般不用设。别把这个端口发布到公网或开放的 LAN——看板能驱动你已登录的 WorkBuddy 账号。

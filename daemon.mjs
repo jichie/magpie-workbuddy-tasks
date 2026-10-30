@@ -32,6 +32,7 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 import {
   DEFAULT_PORT,
   PLUGIN_NAME,
+  bindHint,
   pidAlive,
   probeDaemon,
   readControl,
@@ -127,7 +128,8 @@ function parseArgs(argv = process.argv.slice(2)) {
 }
 
 // "0.0.0.0:4390" | "0.0.0.0" | ":4390" | "4390"
-function parseAddr(s, fallbackPort) {
+// host 优先级：--addr 里的 host > WB_DAEMON_ADDR > 127.0.0.1（导出仅供测试断言链路）
+export function parseAddr(s, fallbackPort) {
   // 默认只绑回环；Docker 里容器内回环外部不可达，可用 WB_DAEMON_ADDR 改成 0.0.0.0
   // （仅暴露到容器网桥，配合 SSH 隧道访问，切勿把该端口发布到公网）
   let host = String(process.env.WB_DAEMON_ADDR ?? "").trim() || "127.0.0.1"
@@ -240,6 +242,12 @@ export async function startDaemon(opts = {}) {
   const accountsFile = join(stateDir, "accounts.json") // uid -> tasksEnabled 布尔（/api/account/toggle 写入）
 
   let settings = { ...DEFAULT_SETTINGS, ...readJson(settingsFile, {}) }
+  // 安全默认（C1）：settings.json 缺失或损坏时 readJson 落 {}，scheduler 按
+  // DEFAULT_SETTINGS 回落 false——装好插件不会自动打上游；再把两枚布尔开关
+  // 钉成真布尔，手改文件写出的 truthy 垃圾（如 "yes"）也开不了排程/自动领奖，
+  // 只有 POST /api/settings（校验 boolean）或看板开关能显式打开。
+  settings.scheduler = settings.scheduler === true
+  settings.claim = settings.claim === true
   settings.hours = { ...DEFAULT_SETTINGS.hours, ...(settings.hours ?? {}) }
   settings.host = { ...DEFAULT_SETTINGS.host, ...(settings.host ?? {}) }
   let snapshots = readJson(snapshotsFile, {})
@@ -793,6 +801,12 @@ export async function startDaemon(opts = {}) {
     const accts = loadAccountsAll()
     const cur = runner?.current?.() ?? null
     const payload = {
+      // 绑定信息（B）：前端展示可点开的看板地址用；bindHost 是真实监听 host，
+      // 绑定 0.0.0.0/:: 时 reachableHint 提示 SSH 隧道/局域网地址（否则空串）。
+      // 口径与 lifecycle.bindHint 一致；key 绝不出现在任何响应里。
+      bindHost: host,
+      port,
+      reachableHint: bindHint(host),
       accounts: accts.map(accountRow),
       scheduler: {
         enabled: !!settings.scheduler,
@@ -1217,7 +1231,8 @@ export async function startDaemon(opts = {}) {
   }
 
   function heartbeat() {
-    writeDaemonInfo(stateDir, { pid: process.pid, port, key, version: VERSION, startedAt })
+    // host 一并落盘：index.mjs 的宿主日志与 /api/state 由此读出真实绑定地址（A）
+    writeDaemonInfo(stateDir, { pid: process.pid, port, key, version: VERSION, startedAt, host })
     try {
       writeFileSync(join(stateDir, "daemon.heartbeat"), String(now()), "utf8")
     } catch {}
@@ -1342,6 +1357,9 @@ export async function startDaemon(opts = {}) {
   }
 
   log(`守护进程就绪：http://${host}:${port}（state: ${stateDir}）`)
+  // A：绑定为通配地址时必须给出明确提示（与 index.mjs / reachableHint 同一句口径）
+  const bindWarn = bindHint(host)
+  if (bindWarn) log(`监听 ${host}:${port}：${bindWarn}`)
   if (!engine?.ok) log("[warn] " + engineErrorsText())
 
   return {
@@ -1385,6 +1403,7 @@ if (isMain) {
   startDaemon({ log })
     .then((h) => {
       log(`看板地址：http://${h.host}:${h.port}/  （API 需要密钥，见 state/daemon.json）`)
+      // 通配绑定的提示由 startDaemon 的启动日志统一给出，这里不再重复
       const bye = (sig) => () => {
         log(`收到 ${sig}，退出`)
         h.stop()

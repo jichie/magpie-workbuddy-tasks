@@ -558,13 +558,19 @@ describe("生命周期", () => {
     const stateDir = tmpState()
     const { h, engine } = await boot({ stateDir })
     try {
+      // 安全默认（C1）：scheduler 缺省 false，tick 一律不动 —— 先显式开启再验窗口逻辑
+      const st = await post(h.port, "/api/settings", { scheduler: true }, KEY)
+      assert.equal(st.status, 200)
+      assert.equal((await st.json()).scheduler, true)
+
       const d = new Date()
       const job = h.ticks.checkScheduler(d.getTime())
       const hour = d.getHours()
       if ([9, 21, 1].includes(hour)) {
         assert.ok(job, `小时 ${hour} 在默认窗口内应触发`)
         assert.ok(job.id)
-        // 同一窗口再 tick：要么 busy 让路、要么 fired 已标记，都不应再启动
+        for (let i = 0; i < 100 && h.runner.current(); i++) await tick()
+        // 同一窗口再 tick：job 已结束，只能是 fired 已标记 —— 不应再启动
         const again = h.ticks.checkScheduler(d.getTime() + 1000)
         assert.ok(again === null)
       } else {

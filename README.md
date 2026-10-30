@@ -56,6 +56,10 @@ git push -u origin main
 magpie plugin add github:<owner>/magpie-workbuddy-tasks
 ```
 
+> **首次 add 若提示 `the plugin's load didn't finish in 20s`**：是冷启动一次性开销（Bun 首次要现场从 npm
+> 拉取 `@opencode-ai/plugin` 供工具注册用，群晖容器实测冷 45.5 s / 热 23 ms，超了宿主 20 s 加载时限），
+> 拉取会在后台完成并进缓存——**再 add 一次或停用→启用一次即可**，详见 install.md 的计时数据。
+
 然后在 magpie 的「插件管理」里**启用**本插件（安装后若未自动启用）。启用后：
 
 - 侧栏「插件」分组会出现「**WorkBuddy 任务**」入口卡（magpie 沙箱页，显示守护进程状态与看板地址）；
@@ -72,7 +76,8 @@ magpie plugin add github:<owner>/magpie-workbuddy-tasks
 
 ## 看板、密钥与局域网安全
 
-- 看板默认 `http://127.0.0.1:4390/`。端口被占用时自动顺延（最多 +9，再不行用随机端口），**实际端口写在 `state/daemon.json` 的 `port` 里**。
+- 看板默认 `http://127.0.0.1:4390/`。端口被占用时自动顺延（最多 +9，再不行用随机端口），**实际端口写在 `state/daemon.json` 的 `port` 里**（实际绑定的 host 也在同一文件的 `host` 里）。
+- `GET /api/state` 顶层带 `bindHost` / `port` / `reachableHint` 三个字段，供前端拼可点开的看板地址：绑定 `0.0.0.0`/`::` 时 `reachableHint` 明确提示「仅容器网桥/局域网可达，请用 SSH 隧道或局域网地址访问，切勿发布到公网」，否则为空串。**daemon key 绝不出现在任何接口响应里**——看板从 `state/daemon.json` 读一次 key 后只存浏览器 sessionStorage。
 - 除 `GET /api/hello` 外所有 API 都要密钥：`Authorization: Bearer <key>` 或 `?k=<key>`。密钥由插件生成，存在 `<magpie 配置目录>/workbuddy-tasks/state/daemon.json`（POSIX 上权限 600）。
 - 看板页面把密钥存在浏览器 **sessionStorage**（只发往本机守护进程；关掉标签页即失效，主题偏好才用 localStorage）。
 - 守护进程**默认只绑定 127.0.0.1**。想用手机在沙发上看板，才需要显式开放：
