@@ -2,7 +2,11 @@
 //
 // 数据面（只消费 daemon.mjs 真实存在的路由，绝不发明接口）：
 //   GET  /api/hello            -> {name, version, ready}
-//   GET  /api/state[?refresh=1|<uid>] -> {accounts, scheduler, job, stats, settings, notice?, engineErrors?}
+//   GET  /api/state[?refresh=1|<uid>] -> {bindHost, port, reachableHint,
+//                                        accounts, scheduler, job, stats, settings, notice?, engineErrors?}
+//        顶层 bindHost/port/reachableHint = 真实监听 host、实际端口（顺延后真值）与通绑定提示
+//        （bindHost 为 0.0.0.0/:: 时非空）——顶栏「看板地址」项据此渲染；老后端缺字段时回退
+//        页面自身 origin，绝不报错（见 addrModel）
 //        scheduler.holds = [{uid, nickname, releasedAt(ISO)}] —— 真正的风控冷却（403/11140）名单
 //        accounts[].tasksEnabled 可写（见 /api/account/toggle）；snapshot.tasks[] 为规范化
 //        camelCase：{code,title,acceptStatus,progress:{current,target},rewardCredit,rewardEnergy,
@@ -362,6 +366,125 @@ async function copyText(text) {
 
 // ---- 顶栏渲染 -----------------------------------------------------------------------------
 
+// ---- 看板地址（消费 /api/state 顶层 bindHost / port / reachableHint） --------------------
+// 三种分支（CONTRACT §3 口径）：
+//   loopback：reachableHint 为 ""（回环绑定）→ http://<bindHost>:<port>/ + 复制按钮
+//   wildcard：reachableHint 非空（通绑定，典型 Docker/NAS）→ 占位地址 + hint 全文 +
+//             docker inspect / ssh -L 命令模板（各带复制按钮）。0.0.0.0 是监听值不是
+//             访问值，绝不渲染成可点地址。
+//   fallback：老后端三字段 undefined → 回退页面自身 origin（看板由守护进程同源服务），
+//             再兜底默认端口 4390；绝不报错。
+// key 永不进地址 / 复制内容 / title：地址项只显示 http://host:port/ 路径。
+
+const DEFAULT_PORT = 4390;
+const KEY_NOTE = "密钥在 state/daemon.json，请勿贴进链接分享";
+
+function isWildcardBind(host) {
+  return host === "0.0.0.0" || host === "::";
+}
+function hostForUrl(host) {
+  return host.includes(":") ? `[${host}]` : host; // IPv6 字面量要加方括号
+}
+
+// 纯函数：/api/state payload → {mode, url, port, hint, bindHost, docker}。
+// 导出仅为 Node 下单元验证；浏览器里 <script type="module"> 不受影响。
+export function addrModel(d) {
+  const rawPort = Number(d?.port);
+  const port = Number.isFinite(rawPort) && rawPort > 0 ? rawPort : null;
+  const bindHost = typeof d?.bindHost === "string" && d.bindHost.trim() ? d.bindHost.trim() : "";
+  const hint = typeof d?.reachableHint === "string" ? d.reachableHint.trim() : null;
+  if (port == null || !bindHost || hint == null) {
+    // 老后端：字段缺失 → 用当前页面 origin（就是用户正在访问的真实地址），
+    // 非浏览器环境或 file:// 等再兜底默认端口，任何情况都不抛错。
+    let url = "";
+    try {
+      if (typeof location !== "undefined" && (location.protocol === "http:" || location.protocol === "https:")) {
+        url = `${location.origin}/`;
+      }
+    } catch {}
+    return { mode: "fallback", url: url || `http://127.0.0.1:${DEFAULT_PORT}/`, port, hint: "", bindHost, docker: false };
+  }
+  if (hint || isWildcardBind(bindHost)) {
+    return {
+      mode: "wildcard",
+      url: `http://<本机可达地址>:${port}/`,
+      port,
+      hint,
+      bindHost,
+      docker: bindHost === "0.0.0.0", // docker inspect 模板只对 0.0.0.0 给
+    };
+  }
+  return { mode: "loopback", url: `http://${hostForUrl(bindHost)}:${port}/`, port, hint: "", bindHost, docker: false };
+}
+
+function renderAddr() {
+  const box = $("#addrBox");
+  if (!box) return;
+  if (!state.data || state.conn !== "online") {
+    box.hidden = true;
+    box.replaceChildren();
+    return;
+  }
+  const m = addrModel(state.data);
+
+  const copyBtn = (text, label) =>
+    el("button", {
+      type: "button",
+      class: "mini-btn",
+      text: "复制",
+      "aria-label": `复制${label}`,
+      onclick: async (ev) => {
+        const ok = await copyText(text);
+        toast(ok ? `已复制：${text}` : "复制失败，请手动选择文本复制。", ok ? "info" : "warn", 6500);
+        ev.target.blur();
+      },
+    });
+
+  const rows = [];
+  if (m.mode !== "wildcard") {
+    rows.push(
+      el("div", { class: "addr-row" },
+        el("span", { class: "label", text: "看板地址" }),
+        el("code", { class: "addr-url", text: m.url }),
+        copyBtn(m.url, "看板地址"),
+        el("span", { class: "addr-note", text: KEY_NOTE }),
+      ),
+    );
+  } else {
+    rows.push(
+      el("div", { class: "addr-row" },
+        el("span", { class: "label", text: "看板地址" }),
+        el("code", { class: "addr-url", text: m.url }),
+        el("span", {
+          class: "addr-note",
+          text: `把 <本机可达地址> 换成容器 IP 或局域网地址；SSH 隧道映射后仍可用 http://127.0.0.1:${m.port}/ 打开`,
+        }),
+      ),
+      el("div", { class: "addr-row" },
+        el("span", { class: "addr-note", text: m.hint ? `${m.hint} · ${KEY_NOTE}` : KEY_NOTE }),
+      ),
+    );
+    if (m.docker) {
+      const ipCmd = 'docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" magpie';
+      const sshCmd = `ssh -L ${m.port}:<容器IP>:${m.port} <user>@<NAS地址>`;
+      rows.push(
+        el("div", { class: "addr-row" },
+          el("span", { class: "addr-note", text: "查容器 IP" }),
+          el("code", { class: "addr-cmd", text: ipCmd }),
+          copyBtn(ipCmd, "查容器 IP 命令"),
+        ),
+        el("div", { class: "addr-row" },
+          el("span", { class: "addr-note", text: "SSH 隧道" }),
+          el("code", { class: "addr-cmd", text: sshCmd }),
+          copyBtn(sshCmd, "SSH 隧道命令"),
+        ),
+      );
+    }
+  }
+  box.replaceChildren(...rows);
+  box.hidden = false;
+}
+
 function jobMentionsRisk(job) {
   if (!job) return false;
   const inSteps = (job.steps || []).some((s) => /风控|restricted/i.test(String(s.detail ?? "")));
@@ -425,6 +548,8 @@ function renderTop() {
   if (state.hello) {
     sub.textContent = `看板 · v${state.hello.version}${state.hello.ready ? "" : " · 引擎未就绪"}`;
   }
+
+  renderAddr();
 }
 
 // ---- 账号区 -------------------------------------------------------------------------------

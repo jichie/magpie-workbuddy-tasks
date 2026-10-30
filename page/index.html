@@ -40,6 +40,11 @@
         地址来自插件选项 <code>dashboardUrl</code>（magpie 插件页可改）。看板 API 需要守护进程密钥：
         在地址后加 <code>?k=&lt;key&gt;</code> 打开，密钥在
         <code>&lt;magpie 配置目录&gt;/workbuddy-tasks/state/daemon.json</code> 的 <code>key</code> 字段（权限 0600，实际端口同文件）。
+        密钥请勿贴进链接分享。
+      </p>
+      <p class="wb-hint" id="tunnelHint" hidden>
+        magpie 跑在 NAS/容器里、你用 SSH 隧道访问？隧道映射后仍可用
+        <code id="tunnelUrl">127.0.0.1:4390</code> 打开看板，无需改 <code>dashboardUrl</code>。
       </p>
     </section>
 
@@ -53,6 +58,23 @@
             （写 <code>control.json desired=on</code>），<strong>关闭插件</strong>即优雅退出
             （<code>desired=off</code>）。看板顶栏也有「停止守护进程」按钮（<code>POST /api/shutdown</code>）；
             浏览器无法启动本机进程，需要手动拉起时在插件目录执行 <code>node daemon.mjs</code>。
+          </p>
+        </div>
+      </details>
+      <details class="wb-details">
+        <summary>Docker / NAS 部署怎么打开看板</summary>
+        <div class="wb-detail-body">
+          <p class="wb-p">
+            守护进程默认只绑 <code>127.0.0.1</code>；容器里需要对外时用选项 <code>listenAddress</code>
+            或 <code>--addr</code> 绑 <code>0.0.0.0</code>。此时看板仅容器网桥/局域网可达，
+            请用 SSH 隧道或局域网地址访问，切勿发布到公网（<code>0.0.0.0</code> 是监听值，不是可打开的地址）。
+          </p>
+          <p class="wb-p">
+            查容器 IP：<code>docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" magpie</code>；
+            建隧道：<code>ssh -L &lt;port&gt;:&lt;容器IP&gt;:&lt;port&gt; &lt;user&gt;@&lt;NAS地址&gt;</code>，
+            映射后仍可用 <code>http://127.0.0.1:&lt;port&gt;/</code> 打开。实际端口与绑定 host 由守护进程写在
+            <code>state/daemon.json</code>，看板顶栏「看板地址」会按真实绑定给出同一组提示。
+            密钥在 <code>state/daemon.json</code>，请勿贴进链接分享。
           </p>
         </div>
       </details>

@@ -207,6 +207,7 @@
 :where(.wb-details summary:hover) { color: var(--wb-ink); background: var(--wb-bg2); }
 :where(.wb-details[open] summary) { border-bottom: 1px solid var(--wb-line); }
 :where(.wb-detail-body) { padding: 10px 12px; }
+:where(.wb-detail-body .wb-p + .wb-p) { margin-top: 8px; }
 
 :where(.wb-foot) {
   border-top: 1px solid var(--wb-line);

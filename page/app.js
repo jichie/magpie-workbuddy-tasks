@@ -44,6 +44,30 @@
     var link = $("#dashLink");
     if (code) code.textContent = url;
     if (link) link.setAttribute("href", url);
+    updateTunnelHint(url);
+  }
+
+  // dashboardUrl 写的是回环地址（127.0.0.1/localhost/::1）时提示 SSH 隧道用法：
+  // 隧道映射后仍可用 127.0.0.1:<port> 打开，无需改选项。非回环地址或解析失败
+  // 一律静默隐藏，不炸页面（沙箱页零网络、零报错的纪律不变）。
+  function updateTunnelHint(url) {
+    var hint = $("#tunnelHint");
+    if (!hint) return;
+    var port = "";
+    try {
+      var u = new URL(url);
+      var h = u.hostname;
+      if (h === "127.0.0.1" || h === "localhost" || h === "[::1]" || h === "::1") {
+        port = u.port || (u.protocol === "https:" ? "443" : "80");
+      }
+    } catch (e) { port = ""; }
+    if (!port) {
+      hint.hidden = true;
+      return;
+    }
+    var code = $("#tunnelUrl");
+    if (code) code.textContent = "127.0.0.1:" + port;
+    hint.hidden = false;
   }
 
   // ---- 复制（clipboard API 在沙箱里可能被拒 → execCommand 兜底） ------------------

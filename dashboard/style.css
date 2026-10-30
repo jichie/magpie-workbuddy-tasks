@@ -174,6 +174,25 @@ a:hover { text-decoration-color: var(--ink3); }
 .stats dt { font-size: 11px; color: var(--ink3); letter-spacing: .04em; }
 .stats dd { font-family: var(--font-mono); font-size: 13px; color: var(--ink); margin: 0; }
 
+/* 看板地址（顶栏第二行）：消费 /api/state 的 bindHost/port/reachableHint。
+   沿用 hairline 分隔 + 次要文字 + code 底纹，不引入新配色。 */
+.addr {
+  flex-basis: 100%;
+  display: grid;
+  gap: 4px;
+  border-top: 1px solid var(--line);
+  margin-top: -6px;
+  padding-top: 8px;
+  font-size: 12.5px;
+  color: var(--ink2);
+}
+.addr[hidden] { display: none; }
+.addr-row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.addr-row .label { letter-spacing: .04em; }
+.addr-url { color: var(--ink); }
+.addr-cmd { color: var(--ink2); max-width: 100%; }
+.addr-note { font-size: 11.5px; color: var(--ink3); }
+
 /* ---- 按钮 / 输入 ------------------------------------------------------------- */
 
 .btn, .btn-quiet {
@@ -674,6 +693,7 @@ dialog::backdrop { background: rgba(0, 0, 0, .35); }
   .topbar { padding: 10px 14px; gap: 10px; }
   .topbar-meta { order: 3; flex-basis: 100%; }
   .topbar-actions { margin-left: auto; }
+  .addr { order: 4; }
   .main { padding: 14px 12px 48px; }
   .card { padding: 14px; }
   .batch-actions { margin-left: 0; }

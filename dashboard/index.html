@@ -31,6 +31,9 @@
       <button type="button" class="btn-quiet" id="daemonStartBtn">启动命令</button>
       <button type="button" class="btn-warn-quiet btn-quiet" id="daemonStopBtn">停止守护进程</button>
     </div>
+    <!-- 看板地址：连上守护进程后由 app.js 按 /api/state 的 bindHost/port/reachableHint 渲染；
+         key 永不进入地址、复制内容与 title（地址只显示 http://host:port/）。 -->
+    <div class="addr" id="addrBox" hidden aria-label="看板地址"></div>
   </header>
 
   <main id="main" class="main">
