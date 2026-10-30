@@ -1,0 +1,16 @@
+# 依赖（本插件零运行时依赖，这里只防本地误装）
+node_modules/
+
+# 插件运行状态与本地调试产物（密钥、快照、历史——绝不入库）
+state/
+tmp/
+*.tmp-*
+
+# 验证工作区 / 测试临时目录
+wbt-verify/
+wb-tasks-*/
+
+# 日志与系统文件
+*.log
+.DS_Store
+Thumbs.db

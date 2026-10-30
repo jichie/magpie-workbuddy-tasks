@@ -1,0 +1,86 @@
+# 安装与发布指南（magpie-workbuddy-tasks）
+
+本文档只讲安装：把本插件推上 GitHub 并用 `magpie plugin add github:<owner>/<repo>` 装进 magpie；以及本地开发时的沙箱测试。功能、机制与安全细节见 [README.md](./README.md)。
+
+## 0. 前提
+
+- magpie 已安装并能正常启动。
+- magpie 里已经登录过 **WorkBuddy（国内版）**账号（`workbuddy` 供应商，由社区插件 `@magpie-community/opencode-workbuddy-auth` 提供）。本插件共享读取那份登录信息（`plugin-auth.json`），**不需要也不接受任何密钥**。
+
+## 1. 推到 GitHub
+
+本仓库已经完成 `git init` 与干净的初始提交（含 `LICENSE` 与 `.gitignore`），你只需要建远端并推送：
+
+```bash
+# 1) 在 GitHub 建一个空仓库（建议同名：magpie-workbuddy-tasks），不要初始化 README
+#    https://github.com/new
+
+# 2) 推送（替换 <owner>）
+cd magpie-workbuddy-tasks
+git branch -M main
+git remote add origin https://github.com/<owner>/magpie-workbuddy-tasks.git
+git push -u origin main
+
+# 3)（可选，推荐）打上 magpie-plugin topic，让插件出现在「插件 → 发现 → 非官方插件」
+#    仓库页 → About ⚙ → Topics → 添加：magpie-plugin
+```
+
+**必须整仓提交**：magpie 按「仓库当前代码」直接加载运行，没有构建步骤——`package.json` 要在仓库根目录，加载所需的 `index.mjs`、`daemon.mjs`、`lifecycle.mjs`、`engine/`、`dashboard/`、`page/` 都要提交进仓库。本仓库没有 dist/构建产物，提交的树就是运行的东西（初始提交已满足；`.gitignore` 只排除 node_modules、状态目录与日志，不含任何运行必需文件）。
+
+以后更新：改动推到默认分支即可。magpie 对比远端提交与本地安装的提交（每 10 分钟最多问一次 GitHub），有差异就在「插件 → 已安装」提示更新，点一下或 `magpie plugin update` 完成更新。固定到某次提交（`github:<owner>/<repo>#<sha>`）的安装不会自动更新。更新代码后需要让宿主重载一次（见下）。
+
+## 2. 安装到 magpie
+
+```bash
+# 在跑 magpie 的机器上执行
+magpie plugin add github:<owner>/<repo>
+```
+
+然后在 magpie 应用里打开「**插件管理**」，**启用**本插件（安装后若未自动启用）。启用后：
+
+- 侧栏「插件」分组出现「**WorkBuddy 任务**」入口卡；
+- 「供应商」里出现 `WorkBuddy 任务`（`workbuddy-tasks`，0 个模型——这是正常的，它不服务对话，**不要**给它发对话请求，也不要纠结给它「登录」：若 magpie 要求为它添加账号，**直接留空确认**即可，任务凭据始终来自 magpie 已登录的 workbuddy 账号）。
+
+### 重载语义（重要）
+
+- 终端里执行的 magpie 命令**每次都会重新加载插件**；
+- 应用内宿主**不会热重载**：`magpie plugin update` 拉下来的新代码、或文件夹方式安装时的本地改动，都要等宿主重载才生效——用 `magpie plugin use <插件名>`（若你的版本支持），或最稳妥地在「插件管理」里把本插件**关掉再打开**。
+
+### 验证
+
+1. 看板守护进程由插件宿主懒加载拉起，**不一定立刻就绪**（详见 README「生命周期」）。等宿主加载过本插件后，检查 `<magpie 配置目录>/workbuddy-tasks/state/daemon.json` 是否出现（内含 `pid / port / key / version / startedAt`）。
+2. `curl http://127.0.0.1:<port>/api/hello` 返回 `{"name":"workbuddy-tasks",...}`（不需要密钥）；`ready:true` 表示引擎文件齐全。
+3. 带密钥 `GET /api/state`：`accounts` 非空；若 `notice` 提示找不到配置目录，给守护进程设 `MAGPIE_CONFIG_DIR`（Docker 里通常是 `/config/magpie`）后重启 magpie。
+4. 守护进程就绪后打开看板 `http://127.0.0.1:<port>/`（首次访问按提示把 `daemon.json` 里的 `key` 粘进去，存在 sessionStorage）；「立即运行」或工具 `workbuddy_tasks_run` 启动一轮，`workbuddy_tasks_wait` 能看到逐步进度。
+
+## 3. 本地沙箱测试（不碰你真实的 magpie）
+
+给 magpie 一个独立的 HOME，像官方文档那样：
+
+```bash
+sb=$(mktemp -d)
+m() { env HOME=$sb XDG_CONFIG_HOME=$sb/.config XDG_CACHE_HOME=$sb/.cache MAGPIE_ADDR=127.0.0.1:3499 magpie "$@" ; }
+
+m plugin add ./magpie-workbuddy-tasks
+m plugin --json                     # 方式、账号、模型（空）、加载错误
+```
+
+跑测试套件（不需要 magpie，零真实网络——fetch 与时钟全部注入）：
+
+```bash
+node --test "tests/**/*.test.mjs" "tests-shell/*.test.mjs" "tests-e2e/*.test.mjs"
+# 或只跑守护进程外壳：
+node --test tests-shell/daemon.test.mjs
+```
+
+手动调试守护进程：
+
+```bash
+node daemon.mjs --state ./tmp/state --cfg ./tmp/cfg --port 4390
+# Windows 下路径含空格要加引号；实际端口与密钥写在 ./tmp/state/daemon.json（0600）
+```
+
+## 4. 停用与卸载
+
+- 临时停用：magpie 插件管理里关掉本插件 → 守护进程 10 秒内读到 `plugins.json` 的 `off:true` 会优雅退出；再打开即恢复（下次宿主加载时拉起，或用 README 里的手动命令立刻拉起）。
+- 彻底移除：`magpie plugin remove <名字>`；托管模式下守护进程发现条目消失即自杀。想连状态一起清掉，删除 `<magpie 配置目录>/workbuddy-tasks/` 即可——里面只有排程设置、历史与快照，**没有登录凭据**；`plugin-auth.json` 由 magpie/社区插件拥有，本插件从不删除它。

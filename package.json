@@ -1,0 +1,37 @@
+{
+  "name": "magpie-workbuddy-tasks",
+  "version": "0.1.0",
+  "description": "WorkBuddy 成长/旅行/夜猫任务批量自动化：复用 magpie 已登录账号，本地看板 + 小时排程 + Agent 工具",
+  "type": "module",
+  "main": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "daemon.mjs",
+    "lifecycle.mjs",
+    "engine",
+    "dashboard",
+    "page",
+    "README.md",
+    "install.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "workbuddy",
+    "magpie",
+    "magpie-plugin"
+  ],
+  "license": "MIT",
+  "magpie": {
+    "icon": "page/icon.svg",
+    "maxConcurrency": 1,
+    "page": {
+      "title": "WorkBuddy 任务",
+      "file": "page/index.html",
+      "icon": "page/icon.svg",
+      "titles": { "zh": "WorkBuddy 任务" }
+    },
+    "permissions": [],
+    "options": { "dashboardUrl": "http://127.0.0.1:4390" }
+  }
+}

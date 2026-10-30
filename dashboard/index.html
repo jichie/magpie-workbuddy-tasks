@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>WorkBuddy 任务 · 看板</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到主内容</a>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-name">WorkBuddy 任务</span>
+      <span class="brand-sub" id="brandSub">看板</span>
+    </div>
+    <div class="topbar-meta">
+      <span class="pill pill-quiet" id="daemonPill" role="status" aria-live="polite">检查中…</span>
+      <span class="pill pill-quiet" id="feedPill">未连接</span>
+      <dl class="stats" aria-label="今日收益">
+        <div><dt>今日积分</dt><dd id="statCredits">—</dd></div>
+        <div><dt>今日能量</dt><dd id="statEnergy">—</dd></div>
+        <div><dt>轮次</dt><dd id="statRuns">—</dd></div>
+      </dl>
+    </div>
+    <div class="topbar-actions">
+      <button type="button" class="btn-quiet" id="themeBtn" aria-label="切换主题">主题：跟随系统</button>
+      <button type="button" class="btn-quiet" id="keyBtn">密钥</button>
+      <button type="button" class="btn-quiet" id="daemonStartBtn">启动命令</button>
+      <button type="button" class="btn-warn-quiet btn-quiet" id="daemonStopBtn">停止守护进程</button>
+    </div>
+  </header>
+
+  <main id="main" class="main">
+
+    <!-- 账号 + 批量操作 -->
+    <section class="card" aria-labelledby="accountsTitle">
+      <div class="card-head">
+        <h2 class="label" id="accountsTitle">账号</h2>
+        <div class="card-head-actions">
+          <label class="check"><input type="checkbox" id="selectAll"> 全选</label>
+          <button type="button" class="btn-quiet" id="rescanBtn">重新扫描账号</button>
+        </div>
+      </div>
+      <div id="accountsBanners"></div>
+      <div id="accountsList"></div>
+
+      <div class="batchbar">
+        <fieldset class="legs" id="legsBox">
+          <legend class="label">任务腿</legend>
+          <label class="check"><input type="checkbox" class="leg-check" value="growth" checked> 成长任务</label>
+          <label class="check"><input type="checkbox" class="leg-check" value="travel"> 猫猫旅行</label>
+          <label class="check"><input type="checkbox" class="leg-check" value="night"> 夜猫子</label>
+        </fieldset>
+        <label class="check" id="claimWrap"
+          title="自动领奖：流水线完成后立即领奖；手动领奖：只做不领，任务停在「待领奖」，之后可用「只领奖」补领">
+          <input type="checkbox" id="claimToggle" checked> 自动领奖
+        </label>
+        <div class="batch-actions">
+          <span class="sel-count" id="selCount">已选 0 个账号</span>
+          <button type="button" class="btn-quiet" id="btnAccept">批量接任务</button>
+          <button type="button" class="btn" id="btnRun">批量做任务</button>
+          <button type="button" class="btn-quiet" id="btnClaim">只领奖</button>
+          <button type="button" class="btn-quiet" id="btnCheckin">每日签到</button>
+        </div>
+        <p class="batch-status" id="batchStatus" role="status" aria-live="polite"></p>
+      </div>
+    </section>
+
+    <!-- 实时进度 -->
+    <section class="card" aria-labelledby="jobTitle">
+      <div class="card-head">
+        <h2 class="label" id="jobTitle">实时进度</h2>
+        <div class="card-head-actions" id="jobActions"></div>
+      </div>
+      <div id="jobBody"></div>
+    </section>
+
+    <!-- 排程 -->
+    <section class="card" aria-labelledby="schedTitle">
+      <div class="card-head">
+        <h2 class="label" id="schedTitle">排程</h2>
+        <div class="card-head-actions">
+          <span class="muted mono" id="lastCycle"></span>
+        </div>
+      </div>
+      <div class="sched-grid">
+        <label class="switch-row">
+          <input type="checkbox" id="schedEnabled">
+          <span>启用小时窗口排程</span>
+          <span class="muted">（到点自动跑一轮；同一窗口一天只触发一次，有任务在跑则让路）</span>
+        </label>
+
+        <div class="hours-grid" role="group" aria-label="各腿小时窗口">
+          <div class="hour-row">
+            <span class="label">成长任务</span>
+            <input class="input input-mono" id="hoursGrowth" inputmode="numeric" placeholder="9,21" aria-label="成长任务小时窗口">
+            <span class="hour-hint">逗号分隔的本地小时（0–23）</span>
+          </div>
+          <div class="hour-row">
+            <span class="label">猫猫旅行</span>
+            <input class="input input-mono" id="hoursTravel" inputmode="numeric" placeholder="9,21" aria-label="猫猫旅行小时窗口">
+            <span class="hour-hint">默认 09:00 与 21:00</span>
+          </div>
+          <div class="hour-row">
+            <span class="label">夜猫子</span>
+            <input class="input input-mono" id="hoursNight" inputmode="numeric" placeholder="1" aria-label="夜猫子小时窗口">
+            <span class="hour-hint">默认 01:00；上游只在 23:00–08:00 计数</span>
+          </div>
+        </div>
+        <div>
+          <button type="button" class="btn" id="saveHoursBtn">保存窗口</button>
+        </div>
+
+        <div>
+          <p class="label" style="margin-bottom:6px">下一次运行</p>
+          <div class="next-runs" id="nextRuns"></div>
+        </div>
+
+        <div>
+          <p class="label" style="margin-bottom:6px">风控冷却（触发 403/11140 的账号，冷却期内批量运行会跳过）</p>
+          <div class="holds" id="holdsBox"></div>
+        </div>
+
+        <details class="adv">
+          <summary>运行默认（任务腿 / 领奖模式 / 账号间隔 / 上游主机）</summary>
+          <div class="adv-body">
+            <div class="adv-row">
+              <span class="label">默认任务腿</span>
+              <label class="check"><input type="checkbox" class="defleg-check" value="growth"> 成长任务</label>
+              <label class="check"><input type="checkbox" class="defleg-check" value="travel"> 猫猫旅行</label>
+              <label class="check"><input type="checkbox" class="defleg-check" value="night"> 夜猫子</label>
+            </div>
+            <div class="adv-row">
+              <label class="check"><input type="checkbox" id="defClaim"> 完成后自动领奖（手动运行的默认模式）</label>
+            </div>
+            <div class="adv-row">
+              <span class="label">账号间隔</span>
+              <input class="input input-mono" id="gapMs" type="number" min="500" max="10000" step="100" style="width:100px" aria-label="账号间隔毫秒">
+              <span class="hour-hint">ms，500–10000；风控红线：任意两次上游调用至少间隔 1 秒</span>
+            </div>
+            <div class="adv-row">
+              <button type="button" class="btn" id="saveDefaultsBtn">保存默认</button>
+            </div>
+            <div>
+              <p class="label" style="margin-bottom:4px">上游主机（生效值，只读）</p>
+              <div class="hosts" id="hostsBox"></div>
+              <p class="hour-hint" style="margin-top:4px">留空 = 引擎默认；如需覆盖，向 <code>POST /api/settings</code> 提交 <code>host</code> 字段。</p>
+            </div>
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <!-- 历史 -->
+    <section class="card" aria-labelledby="histTitle">
+      <div class="card-head">
+        <h2 class="label" id="histTitle">历史</h2>
+        <div class="card-head-actions">
+          <label class="check">拉取
+            <select class="input" id="histLimit" aria-label="拉取条数">
+              <option value="50">50</option>
+              <option value="200" selected>200</option>
+              <option value="1000">1000</option>
+              <option value="2000">2000</option>
+            </select> 条
+          </label>
+          <button type="button" class="btn-quiet" id="histRefreshBtn">刷新</button>
+        </div>
+      </div>
+      <div class="tbl-wrap" id="histBody"></div>
+      <div class="pager" id="histPager"></div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    WorkBuddy 任务看板 · 数据只来自本机守护进程 · access/refresh token 永不出现在本页
+  </footer>
+
+  <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+
+  <!-- 密钥对话框 -->
+  <dialog id="keyDialog" aria-labelledby="keyDlgTitle">
+    <form method="dialog" class="dialog-body" id="keyForm">
+      <h2 class="label" id="keyDlgTitle">看板密钥</h2>
+      <p class="dialog-text">
+        除 <code>/api/hello</code> 外，所有接口都需要守护进程密钥。密钥保存在浏览器
+        sessionStorage（只发往本机守护进程），也可以用 <code>?k=&lt;key&gt;</code> 打开本页。
+      </p>
+      <p class="dialog-text">
+        密钥在 <code>&lt;magpie 配置目录&gt;/workbuddy-tasks/state/daemon.json</code> 的
+        <code>key</code> 字段里（文件权限 0600，实际端口也写在同一文件）。
+      </p>
+      <input type="password" class="input input-mono" id="keyInput" placeholder="daemon key"
+        autocomplete="off" spellcheck="false" aria-label="守护进程密钥">
+      <p class="error-text" id="keyError" hidden></p>
+      <div class="dialog-actions">
+        <button type="submit" class="btn-quiet" value="cancel">取消</button>
+        <button type="submit" class="btn" value="save">保存并连接</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 启动命令对话框 -->
+  <dialog id="cmdDialog" aria-labelledby="cmdDlgTitle">
+    <form method="dialog" class="dialog-body">
+      <h2 class="label" id="cmdDlgTitle">启动守护进程</h2>
+      <p class="dialog-text">
+        浏览器无法拉起本机进程。magpie 开启本插件时会自动拉起守护进程；如需手动启动，
+        在插件目录的终端里执行：
+      </p>
+      <pre class="cmd-pre" id="cmdText">node daemon.mjs
+# 或 bun daemon.mjs
+# 可选：--port 4390 --addr 127.0.0.1 --cfg &lt;magpie 配置目录&gt; --state &lt;状态目录&gt;</pre>
+      <p class="dialog-text">
+        启动后看板在 <code>http://127.0.0.1:4390/</code>（端口被占用会自动顺延）；
+        实际端口与密钥写在 <code>&lt;状态目录&gt;/daemon.json</code>。
+      </p>
+      <div class="dialog-actions">
+        <button type="button" class="btn-quiet" id="cmdCopyBtn">复制命令</button>
+        <button type="submit" class="btn" value="cancel">关闭</button>
+      </div>
+    </form>
+  </dialog>
+
+  <noscript>
+    <div class="main">
+      <div class="banner banner-warn"><strong>需要 JavaScript</strong><p>看板是纯前端页面（无构建、无框架），请在浏览器中启用 JavaScript 后刷新。</p></div>
+    </div>
+  </noscript>
+</body>
+</html>

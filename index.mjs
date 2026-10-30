@@ -1,0 +1,450 @@
+// magpie-workbuddy-tasks —— 插件入口
+//
+// 这个模块只导出一个插件函数（magpie 会把入口文件里每个导出函数都当插件跑），
+// 可测试的辅助全部挂在 export const _internal 上（契约 §0.6）。
+//
+// 它做三件事：
+//   1. 声明 provider「workbuddy-tasks」——models: {}，不服务任何对话模型；
+//      对话链路继续由 @magpie-community/opencode-workbuddy-auth（workbuddy /
+//      workbuddy-ai）负责，本插件绝不碰那两个 id（契约 §0.1）。
+//   2. auth.usage：显示「可参与任务的账号数 / 今日积分·能量」，数据来自守护进程。
+//      auth.checkin 故意不实现——社区插件已负责每日签到（契约 §5）。
+//   3. tool 钩子：五个工具（契约 §6），全部只走守护进程的 HTTP API，
+//      单次执行 ≤55 s，长活一律 fire-and-poll。
+//
+// 生命周期（契约 §4）：被宿主加载时读 state/control.json 的 desired，
+// 非 off 则 ensureDaemon()（健康则复用，不健康才 spawn detached 守护进程），
+// 并注册退出钩子——若守护进程是本会话拉起的，退场时通知它退出。
+
+import {
+  DEFAULT_PORT,
+  PROVIDER_ID,
+  daemonKey,
+  ensureDaemon,
+  interpreter,
+  pidAlive,
+  probeDaemon,
+  readControl,
+  readDaemonInfo,
+  registerExitHooks,
+  resolveCfgDir,
+  shutdownDaemon,
+  stateDirFor,
+  writeControl,
+} from "./lifecycle.mjs"
+
+const VERSION = "0.1.0"
+const TOOL_PREFIX = "workbuddy_tasks" // 契约 §6 的工具名前缀（magpie 还会加上插件短名前缀）
+
+// 本文件自己的目录（daemon.mjs 与它同目录）
+function hereDir() {
+  try {
+    const raw = decodeURIComponent(new URL("./daemon.mjs", import.meta.url).href.replace(/^file:\/\//, ""))
+    if (process.platform === "win32") return raw.replace(/^\//, "").replace(/\//g, "\\")
+    return raw
+  } catch {
+    return "."
+  }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const short = (e) => String(e?.message ?? e).slice(0, 180)
+
+// ---- 守护进程 HTTP 客户端（工具与 usage 共用） -----------------------------
+
+function makeDaemonClient(getInfo) {
+  async function call(method, path, body, timeoutMs = 10000, extraSignal = null) {
+    const info = await getInfo()
+    if (!info?.port || !info?.key) {
+      const e = new Error("任务守护进程未运行，无法执行（打开/重开本插件会自动拉起）")
+      e.code = "WB_NO_DAEMON"
+      throw e
+    }
+    const signals = [AbortSignal.timeout(timeoutMs)]
+    if (extraSignal) signals.push(extraSignal)
+    const signal = typeof AbortSignal.any === "function" ? AbortSignal.any(signals) : signals[0]
+    const res = await fetch(`http://127.0.0.1:${info.port}${path}`, {
+      method,
+      headers: {
+        authorization: `Bearer ${info.key}`,
+        ...(body !== undefined ? { "content-type": "application/json" } : {}),
+      },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal,
+    })
+    let data = null
+    try {
+      data = await res.json()
+    } catch {}
+    return { status: res.status, ok: res.ok, data }
+  }
+  return { call }
+}
+
+// ---- 汇总文本（工具的返回都是给人看的纯文本） ------------------------------
+
+function fmtState(s) {
+  const lines = []
+  const accts = s.accounts ?? []
+  const on = accts.filter((a) => a.tasksEnabled)
+  lines.push(`账号：${accts.length} 个已登录，${on.length} 个参与任务`)
+  for (const a of accts.slice(0, 10)) {
+    const days = a.expiresInDays == null ? "有效期未知" : `令牌剩 ${a.expiresInDays} 天`
+    lines.push(`  · ${a.nickname || a.uid}（${a.tasksEnabled ? "参与" : "已停用"}，${days}）`)
+  }
+  if (accts.length > 10) lines.push(`  … 其余 ${accts.length - 10} 个略`)
+  if (s.notice) lines.push(`提示：${s.notice}`)
+  const sc = s.scheduler ?? {}
+  const next = (sc.nextRuns ?? [])
+    .map(([leg, h]) => `${leg}@${String(h).padStart(2, "0")}:00`)
+    .join("、")
+  lines.push(`排程：${sc.enabled ? "开启" : "关闭"}${next ? `，窗口：${next}` : ""}${sc.lastCycle ? `，上次触发 ${sc.lastCycle}` : ""}`)
+  const j = s.job
+  if (j) {
+    const done = (j.steps ?? []).filter((x) => x.state === "ok" || x.state === "skip" || x.state === "fail").length
+    lines.push(`当前任务：job ${j.id}（${j.state}，${done}/${(j.steps ?? []).length} 步）`)
+  } else {
+    lines.push("当前任务：无")
+  }
+  const st = s.stats ?? {}
+  lines.push(`今日：${st.creditsToday ?? 0} 积分 · ${st.energyToday ?? 0} 能量 · ${st.runs ?? 0} 轮`)
+  if (s.engineErrors?.length) lines.push(`引擎告警：${s.engineErrors.join("；")}`)
+  return lines.join("\n")
+}
+
+function fmtJob(j) {
+  if (!j) return "任务不存在（或已从内存清除）"
+  const steps = j.steps ?? []
+  const t = j.totals ?? {}
+  const lines = [`job ${j.id}：${j.state}`]
+  if (j.startedAt) lines[0] += `（${j.startedAt} 起${j.endedAt ? `，${j.endedAt} 结束` : ""}）`
+  lines.push(`结算：+${t.credit ?? 0} 积分 · +${t.energy ?? 0} 能量 · 点亮 ${t.tasksLit ?? 0} · 领取 ${t.tasksClaimed ?? 0}`)
+  for (const s of steps.slice(-20)) {
+    const name = s.nickname || s.uid
+    const leg = s.leg === "growth" ? "成长" : s.leg === "travel" ? "旅行" : s.leg === "night" ? "夜猫" : s.leg
+    lines.push(`  ${s.state === "ok" ? "✓" : s.state === "fail" ? "✗" : s.state === "skip" ? "－" : "…"} ${name} ${leg}：${s.detail || s.state}${s.credit ? `（+${s.credit} 积分${s.energy ? ` +${s.energy} 能量` : ""}）` : ""}`)
+  }
+  if (steps.length > 20) lines.push(`  … 其余 ${steps.length - 20} 步略`)
+  const logs = j.log ?? []
+  if (logs.length) lines.push(`最近日志：${logs.slice(-3).join(" | ")}`)
+  return lines.join("\n")
+}
+
+function fmtTasks(acct) {
+  const snap = acct?.snapshot
+  if (!snap || !Array.isArray(snap.tasks) || !snap.tasks.length) {
+    return `账号 ${acct?.nickname || acct?.uid}：暂无任务快照。运行一轮任务（或稍后重试）后会自动生成。`
+  }
+  const lines = [`账号 ${acct.nickname || acct.uid} 的任务表（更新于 ${snap.updatedISO ?? "?"}）：`]
+  // acceptStatus 是规范 Task 的字符串状态（CONTRACT §2：上游 accept_status 原词）
+  const statusName = { not_accepted: "未接取", accepted: "已接取", completed: "已完成", claimed: "已领奖" }
+  for (const t of snap.tasks) {
+    const st = statusName[t.acceptStatus] ?? String(t.acceptStatus)
+    const prog = t.progress?.target ? `进度 ${t.progress.current}/${t.progress.target}` : "进度未知"
+    const reward = [t.rewardCredit ? `+${t.rewardCredit}积分` : "", t.rewardEnergy ? `+${t.rewardEnergy}能量` : ""].filter(Boolean).join(" ")
+    lines.push(`  ${t.code}｜${t.title || "未命名"}｜${st}｜${prog}${reward ? `｜${reward}` : ""}${t.jumpUrl ? `｜需手动：${t.jumpUrl}` : ""}`)
+  }
+  const extra = []
+  if (snap.energy != null) extra.push(`能量 ${snap.energy}`)
+  if (snap.days != null) extra.push(`连续 ${snap.days} 天`)
+  if (extra.length) lines.push(`汇总：${extra.join(" · ")}`)
+  return lines.join("\n")
+}
+
+// ---- 插件函数 --------------------------------------------------------------
+
+export const WorkBuddyTasksPlugin = async (input, options) => {
+  const cfgDir = input?.directory || input?.worktree || resolveCfgDir(process.env) || null
+  const dir = hereDir()
+  const stateDir = cfgDir ? stateDirFor(cfgDir) : null
+
+  // magpie 日志尽力而为（client.app.log 的签名按 OpenCode 的来，包一层不炸）
+  const log = (...a) => {
+    try {
+      input?.client?.app?.log?.({ level: "info", service: "workbuddy-tasks", message: a.join(" ") })
+    } catch {}
+  }
+
+  // 用户在 plugins.json options 里可写 dashboardUrl（给 page 入口卡跳转看板用）
+  const dashboardUrl = typeof options?.dashboardUrl === "string" ? options.dashboardUrl : ""
+
+  // 拉起守护进程（不阻塞插件加载太久：ensureDaemon 自带 8s 预算，失败也不炸）
+  const boot = ensureDaemon({ cfgDir, pluginDir: dir, log })
+    .then((r) => {
+      if (r?.error) log("守护进程：" + r.error)
+      else if (r?.info) log(`守护进程就绪：127.0.0.1:${r.info.port}${r.spawned ? "（本次拉起）" : "（复用已有）"}`)
+      return r
+    })
+    .catch((e) => ({ info: null, spawned: false, error: short(e) }))
+
+  // 宿主退出：只有本会话拉起的守护进程才由我们送行；其余交给它自己的 magpie 探测
+  registerExitHooks(async () => {
+    const r = await boot.catch(() => null)
+    if (r?.spawned && r?.info) await shutdownDaemon(r.info)
+  })
+
+  const client = makeDaemonClient(async () => {
+    const r = await boot
+    if (r?.info) return r.info
+    // 第一次没起来，给一次快速重试的机会
+    const retry = await ensureDaemon({ cfgDir, pluginDir: dir, log, budgetMs: 3000 }).catch(() => null)
+    if (retry?.info) return retry.info
+    return null
+  })
+
+  // ---- auth.usage：账号数 / 今日积分·能量（契约 §5） ----
+  async function usage() {
+    try {
+      const r = await client.call("GET", "/api/state", undefined, 8000)
+      if (r.status === 401) return { error: "守护进程密钥不匹配（删除 state/daemon.json 后重开插件可重建）", windows: [] }
+      if (!r.ok || !r.data) return { error: `守护进程返回异常（HTTP ${r.status}）`, windows: [] }
+      const s = r.data
+      const count = (s.accounts ?? []).filter((a) => a.tasksEnabled).length
+      const st = s.stats ?? {}
+      return {
+        plan: "WorkBuddy 任务",
+        user: `${count} 个账号参与任务`,
+        windows: [
+          {
+            name: "今日任务",
+            display: `${st.creditsToday ?? 0} 积分 · ${st.energyToday ?? 0} 能量（${st.runs ?? 0} 轮）`,
+            aside: true, // 只展示，不参与路由权衡
+          },
+        ],
+      }
+    } catch (e) {
+      if (e?.code === "WB_NO_DAEMON") {
+        return { error: `任务守护进程未运行：${e.message}`, windows: [] }
+      }
+      return { error: `连不上任务守护进程：${short(e)}`, windows: [] }
+    }
+  }
+
+  // ---- tool 钩子（契约 §6） ----
+  // SDK（@opencode-ai/plugin）由 magpie 的插件宿主提供；拿不到时跳过工具注册，
+  // provider 与 usage 照常工作，不让整个插件加载失败。
+  let toolHook = undefined
+  try {
+    const sdk = await import("@opencode-ai/plugin")
+    const tool = sdk?.tool
+    const schema = tool?.schema
+    if (typeof tool === "function" && schema) {
+      const optArr = () => schema.array(schema.string()).optional()
+      const optBool = () => schema.boolean().optional()
+      const optNum = () => schema.number().optional()
+      const optStr = () => schema.string().optional()
+
+      const runTool = (def) =>
+        tool({
+          ...def,
+          async execute(args, ctx) {
+            try {
+              return await def.run(args, ctx)
+            } catch (e) {
+              return `执行失败：${short(e)}${e?.code === "WB_NO_DAEMON" ? "（打开/重开本插件可重新拉起守护进程）" : ""}`
+            }
+          },
+        })
+
+      toolHook = {
+        // 状态：账号 / 排程 / 当前 job / 今日收益
+        [`${TOOL_PREFIX}_status`]: runTool({
+          description:
+            "查看 WorkBuddy 任务插件的状态：参与账号、排程窗口、当前批量任务进度与今日积分/能量收益。",
+          args: {},
+          run: async (_args, ctx) => {
+            const r = await client.call("GET", "/api/state", undefined, 10000, ctx?.abort)
+            if (!r.ok) return `读取状态失败（HTTP ${r.status}）：${r.data?.error ?? ""}`
+            return fmtState(r.data)
+          },
+        }),
+
+        // 启动批量任务：立即返回 job id，不等待（55 s 装不下一轮批量）
+        [`${TOOL_PREFIX}_run`]: runTool({
+          description:
+            "启动一轮 WorkBuddy 任务（成长任务/猫猫旅行/夜猫子），立即返回 job id，不等待完成。用 workbuddy_tasks_wait 轮询进度。同一时刻只能跑一个批量任务。",
+          args: {
+            uids: optArr().describe("要跑的账号 uid 列表；不填 = 全部可参与账号"),
+            legs: optArr().describe("任务腿：growth（成长）、travel（猫猫旅行）、night（夜猫子）；不填 = 设置里的默认"),
+            claim: optBool().describe("完成后自动领奖，默认跟随设置"),
+          },
+          run: async (args, ctx) => {
+            const body = {}
+            if (Array.isArray(args?.uids)) body.uids = args.uids
+            if (Array.isArray(args?.legs)) body.legs = args.legs
+            if (args?.claim !== undefined) body.claim = !!args.claim
+            const r = await client.call("POST", "/api/run", body, 15000, ctx?.abort)
+            if (r.status === 409) {
+              const cur = await client.call("GET", "/api/state", undefined, 8000, ctx?.abort).catch(() => null)
+              const job = cur?.data?.job
+              return `已有批量任务在运行（job ${job?.id ?? "?"}，${job?.state ?? "?"}）。等它结束再启动，或用等待工具查看进度。`
+            }
+            if (r.status === 503) return `启动失败：${r.data?.error ?? "任务引擎不可用"}`
+            if (!r.ok) return `启动失败（HTTP ${r.status}）：${r.data?.error ?? ""}`
+            const j = r.data?.job
+            const legs = (j?.legs ?? body.legs ?? []).join(" + ")
+            return `已启动 job ${j?.id ?? "?"}${legs ? `（${legs}）` : ""}。用等待工具（workbuddy_tasks_wait）可轮询到完成。`
+          },
+        }),
+
+        // 等待 job：轮询到完成或超时，返回进度与结算
+        [`${TOOL_PREFIX}_wait`]: runTool({
+          description: "等待一个 WorkBuddy 任务 job 结束（轮询），返回进度与结算；到时或未找到也如实返回。",
+          args: {
+            jobId: schema.string().describe("workbuddy_tasks_run 返回的 job id"),
+            maxSeconds: optNum().describe("最长等待秒数，默认 45，上限 50"),
+          },
+          run: async (args, ctx) => {
+            const id = String(args?.jobId ?? "").trim()
+            if (!id) return "需要 jobId（workbuddy_tasks_run 的返回）"
+            const maxS = Math.min(50, Math.max(3, Number(args?.maxSeconds) || 45))
+            const deadline = Date.now() + maxS * 1000
+            for (;;) {
+              const r = await client.call("GET", `/api/jobs/${encodeURIComponent(id)}`, undefined, 8000, ctx?.abort)
+              if (r.status === 404) return `job ${id} 不存在（可能已结束并被清理，或 id 写错了）`
+              if (!r.ok) return `查询失败（HTTP ${r.status}）`
+              const j = r.data
+              if (j.state === "done" || j.state === "error") return fmtJob(j)
+              if (Date.now() >= deadline) {
+                const steps = j.steps ?? []
+                const done = steps.filter((x) => x.state !== "pending" && x.state !== "running").length
+                return (
+                  `job ${id} 还在${j.state === "running" ? "运行" : j.state}，已等 ${maxS}s（${done}/${steps.length} 步，+${j.totals?.credit ?? 0} 积分）。` +
+                  `稍后再调一次本工具可继续等待。`
+                )
+              }
+              await sleepUntil(1500, ctx?.abort)
+            }
+          },
+        }),
+
+        // 任务表：code/标题/接取状态/进度/奖励
+        [`${TOOL_PREFIX}_list`]: runTool({
+          description:
+            "列出 WorkBuddy 成长任务表（code、标题、接取状态、进度、奖励）。数据来自账号任务快照，查询时会尽量刷新一次。",
+          args: {
+            uid: optStr().describe("账号 uid；不填 = 第一个可参与账号"),
+          },
+          run: async (args, ctx) => {
+            const uid = args?.uid ? `?uid=${encodeURIComponent(String(args.uid))}` : "?refresh=1"
+            const r = await client.call("GET", `/api/state${uid}`, undefined, 30000, ctx?.abort)
+            if (!r.ok) return `读取失败（HTTP ${r.status}）：${r.data?.error ?? ""}`
+            const s = r.data
+            const accts = s.accounts ?? []
+            if (!accts.length) return `没有账号：${s.notice ?? "magpie 里还没有已登录的 workbuddy 账号"}`
+            const pick = args?.uid ? accts.find((a) => a.uid === args.uid) : accts.find((a) => a.tasksEnabled) ?? accts[0]
+            if (!pick) return `找不到账号 ${args.uid}`
+            return fmtTasks(pick)
+          },
+        }),
+
+        // 单个领奖
+        [`${TOOL_PREFIX}_claim`]: runTool({
+          description: "领取单个 WorkBuddy 成长任务奖励（按任务 code）。批量任务运行中时会拒绝，避免抢限速。",
+          args: {
+            uid: schema.string().describe("账号 uid"),
+            code: schema.string().describe("任务 code（workbuddy_tasks_list 里可以看到）"),
+          },
+          run: async (args, ctx) => {
+            const uid = String(args?.uid ?? "").trim()
+            const code = String(args?.code ?? "").trim()
+            if (!uid || !code) return "需要 uid 与 code"
+            const r = await client.call("POST", "/api/task/claim", { uid, code }, 30000, ctx?.abort)
+            if (r.status === 409) return "批量任务运行中，稍后再领。"
+            if (r.status === 404) return `账号 ${uid} 不存在`
+            if (!r.ok) return `领取失败：${r.data?.error ?? `HTTP ${r.status}`}`
+            const d = r.data
+            if (!d.ok) return `没有领到：${d.reason || "任务可能未完成"}`
+            const got = [d.credit ? `+${d.credit} 积分` : "", d.energy ? `+${d.energy} 能量` : ""].filter(Boolean).join(" ")
+            return `领取成功${got ? `：${got}` : ""}${d.via ? `（经 ${d.via === "web" ? "网页回退" : "聊天接口"}）` : ""}`
+          },
+        }),
+      }
+    } else {
+      log("未找到 @opencode-ai/plugin 的 tool 导出，工具未注册（provider 与用量不受影响）")
+    }
+  } catch (e) {
+    log(`加载 @opencode-ai/plugin 失败，工具未注册：${short(e)}`)
+  }
+
+  const hooks = {
+    // 声明 provider：只为让 magpie 有理由加载我们；models: {} = 不服务对话
+    config: async (cfg) => {
+      cfg.provider ??= {}
+      cfg.provider[PROVIDER_ID] ??= {
+        name: "WorkBuddy 任务",
+        npm: "@ai-sdk/openai-compatible",
+        api: "https://copilot.tencent.com",
+        models: {}, // 铁律 §0.1：不碰对话链路
+      }
+    },
+    auth: {
+      provider: PROVIDER_ID,
+      methods: [
+        {
+          type: "api",
+          label: "（无需填写）复用 magpie 已登录的 WorkBuddy 账号",
+          placeholder: "直接留空即可",
+          async authorize() {
+            // 不收任何秘密：凭据永远来自 magpie 已登录的 workbuddy 账号（共享读 plugin-auth.json）
+            return { type: "success", key: "shared", metadata: { note: "凭据取自 magpie 的 workbuddy 账号" } }
+          },
+        },
+      ],
+      // 本 provider 永远不该被拿来发对话请求；给个空 loader 兜底
+      async loader() {
+        return { baseURL: "", apiKey: "" }
+      },
+      // magpie 专属钩子：参与账号数 / 今日积分·能量
+      usage,
+      // auth.checkin 故意不实现：官方社区插件已负责每日签到，别抢（契约 §5）
+    },
+  }
+  if (toolHook) hooks.tool = toolHook
+
+  return hooks
+}
+
+async function sleepUntil(ms, signal) {
+  if (signal?.aborted) throw new Error("已中止")
+  await new Promise((r) => {
+    const t = setTimeout(r, ms)
+    signal?.addEventListener?.(
+      "abort",
+      () => {
+        clearTimeout(t)
+        r()
+      },
+      { once: true },
+    )
+  })
+}
+
+// ---- 可测试的辅助（magpie 只把导出的“函数”当插件，_internal 是对象，安全） ----
+
+export const _internal = {
+  PROVIDER_ID,
+  DEFAULT_PORT,
+  VERSION,
+  TOOL_PREFIX,
+  // 生命周期透传（给 bun test / node --test 用）
+  ensureDaemon,
+  shutdownDaemon,
+  registerExitHooks,
+  resolveCfgDir,
+  stateDirFor,
+  readControl,
+  writeControl,
+  readDaemonInfo,
+  daemonKey,
+  pidAlive,
+  probeDaemon,
+  interpreter,
+  // 纯函数
+  fmtState,
+  fmtJob,
+  fmtTasks,
+  makeDaemonClient,
+  hereDir,
+  _sleepUntil: sleepUntil,
+}

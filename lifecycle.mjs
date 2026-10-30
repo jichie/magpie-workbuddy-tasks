@@ -1,0 +1,280 @@
+// magpie-workbuddy-tasks —— 守护进程生命周期辅助
+// 只被 index.mjs（插件宿主内）与 daemon.mjs 使用；只用 node: 内置，Node / Bun 通用。
+//
+// 职责（契约 §4）：
+//   - 定位 magpie 配置目录与插件自己的 state 目录
+//   - control.json（唯一意图来源：desired = 'on' | 'off'）的读写
+//   - daemon.json（pid/port/key/version/startedAt，权限 0600）的读写
+//   - 探测守护进程健康（GET /api/hello）
+//   - ensureDaemon()：健康则复用，不健康才 spawn（detached + stdio ignore + unref）
+//   - shutdownDaemon()：POST /api/shutdown 通知退出
+//   - registerExitHooks()：宿主退出/信号时收尾
+
+import { spawn } from "node:child_process"
+import { randomBytes } from "node:crypto"
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
+import { homedir } from "node:os"
+import { dirname, join } from "node:path"
+import { fileURLToPath } from "node:url"
+
+export const PLUGIN_NAME = "workbuddy-tasks"
+export const PROVIDER_ID = "workbuddy-tasks"
+export const DEFAULT_PORT = 4390
+const SPAWN_BUDGET_MS = 8000
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+function readTextSync(file) {
+  try {
+    return readFileSync(file, "utf8")
+  } catch {
+    return null
+  }
+}
+
+// 原子写（tmp + rename）；mode 只在 Linux/macOS 有意义（0600 保护 daemon.json）
+function writeJsonAtomic(file, data, mode) {
+  ensureDir(dirname(file))
+  const tmp = `${file}.tmp-${process.pid}-${Date.now()}`
+  writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n", "utf8")
+  if (mode) {
+    try {
+      chmodSync(tmp, mode)
+    } catch {}
+  }
+  renameSync(tmp, file)
+}
+
+function ensureDir(dir) {
+  try {
+    mkdirSync(dir, { recursive: true })
+  } catch {}
+}
+
+// ---- 路径 ------------------------------------------------------------
+
+// resolveCfgDir：magpie 配置目录。优先级：WB_CONFIG_DIR > MAGPIE_CONFIG_DIR >
+// $XDG_CONFIG_HOME/magpie > ~/.config/magpie（与 engine/store 的规则对齐；
+// magpie 在 Docker 里通常是 /config/magpie，请设 MAGPIE_CONFIG_DIR 指过去）。
+export function resolveCfgDir(env = process.env) {
+  const wb = typeof env.WB_CONFIG_DIR === "string" ? env.WB_CONFIG_DIR.trim() : ""
+  if (wb) return wb
+  const mg = typeof env.MAGPIE_CONFIG_DIR === "string" ? env.MAGPIE_CONFIG_DIR.trim() : ""
+  if (mg) return mg
+  const xdg = typeof env.XDG_CONFIG_HOME === "string" ? env.XDG_CONFIG_HOME.trim() : ""
+  if (xdg) return join(xdg, "magpie")
+  return join(homedir(), ".config", "magpie")
+}
+
+// 本插件在 magpie 配置目录下的状态目录：<cfg>/workbuddy-tasks/state
+export function stateDirFor(cfgDir) {
+  return join(cfgDir, PLUGIN_NAME, "state")
+}
+
+// ---- control.json：唯一意图来源 ---------------------------------------
+
+export function controlPath(stateDir) {
+  return join(stateDir, "control.json")
+}
+
+export function readControl(stateDir) {
+  try {
+    const raw = JSON.parse(readTextSync(controlPath(stateDir)) ?? "{}")
+    return { ...raw, desired: raw.desired === "off" ? "off" : "on" }
+  } catch {
+    return { desired: "on" }
+  }
+}
+
+export function writeControl(stateDir, desired, extra = {}) {
+  writeJsonAtomic(controlPath(stateDir), {
+    ...extra,
+    desired: desired === "off" ? "off" : "on",
+    updatedAt: new Date().toISOString(),
+  })
+}
+
+// ---- daemon.json：pid / port / key / version / startedAt（0600） -------
+
+export function daemonInfoPath(stateDir) {
+  return join(stateDir, "daemon.json")
+}
+
+export function readDaemonInfo(stateDir) {
+  try {
+    const raw = JSON.parse(readTextSync(daemonInfoPath(stateDir)) ?? "null")
+    if (!raw || typeof raw !== "object") return null
+    const port = Number(raw.port)
+    if (!raw.pid || !Number.isFinite(port) || port <= 0) return null
+    return { pid: Number(raw.pid), port, key: String(raw.key ?? ""), version: raw.version, startedAt: raw.startedAt }
+  } catch {
+    return null
+  }
+}
+
+export function writeDaemonInfo(stateDir, info) {
+  writeJsonAtomic(daemonInfoPath(stateDir), { ...info, writtenAt: new Date().toISOString() }, 0o600)
+}
+
+export function daemonKey() {
+  return randomBytes(24).toString("base64url")
+}
+
+// ---- 进程与健康探测 ----------------------------------------------------
+
+export function pidAlive(pid) {
+  const p = Number(pid)
+  if (!Number.isFinite(p) || p <= 0) return false
+  try {
+    process.kill(p, 0)
+    return true
+  } catch (e) {
+    return e?.code === "EPERM" // 存在但无权发信号，也算活着
+  }
+}
+
+// probeDaemon：GET /api/hello，且 name 必须是本插件——端口被别的程序占了不算数
+export async function probeDaemon(port, key, timeoutMs = 1500, host = "127.0.0.1") {
+  let res
+  try {
+    res = await fetch(`http://${host}:${port}/api/hello`, {
+      signal: AbortSignal.timeout(timeoutMs),
+      headers: key ? { authorization: `Bearer ${key}` } : undefined,
+    })
+  } catch {
+    return null
+  }
+  if (!res.ok) return null
+  let j = null
+  try {
+    j = await res.json()
+  } catch {
+    return null
+  }
+  return j && j.name === PLUGIN_NAME ? j : null
+}
+
+// ---- 解释器解析（不碰 Bun.spawn；spawn+detached+unref 两边通用） -------
+
+// 宿主是 Bun 时 process.execPath 就是 bun 可执行文件，是 Node 时就是 node；
+// 万一拿不到，退回 PATH 上的 node（spawn("node") 在 Windows 会自动补 .exe）。
+export function interpreter() {
+  const p = process.execPath
+  if (typeof p === "string" && p.trim()) return p
+  return process.platform === "win32" ? "node.exe" : "node"
+}
+
+// ---- ensureDaemon：健康则复用，不健康才拉起 -----------------------------
+//
+// 返回 { info, spawned, error?, off? }：
+//   off      —— control.json.desired === 'off'，宿主不该拉起
+//   spawned  —— 本次是否由我们 spawn（exit 钩子据此决定要不要叫它退场）
+//   info     —— 就绪守护进程的 {pid,port,key,...}；没就绪时为 null
+export async function ensureDaemon({ cfgDir, pluginDir, log = () => {}, budgetMs = SPAWN_BUDGET_MS } = {}) {
+  if (!cfgDir) {
+    return { info: null, spawned: false, error: "无法定位 magpie 配置目录（可设 MAGPIE_CONFIG_DIR 环境变量）" }
+  }
+  const stateDir = stateDirFor(cfgDir)
+  ensureDir(stateDir)
+
+  const control = readControl(stateDir)
+  if (control.desired === "off") {
+    log("control.json desired=off，守护进程保持关闭")
+    return { info: null, spawned: false, off: true }
+  }
+
+  // 已有一个健康的？直接复用（拒绝重复拉起是 daemon 自己也会把守的另一道门）
+  const prev = readDaemonInfo(stateDir)
+  if (prev && pidAlive(prev.pid)) {
+    const hello = await probeDaemon(prev.port, prev.key).catch(() => null)
+    if (hello) return { info: prev, spawned: false }
+  }
+
+  const daemonPath = join(pluginDir, "daemon.mjs")
+  if (!existsSync(daemonPath)) {
+    return { info: null, spawned: false, error: `找不到守护进程脚本：${daemonPath}` }
+  }
+
+  const key = prev?.key || daemonKey()
+  const port = prev?.port || DEFAULT_PORT
+  const env = {
+    ...process.env,
+    WB_CONFIG_DIR: cfgDir,
+    WB_STATE_DIR: stateDir,
+    WB_DAEMON_KEY: key,
+    WB_DAEMON_PORT: String(port),
+    WB_MANAGED: "1", // 由 magpie 宿主拉起：plugins.json 里条目消失时允许自杀
+  }
+  let child
+  try {
+    child = spawn(interpreter(), [daemonPath], {
+      detached: true,
+      stdio: "ignore",
+      env,
+      cwd: pluginDir,
+      windowsHide: true,
+    })
+  } catch (e) {
+    return { info: null, spawned: false, error: `拉起守护进程失败：${e?.message ?? e}` }
+  }
+  child.unref?.()
+  log(`已拉起守护进程（pid ${child.pid}），等待就绪…`)
+
+  const deadline = Date.now() + budgetMs
+  while (Date.now() < deadline) {
+    await sleep(400)
+    const info = readDaemonInfo(stateDir)
+    if (info) {
+      const hello = await probeDaemon(info.port, info.key || key).catch(() => null)
+      if (hello) return { info, spawned: true }
+    }
+    if (!pidAlive(child.pid)) break // 起来又倒了：多半是端口/状态目录问题，不无限等
+  }
+  return {
+    info: readDaemonInfo(stateDir),
+    spawned: true,
+    error: "守护进程未能在时限内就绪（详情见 magpie 日志里 plugin: 开头的行）",
+  }
+}
+
+// ---- shutdownDaemon：请守护进程退场 ------------------------------------
+
+export async function shutdownDaemon(info, timeoutMs = 2500) {
+  if (!info?.port || !info?.key) return false
+  try {
+    const res = await fetch(`http://127.0.0.1:${info.port}/api/shutdown`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${info.key}` },
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+// ---- 宿主退出钩子 -------------------------------------------------------
+
+// process.on('exit') 里做不了异步收尾，所以 SIGINT/SIGTERM 走 await 再退出，
+// 'exit' 只做尽力而为的 fire-and-forget。多数场景下守护进程自己的
+// magpie 探测（连续失败即退）才是真正的兜底。
+let hooksInstalled = false
+export function registerExitHooks(onShutdown) {
+  if (hooksInstalled) return
+  hooksInstalled = true
+  const run = () => {
+    try {
+      const r = onShutdown()
+      if (r && typeof r.catch === "function") r.catch(() => {})
+    } catch {}
+  }
+  const signaled = () => {
+    Promise.resolve()
+      .then(onShutdown)
+      .catch(() => {})
+      .finally(() => process.exit(0))
+  }
+  process.once("SIGINT", signaled)
+  process.once("SIGTERM", signaled)
+  process.once("exit", run)
+}
