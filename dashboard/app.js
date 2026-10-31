@@ -1160,9 +1160,9 @@ function accountRow(a) {
     { class: "acct-tasks" },
     el(
       "summary",
-      { class: "acct-tasks-head" },
+      { class: "acct-tasks-head fold-sum" },
       el("span", {
-        class: expired ? "acct-tasks-label warn-text" : "acct-tasks-label",
+        class: expired ? "acct-tasks-label fold-label warn-text" : "acct-tasks-label fold-label",
         text: expired ? "任务明细 · 快照已过期" : "任务明细",
       }),
       snapMetrics(a.snapshot),

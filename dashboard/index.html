@@ -141,10 +141,12 @@
           <input type="checkbox" id="claimToggle" checked> 自动领奖
         </label>
         <div class="batch-actions">
-          <span class="sel-count" id="selCount">已选 0 个账号</span>
-          <!-- 批量接取只提交后端判定 canAccept 的任务；不可自动接取的项数在这里说明，
-               而不是静默少接（数字来自 snapshot.tasks[].canAccept，见 app.js acceptPlan）。 -->
-          <span class="accept-note" id="acceptNote" hidden></span>
+          <div class="batch-hints">
+            <span class="sel-count" id="selCount">已选 0 个账号</span>
+            <!-- 批量接取只提交后端判定 canAccept 的任务；不可自动接取的项数在这里说明，
+                 而不是静默少接（数字来自 snapshot.tasks[].canAccept，见 app.js acceptPlan）。 -->
+            <span class="accept-note" id="acceptNote" hidden></span>
+          </div>
           <button type="button" class="btn-quiet" id="btnAccept">批量接任务</button>
           <button type="button" class="btn-quiet" id="btnClaim">只领奖</button>
           <button type="button" class="btn-quiet" id="btnCheckin">每日签到</button>
@@ -210,7 +212,7 @@
         </div>
 
         <details class="adv">
-          <summary>运行默认（任务腿 / 领奖模式 / 账号间隔 / 上游主机）</summary>
+          <summary class="fold-sum"><span class="fold-label">运行默认（任务腿 / 领奖模式 / 账号间隔 / 上游主机）</span></summary>
           <div class="adv-body">
             <div class="adv-row">
               <span class="label">默认任务腿</span>

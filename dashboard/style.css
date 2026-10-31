@@ -431,9 +431,10 @@ input[type="checkbox"] { accent-color: var(--btn); width: 14px; height: 14px; ma
 .acct-toggle.is-disabled { opacity: .5; cursor: not-allowed; }
 .acct-toggle.is-disabled input { cursor: not-allowed; }
 
-/* 任务明细：折叠标题里的分项小格（数值在上、标签在下），换行只发生在格与格之间 */
-.acct-tasks { border-top: 1px solid var(--line); }
-.acct-tasks > summary {
+/* 折叠标题统一样式：账号「任务明细」与排程「运行默认」共用同一套自绘三角。
+   display:flex 会隐藏原生 marker，三角画在 .fold-label 上；两处 summary 的
+   font-size / line-height / padding 由 .fold-sum 一处决定，避免两套折叠符号。 */
+.fold-sum {
   display: flex;
   align-items: center;
   gap: 6px 14px;
@@ -441,24 +442,18 @@ input[type="checkbox"] { accent-color: var(--btn); width: 14px; height: 14px; ma
   min-height: 45px;
   padding: 7px 14px;
   font-size: 12.5px;
+  line-height: 1.55;
   color: var(--ink2);
   cursor: pointer;
   list-style: none;
   user-select: none;
 }
-.acct-tasks > summary::-webkit-details-marker { display: none; }
-.acct-tasks > summary::marker { content: ""; }
-.acct-tasks > summary:hover { color: var(--ink); background: var(--bg2); }
-.acct-tasks[open] > summary { border-bottom: 1px solid var(--line); }
-.acct-tasks-label {
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: .08em;
-  color: var(--ink3);
-  white-space: nowrap;
-}
-/* 自绘折叠箭头（display:flex 的 summary 会隐藏原生 marker；不引入新配色） */
-.acct-tasks-label::before {
+.fold-sum::-webkit-details-marker { display: none; }
+.fold-sum::marker { content: ""; }
+.fold-sum:hover { color: var(--ink); background: var(--bg2); }
+details[open] > .fold-sum { border-bottom: 1px solid var(--line); }
+.fold-label { display: inline-block; }
+.fold-label::before {
   content: "";
   display: inline-block;
   width: 0;
@@ -470,9 +465,19 @@ input[type="checkbox"] { accent-color: var(--btn); width: 14px; height: 14px; ma
   vertical-align: 1px;
   transition: transform .15s ease;
 }
-.acct-tasks[open] > summary .acct-tasks-label::before { transform: rotate(90deg); }
-.acct-tasks-label.warn-text { color: var(--warn); }
-.acct-tasks-label.warn-text::before { border-left-color: var(--warn); }
+details[open] > .fold-sum .fold-label::before { transform: rotate(90deg); }
+.fold-label.warn-text { color: var(--warn); }
+.fold-label.warn-text::before { border-left-color: var(--warn); }
+
+/* 任务明细：折叠标题里的分项小格（数值在上、标签在下），换行只发生在格与格之间 */
+.acct-tasks { border-top: 1px solid var(--line); }
+.acct-tasks-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  color: var(--ink3);
+  white-space: nowrap;
+}
 .acct-metrics {
   flex: 1 1 auto;
   display: grid;
@@ -612,6 +617,8 @@ input[type="checkbox"] { accent-color: var(--btn); width: 14px; height: 14px; ma
 }
 .batchbar .legs legend { padding: 0; margin-bottom: 2px; }
 .batch-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-left: auto; }
+/* 选择范围 + 不可接取说明：桌面端并排；窄屏收成一段连续文字，避免两条独立灰行各留一份行距 */
+.batch-hints { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
 .sel-count { font-size: 12px; color: var(--ink3); white-space: nowrap; }
 /* 「批量接任务」旁的不可接取说明（数字来自 canAccept 字段）：允许换行，不抢注意力 */
 .accept-note { font-size: 11.5px; color: var(--ink3); max-width: 280px; }
@@ -720,15 +727,6 @@ input[type="checkbox"] { accent-color: var(--btn); width: 14px; height: 14px; ma
 .hold-release { color: var(--warn); white-space: nowrap; }
 
 details.adv { border: 1px solid var(--line); border-radius: var(--r); padding: 0; }
-details.adv > summary {
-  padding: 8px 14px;
-  font-size: 12.5px;
-  color: var(--ink2);
-  cursor: pointer;
-  list-style-position: inside;
-}
-details.adv > summary:hover { color: var(--ink); background: var(--bg2); }
-details.adv[open] > summary { border-bottom: 1px solid var(--line); }
 .adv-body { padding: 12px 14px; display: grid; gap: 12px; }
 .adv-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 13px; color: var(--ink2); }
 .hosts { display: grid; gap: 3px; font-size: 12px; color: var(--ink3); }
@@ -994,9 +992,39 @@ dialog::backdrop { background: rgba(0, 0, 0, .35); }
 
 @media (max-width: 600px) {
   body { font-size: 13px; }
-  .stats { gap: 10px; }
-  /* 顶栏地址项只留地址本身；完整无鉴权说明在页脚，避免小屏顶栏过高 */
+
+  /* 顶栏：品牌 + 状态胶囊一行、操作按钮一行、统计 + 地址一行（≤120px）。
+     地址只留 URL（标签与复制按钮隐藏）；完整无鉴权说明仍在页脚。 */
+  .topbar { padding: 8px 12px; gap: 8px; }
+  .brand-sub { display: none; }
+  .topbar-meta { display: contents; }
+  .topbar-actions { order: 2; margin-left: 0; }
+  .stats { order: 3; gap: 8px; }
   .addr-note { display: none; }
+  .addr {
+    order: 3;
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border-top: 0;
+    margin-top: 0;
+    padding-top: 0;
+  }
+  .addr-row { flex-wrap: nowrap; gap: 8px; min-width: 0; }
+  .addr .label, .addr .mini-btn { display: none; }
+  .addr-url { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* 排程开关：提示整行下移，标签保持一整句不折断 */
+  .switch-row { flex-wrap: wrap; row-gap: 8px; }
+  .switch-row > span:not(.muted) { white-space: nowrap; }
+  .switch-row .muted { flex-basis: 100%; }
+
+  /* 批量条：两段灰字收成一段连续文字（换行不再各带 8px 行距） */
+  .batch-hints { flex: 1 1 100%; display: block; }
+  .batch-hints .sel-count { white-space: normal; }
+  .batch-hints .accept-note { display: inline; max-width: none; }
+  .batch-hints .accept-note::before { content: " · "; }
 
   /* 表格降级为卡片 */
   .tbl thead { display: none; }
