@@ -1340,8 +1340,11 @@ function renderJob() {
 
   if (!job) {
     box.replaceChildren(
-      el("div", { class: "empty" },
-        "当前没有任务在跑。勾选账号与任务腿后点「批量做任务」启动一轮：接取 → 点亮 → 领奖；排程到点也会自动运行。",
+      el(
+        "div",
+        { class: "empty job-empty" },
+        el("strong", { text: "当前没有任务在跑" }),
+        "勾选账号与任务腿后点「批量做任务」启动一轮：接取 → 点亮 → 领奖；排程到点也会自动运行。",
       ),
     );
     return;

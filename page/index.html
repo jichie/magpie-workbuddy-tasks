@@ -11,63 +11,89 @@
 </head>
 <body>
   <main class="wb-card" aria-labelledby="wbTitle">
-    <header class="wb-head">
-      <h1 class="wb-title" id="wbTitle">WorkBuddy 任务</h1>
-      <span class="wb-tag">批量自动化 · 本地守护进程</span>
+    <header class="wb-hero">
+      <div class="wb-brand">
+        <img class="wb-logo" src="logo-mark.png" alt="" width="40" height="40">
+        <div class="wb-brand-copy">
+          <h1 class="wb-title" id="wbTitle">WorkBuddy 任务</h1>
+          <p class="wb-kicker">批量自动化 · 本地守护进程</p>
+        </div>
+      </div>
+      <span class="wb-tag">国内版</span>
     </header>
 
-    <p class="wb-p">
-      把 WorkBuddy 国内版的<strong>成长任务</strong>做成批量流水线：批量接取、点亮（上报进度）、领奖，
-      外加<strong>猫猫旅行</strong>与<strong>夜猫子</strong>任务，按小时窗口自动排程（默认成长/旅行
-      <span class="wb-mono">09:00 · 21:00</span>，夜猫子 <span class="wb-mono">01:00</span>）。
-      全程遵守风控节奏：任意两次上游调用至少间隔 1 秒，账号之间 1.5–5 秒。
+    <p class="wb-lede">
+      把 WorkBuddy 国内版的<strong>成长任务</strong>做成流水线：批量接取、点亮（上报进度）、领奖；
+      附带<strong>猫猫旅行</strong>、<strong>夜猫子</strong>与小时窗口排程。全程遵守风控节奏，
+      任意两次上游调用至少间隔 1 秒。
     </p>
 
-    <p class="wb-p">
-      <strong>用哪些账号：</strong>复用 magpie 已登录的 WorkBuddy（国内版）OAuth 个人账号；
-      API key 账号与企业账号不参与。本入口卡没有读取权限（插件 permissions 为空），
-      账号列表、任务进度与快照都在看板里查看。access/refresh token 永不出守护进程。
-    </p>
+    <div class="wb-facts" aria-label="运行前提">
+      <div class="wb-fact">
+        <span class="wb-fact-label">使用账号</span>
+        <span class="wb-fact-value">magpie 已登录的 WorkBuddy 国内版 OAuth</span>
+      </div>
+      <div class="wb-fact">
+        <span class="wb-fact-label">不参与</span>
+        <span class="wb-fact-value">API key 账号 / 企业账号</span>
+      </div>
+      <div class="wb-fact">
+        <span class="wb-fact-label">凭据</span>
+        <span class="wb-fact-value">access / refresh token 永不出守护进程</span>
+      </div>
+    </div>
 
     <section class="wb-dash" aria-labelledby="wbDashTitle">
-      <h2 class="wb-label" id="wbDashTitle">看板地址</h2>
-      <div class="wb-dashrow">
-        <code class="wb-url" id="dashUrl">http://127.0.0.1:4390</code>
-        <button type="button" class="wb-btn" id="copyBtn">复制</button>
-        <a class="wb-btn wb-btn-primary" id="dashLink" href="http://127.0.0.1:4390" target="_blank" rel="noopener noreferrer">在新窗口打开看板</a>
+      <div class="wb-dash-head">
+        <div>
+          <h2 class="wb-label" id="wbDashTitle">看板</h2>
+          <p class="wb-hint">账号列表、任务进度、批量操作、实时步骤、排程与历史都在独立看板里。</p>
+        </div>
+        <span class="wb-dash-note">地址来自插件选项 <code>dashboardUrl</code></span>
       </div>
-      <p class="wb-hint" id="dashHint">
-        地址来自插件选项 <code>dashboardUrl</code>（magpie 插件页可改）。看板<strong>直接打开即可</strong>，
-        全部接口无鉴权，靠网络边界保护 —— 守护进程默认只绑
-        <code>127.0.0.1</code>；改成 <code>0.0.0.0</code> 后局域网内任何人都能触发批量任务或导出含凭据的文件，
-        不用时请关闭端口转发。
-      </p>
-      <p class="wb-hint" id="tunnelHint" hidden>
-        magpie 跑在 NAS/容器里、你用 SSH 隧道访问？隧道映射后仍可用
-        <code id="tunnelUrl">127.0.0.1:4390</code> 打开看板，无需改 <code>dashboardUrl</code>。
-      </p>
+
+      <div class="wb-url-row">
+        <code class="wb-url" id="dashUrl">http://127.0.0.1:4390</code>
+        <button type="button" class="wb-btn" id="copyBtn">复制地址</button>
+        <a class="wb-btn wb-btn-primary" id="dashLink" href="http://127.0.0.1:4390"
+          target="_blank" rel="noopener noreferrer">打开看板</a>
+      </div>
+
+      <div class="wb-dash-actions">
+        <p class="wb-hint" id="dashHint">
+          全部接口无鉴权，靠网络边界保护：守护进程默认只绑 <code>127.0.0.1</code>。
+          改绑 <code>0.0.0.0</code> 后同网段任何人都能触发任务或导出含凭据文件，不用时请关闭端口转发。
+        </p>
+        <p class="wb-hint" id="tunnelHint" hidden>
+          SSH 隧道映射后仍可用 <code id="tunnelUrl">127.0.0.1:4390</code> 打开看板，无需改
+          <code>dashboardUrl</code>。
+        </p>
+      </div>
     </section>
 
     <section class="wb-notes" aria-labelledby="wbNotesTitle">
-      <h2 class="wb-label" id="wbNotesTitle">状态说明</h2>
+      <h2 class="wb-label" id="wbNotesTitle">说明</h2>
+
       <details class="wb-details">
         <summary>如何启用 / 停用</summary>
         <div class="wb-detail-body">
           <p class="wb-p">
-            守护进程跟随 magpie：在 magpie 插件管理里<strong>开启本插件</strong>即自动拉起
+            守护进程跟随 magpie：在插件管理里<strong>开启本插件</strong>即自动拉起
             （写 <code>control.json desired=on</code>），<strong>关闭插件</strong>即优雅退出
             （<code>desired=off</code>）。看板顶栏也有「停止守护进程」按钮（<code>POST /api/shutdown</code>）；
             浏览器无法启动本机进程，需要手动拉起时在插件目录执行 <code>node daemon.mjs</code>。
           </p>
         </div>
       </details>
+
       <details class="wb-details">
         <summary>Docker / NAS 部署怎么打开看板</summary>
         <div class="wb-detail-body">
           <p class="wb-p">
-            守护进程默认只绑 <code>127.0.0.1</code>；容器里需要对外时用选项 <code>listenAddress</code>
-            或 <code>--addr</code> 绑 <code>0.0.0.0</code>。此时看板仅容器网桥/局域网可达，
-            请用 SSH 隧道或局域网地址访问，切勿发布到公网（<code>0.0.0.0</code> 是监听值，不是可打开的地址）。
+            守护进程默认只绑 <code>127.0.0.1</code>；容器里需要对外时用选项
+            <code>listenAddress</code> 或 <code>--addr</code> 绑 <code>0.0.0.0</code>。
+            此时看板仅容器网桥/局域网可达，请用 SSH 隧道或局域网地址访问，切勿发布到公网
+            （<code>0.0.0.0</code> 是监听值，不是可打开的地址）。
           </p>
           <p class="wb-p">
             查容器 IP：<code>docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" magpie</code>；
@@ -75,10 +101,10 @@
             映射后仍可用 <code>http://127.0.0.1:&lt;port&gt;/</code> 打开。实际端口与绑定 host 由守护进程写在
             <code>state/daemon.json</code>；看板页面不再显示访问地址，需要时直接看该文件里的
             <code>host</code> 与 <code>port</code>。
-            看板无鉴权：改绑 <code>0.0.0.0</code> 期间请用防火墙/隧道限制来源，不用时关闭端口转发。
           </p>
         </div>
       </details>
+
       <details class="wb-details">
         <summary>为什么这里看不到实时数据</summary>
         <div class="wb-detail-body">
@@ -86,29 +112,26 @@
             本页运行在 magpie 的沙箱 iframe 里（<code>sandbox="allow-scripts"</code>，
             CSP <code>connect-src 'none'</code>）：不允许 fetch / WebSocket，也没有申报任何
             <code>magpie.read</code> 权限，所以无法请求守护进程的 <code>/api/state</code> 或 SSE。
-            这是一张诚实的入口卡 —— 账号、14+ 项成长任务表、批量操作、实时步骤/日志、排程与历史，
-            全部在独立看板里（同源静态页，由守护进程服务）。
+            这是一张诚实的入口卡 —— 实时数据都在独立看板里。
           </p>
         </div>
       </details>
+
       <details class="wb-details">
         <summary>看板里能做什么</summary>
         <div class="wb-detail-body">
           <p class="wb-p">
-            勾选账号 →「批量接任务」（只接取，不点亮；只提交守护进程判定 <code>canAccept</code> 的任务，
-            自动任务与桌面端 / 未收录任务不进名单，不可自动接取的项数在按钮旁说明）、
-            「批量做任务」（接取 → 点亮 → 领奖完整流水线）、
-            「只领奖」（补领「待领奖」）、「每日签到」（连登）；自动 / 手动领奖两种模式；
-            每个账号可单独开关「参与任务」（关闭后批量与排程都会跳过它）；
-            单账号任务表可逐项接取 / 领奖、查看进度与奖励（积分 / 能量），并按守护进程下发的
-            判断字段标注「需在桌面端完成」「无法自动化」（附原因原文）与钉死的专家 id
-            （<code>ex_…</code>）—— 前端不自己猜，判断只来自后端；
-            风控冷却（403/11140）名单直接显示解除时间；
-            实时步骤与滚动日志走 SSE，断线自动回退 3 秒轮询；小时窗口排程可编辑并预览下一次运行；
-            历史记录失败 / 跳过都会留一行说明；
+            勾选账号 →「批量接任务」（只接取，不点亮；只提交守护进程判定 <code>canAccept</code> 的任务）、
+            「批量做任务」（接取 → 点亮 → 领奖完整流水线）、「只领奖」（补领「待领奖」）、
+            「每日签到」（连登）；自动 / 手动领奖两种模式；每个账号可单独开关「参与任务」。
+            单账号任务表可逐项接取 / 领奖，并按后端下发的判断字段标注「需在桌面端完成」「无法自动化」
+            与钉死的专家 id；风控冷却名单直接显示解除时间；实时步骤与滚动日志走 SSE，
+            断线自动回退轮询；小时窗口排程可编辑并预览下一次运行；历史失败 / 跳过都会留一行说明。
+          </p>
+          <p class="wb-p">
             <strong>账号导入 / 导出</strong>：导出为 hub 同款 <code>workbuddy-accounts</code> JSON
-            （默认含凭据，可改脱敏），导入走「先预览（只读、不写盘）→
-            确认写入 <code>plugin-auth.json</code>（写前自动备份）」两段式，只同步国内版、智能合并，
+            （默认含凭据，可改脱敏）；导入走「先预览（只读、不写盘）→ 确认写入
+            <code>plugin-auth.json</code>（写前自动备份）」两段式，只同步国内版、智能合并，
             不删除任何现有账号。
           </p>
         </div>
