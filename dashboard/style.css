@@ -122,15 +122,17 @@ a:hover { text-decoration-color: var(--ink3); }
 
 /* ---- 顶栏 ------------------------------------------------------------------ */
 
+/* 顶栏只放品牌 / 状态胶囊 / 操作按钮，一行收口；地址与今日统计移到下方的
+   .subbar 一行次要文字里，绝不让 header 堆成两三行。 */
 .topbar {
   position: sticky;
   top: 0;
   z-index: 20;
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 8px 16px;
   flex-wrap: wrap;
-  padding: 10px 20px;
+  padding: 8px 20px;
   background: var(--bg);
   border-bottom: 1px solid var(--line);
 }
@@ -139,8 +141,8 @@ a:hover { text-decoration-color: var(--ink3); }
 .brand-name { font-size: 14px; font-weight: 650; letter-spacing: .01em; white-space: nowrap; }
 .brand-sub { font-family: var(--font-mono); font-size: 11px; color: var(--ink3); white-space: nowrap; }
 
-.topbar-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; flex: 1 1 auto; }
-.topbar-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.topbar-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.topbar-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-left: auto; }
 
 /* 状态胶囊 */
 .pill {
@@ -168,30 +170,39 @@ a:hover { text-decoration-color: var(--ink3); }
 .pill-off { color: var(--ink3); }
 .pill-quiet { color: var(--ink3); }
 
+/* 顶栏下方一行：看板地址 + 今日统计（同一行次要文字，地址说明进 title）。 */
+.subbar {
+  display: flex;
+  align-items: center;
+  gap: 6px 18px;
+  flex-wrap: wrap;
+  padding: 6px 20px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--ink3);
+}
+
 /* 今日统计 */
-.stats { display: flex; align-items: center; gap: 14px; margin: 0; }
+.stats { display: flex; align-items: center; gap: 14px; margin: 0; flex: none; }
 .stats > div { display: flex; align-items: baseline; gap: 5px; }
 .stats dt { font-size: 11px; color: var(--ink3); letter-spacing: .04em; }
 .stats dd { font-family: var(--font-mono); font-size: 13px; color: var(--ink); margin: 0; }
 
-/* 看板地址（顶栏第二行）：消费 /api/state 的 bindHost/port/reachableHint。
-   沿用 hairline 分隔 + 次要文字 + code 底纹，不引入新配色。 */
-.addr {
-  flex-basis: 100%;
-  display: grid;
-  gap: 4px;
-  border-top: 1px solid var(--line);
-  margin-top: -6px;
-  padding-top: 8px;
-  font-size: 12.5px;
-  color: var(--ink2);
-}
+/* 看板地址（subbar 内一行）：消费 /api/state 的 serveUrl（老后端回退 bindHost/port）。
+   只留 URL + 复制按钮；窄屏隐藏「看板地址」标签，URL 用省略号收口。 */
+.addr { display: flex; align-items: center; min-width: 0; flex: 1 1 auto; }
 .addr[hidden] { display: none; }
-.addr-row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
-.addr-row .label { letter-spacing: .04em; }
-.addr-url { color: var(--ink); }
-.addr-cmd { color: var(--ink2); max-width: 100%; }
-.addr-note { font-size: 11.5px; color: var(--ink3); }
+.addr-row { display: flex; align-items: baseline; gap: 8px; min-width: 0; flex-wrap: nowrap; }
+.addr-row .label { flex: none; letter-spacing: .04em; }
+.addr-url {
+  color: var(--ink2);
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.addr-copy { flex: none; }
 
 /* ---- 按钮 / 输入 ------------------------------------------------------------- */
 
@@ -452,7 +463,14 @@ input[type="checkbox"] { accent-color: var(--btn); width: 14px; height: 14px; ma
 .fold-sum::marker { content: ""; }
 .fold-sum:hover { color: var(--ink); background: var(--bg2); }
 details[open] > .fold-sum { border-bottom: 1px solid var(--line); }
-.fold-label { display: inline-block; }
+.fold-label {
+  display: inline-block;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .fold-label::before {
   content: "";
   display: inline-block;
@@ -469,27 +487,33 @@ details[open] > .fold-sum .fold-label::before { transform: rotate(90deg); }
 .fold-label.warn-text { color: var(--warn); }
 .fold-label.warn-text::before { border-left-color: var(--warn); }
 
-/* 任务明细：折叠标题里的分项小格（数值在上、标签在下），换行只发生在格与格之间 */
+/* 任务明细：折叠标题里只留一行紧凑文字（完整汇总在 title）；8 个分项小格
+   移到折叠内部、任务表上方，换行只发生在格与格之间。 */
 .acct-tasks { border-top: 1px solid var(--line); }
 .acct-tasks-label {
   font-size: 11px;
   font-weight: 600;
   letter-spacing: .08em;
   color: var(--ink3);
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 .acct-metrics {
-  flex: 1 1 auto;
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(64px, 1fr));
-  gap: 2px 16px;
-  min-width: 0;
+  gap: 6px 16px;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--line);
 }
 .metric {
   display: flex;
   flex-direction: column-reverse;
   align-items: flex-start;
   line-height: 1.35;
+  min-width: 0;
 }
 .metric-v {
   font-family: var(--font-mono);
@@ -497,7 +521,13 @@ details[open] > .fold-sum .fold-label::before { transform: rotate(90deg); }
   color: var(--ink);
 }
 .metric-l { font-size: 10.5px; color: var(--ink3); white-space: nowrap; }
-.acct-metrics-empty { font-size: 11.5px; color: var(--ink3); }
+.acct-metrics-empty {
+  display: block;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--line);
+  font-size: 11.5px;
+  color: var(--ink3);
+}
 .acct-tasks .tbl-wrap { padding: 4px 8px 10px; }
 
 /* 国际版账号诊断：一行次要文字，绝不列出具体账号 */
@@ -910,10 +940,8 @@ dialog::backdrop { background: rgba(0, 0, 0, .35); }
 }
 
 @media (max-width: 900px) {
-  .topbar { padding: 10px 14px; gap: 10px; }
-  .topbar-meta { order: 3; flex-basis: 100%; }
-  .topbar-actions { margin-left: auto; }
-  .addr { order: 4; }
+  .topbar { padding: 8px 14px; }
+  .subbar { padding: 6px 14px; }
   .main { padding: 14px 12px 48px; }
   .card { padding: 14px; }
   .batch-actions { margin-left: 0; }
@@ -973,9 +1001,8 @@ dialog::backdrop { background: rgba(0, 0, 0, .35); }
   .acct-side .mini-btn { margin-top: 0; }
   .acct-toggle-cell .acct-toggle { width: 100%; }
 
-  /* 任务明细：标签独占一行，分项小格两列、格内左标签右数值 */
-  .acct-tasks > summary { align-items: flex-start; }
-  .acct-tasks-label { flex-basis: 100%; }
+  /* 任务明细：折叠标题永远是单行紧凑文字；分项小格在折叠内部，两列、格内左标签右数值 */
+  .acct-tasks > summary { flex-wrap: nowrap; }
   .acct-metrics {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -993,28 +1020,16 @@ dialog::backdrop { background: rgba(0, 0, 0, .35); }
 @media (max-width: 600px) {
   body { font-size: 13px; }
 
-  /* 顶栏：品牌 + 状态胶囊一行、操作按钮一行、统计 + 地址一行（≤120px）。
-     地址只留 URL（标签与复制按钮隐藏）；完整无鉴权说明仍在页脚。 */
-  .topbar { padding: 8px 12px; gap: 8px; }
+  /* 顶栏：品牌 + 状态胶囊一行、操作按钮一行；地址与统计在 subbar 内一行，
+     地址只留 URL（标签隐藏，URL 省略号收口），完整无鉴权说明仍在页脚。 */
+  .topbar { padding: 8px 12px; gap: 8px 10px; }
   .brand-sub { display: none; }
-  .topbar-meta { display: contents; }
-  .topbar-actions { order: 2; margin-left: 0; }
-  .stats { order: 3; gap: 8px; }
-  .addr-note { display: none; }
-  .addr {
-    order: 3;
-    flex: 1 1 0;
-    min-width: 0;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    border-top: 0;
-    margin-top: 0;
-    padding-top: 0;
-  }
-  .addr-row { flex-wrap: nowrap; gap: 8px; min-width: 0; }
-  .addr .label, .addr .mini-btn { display: none; }
-  .addr-url { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .topbar-actions { margin-left: 0; }
+  .subbar { padding: 6px 12px; gap: 4px 12px; }
+  .stats { gap: 10px; }
+  .addr { flex: 1 1 120px; min-width: 0; }
+  .addr-row { gap: 8px; }
+  .addr .label { display: none; }
   /* 排程开关：提示整行下移，标签保持一整句不折断 */
   .switch-row { flex-wrap: wrap; row-gap: 8px; }
   .switch-row > span:not(.muted) { white-space: nowrap; }

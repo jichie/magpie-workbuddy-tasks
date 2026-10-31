@@ -16,6 +16,8 @@
 //   WB_DAEMON_ADDR  监听地址；缺省 127.0.0.1（Docker 内可设 0.0.0.0，只到容器网桥）
 //   WB_MANAGED      =1 表示由 magpie 宿主拉起（plugins.json 条目消失时允许自杀）
 //   MAGPIE_ADDR     magpie 网关地址（host:port），如 127.0.0.1:3499
+//   MAGPIE_PUBLIC_URL  magpie 对外共享地址（如 http://192.0.2.10:3425）；取其 hostname
+//                      作 /api/state serveUrl 的第②优先级（+守护进程自己的端口，§3）
 // 命令行：--addr <host:port|host|:port>  --port <n>  --cfg <dir>  --state <dir>
 // startDaemon 可注入（测试/嵌入用）：{ cfgDir, stateDir, port, key, args, engine,
 //   now, sleep, fetch, log, noTimers, skipExistingCheck, managed, runner }。
@@ -328,6 +330,119 @@ export function parseAddr(s, fallbackPort) {
     }
   }
   return { host, port }
+}
+
+// ---- serveUrl：看板显示/复制的「访问地址」 ---------------------------------
+//
+// 0.0.0.0/:: 是监听值不是访问值；看板顶栏要显示的是用户浏览器地址栏里那台机器的
+// 地址（如 http://192.0.2.10:4390/）。取值链（docs/CONTRACT.md §3）：
+//   ① 当前请求的 Host 头（最准确——用户实际就是用它访问的；外部输入，白名单校验）
+//   ② MAGPIE_PUBLIC_URL 的 hostname（magpie 对外共享地址）+ 守护进程自己的端口
+//   ③ bindHost（仅当是具体地址，不是 0.0.0.0/:: 通配）
+//   兜底：http://127.0.0.1:<port>/
+// 硬规则：返回串绝不含 0.0.0.0 / :: / *；只有 scheme://host[:port]/，不拼路径、
+// 查询串、凭据或 key。bindHost/port/reachableHint 字段原样保留（向后兼容）。
+
+const SERVE_HOSTNAME_MAX = 253 // RFC 1035 主机名长度上限
+const SERVE_HOST_MAX = 255 // host[:port] 总长上限（253 + ":" + 5 位端口）
+// 任何候选里出现监听值/通配记号 → 整串丢弃（宁可回退 127.0.0.1，不可上屏 0.0.0.0）
+const SERVE_BAD_ADDR_RE = /0\.0\.0\.0|::|\*/
+
+// Host 头白名单校验。通过 → {host, port}（host 为小写、不含端口；port 为显式端口
+// 或 null）；不通过 → null（调用方落到取值链下一级）。规则：
+//   - 字符集只允许 字母数字 . - _ [ ] :（空格/尖括号/斜杠/@/?/% 等一律拒绝——
+//     这同时挡死了路径穿越、userinfo、查询串注入）
+//   - 总长 ≤ 255、host 部分 ≤ 253；端口 1-65535 且无前导零
+//   - host 部分必须是：IPv4 字面量 | localhost | 单标签 LAN 主机名（不含点）|
+//     [IPv6] 方括号字面量；带点的非 IPv4（evil.com 这类公网/伪域名）不可信，拒绝
+//   - 0.0.0.0 / 含 0.0.0.0、::、* 的值一律拒绝（监听值不是访问值）
+export function sanitizeServeHost(raw) {
+  if (typeof raw !== "string") return null
+  const s = raw.trim()
+  if (!s || s.length > SERVE_HOST_MAX || !/^[\w.\-\[\]:]+$/.test(s)) return null
+  let hostPart = s
+  let portPart = null
+  if (s.startsWith("[")) {
+    const close = s.indexOf("]")
+    if (close < 0) return null
+    hostPart = s.slice(1, close)
+    const rest = s.slice(close + 1)
+    if (rest && !rest.startsWith(":")) return null
+    portPart = rest ? rest.slice(1) : null
+  } else if (net.isIPv6(s)) {
+    // 整串是 IPv6 全形字面量（bindHost 直接绑 IPv6 时的裸形态；HTTP 头里裸 IPv6
+    // 不合法，但当作无端口 host 处理同样安全）——不做 host:port 拆分
+  } else {
+    const i = s.indexOf(":")
+    if (i >= 0) {
+      hostPart = s.slice(0, i)
+      portPart = s.slice(i + 1)
+      if (portPart.includes(":")) return null // 无方括号的多个冒号 = 畸形 IPv6，拒
+    }
+  }
+  if (!hostPart || hostPart.length > SERVE_HOSTNAME_MAX) return null
+  let port = null
+  if (portPart != null) {
+    if (!/^\d{1,5}$/.test(portPart) || /^0\d/.test(portPart)) return null
+    const n = Number(portPart)
+    if (!(n >= 1 && n <= 65535)) return null
+    port = n
+  }
+  const shaped =
+    net.isIPv4(hostPart) ||
+    net.isIPv6(hostPart) || // Host 头 [IPv6] / bindHost 裸 IPv6 全形（缩写形含 :: 会被 BAD 拒）
+    hostPart.toLowerCase() === "localhost" ||
+    /^[A-Za-z0-9]([A-Za-z0-9_-]*[A-Za-z0-9])?$/.test(hostPart) // 单标签 LAN 主机名
+  if (!shaped) return null
+  if (SERVE_BAD_ADDR_RE.test(hostPart)) return null
+  return { host: hostPart.toLowerCase(), port }
+}
+
+// MAGPIE_PUBLIC_URL（运维显式声明的 magpie 对外共享地址）→ 展示用 hostname。
+// 属配置输入而非请求输入：放行公网域名，但仍查形状并拒绝通配/监听值。
+function publicServeHost(raw) {
+  if (typeof raw !== "string" || !raw.trim()) return null
+  let u
+  try {
+    u = new URL(raw.trim())
+  } catch {
+    return null
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return null
+  const h = u.hostname // URL 解析过的 hostname；IPv6 字面量带方括号
+  const bare = h.startsWith("[") && h.endsWith("]") ? h.slice(1, -1) : h
+  if (!bare || bare.length > SERVE_HOSTNAME_MAX) return null
+  if (!/^[\w.\-]+$/.test(bare) && !net.isIPv6(bare)) return null // 放行域名/单标签/IPv4/IPv6 全形
+  if (SERVE_BAD_ADDR_RE.test(bare)) return null
+  return bare.toLowerCase()
+}
+
+// 取值链合成（纯函数，测试可直接驱动）。port 为守护进程实际绑定端口（bind 后必 ≥1，
+// 异常输入按默认端口兜底）。任何一级产出含 0.0.0.0/::/* 都整串丢弃、继续下一级。
+export function computeServeUrl({ hostHeader, publicUrl, bindHost, port } = {}) {
+  const p = Number(port)
+  const safePort = Number.isFinite(p) && p > 0 ? p : DEFAULT_PORT
+  const bracket = (h) => (h.includes(":") ? `[${h}]` : h) // IPv6 字面量要加方括号
+  // ① Host 头（显式端口优先；无显式端口说明走的就是 80/默认映射，URL 不带端口）
+  const h = sanitizeServeHost(hostHeader)
+  if (h) {
+    const url = h.port != null ? `http://${bracket(h.host)}:${h.port}/` : `http://${bracket(h.host)}/`
+    if (!SERVE_BAD_ADDR_RE.test(url)) return url
+  }
+  // ② MAGPIE_PUBLIC_URL 的 hostname + 守护进程自己的端口
+  const pub = publicServeHost(publicUrl)
+  if (pub) {
+    const url = `http://${bracket(pub)}:${safePort}/`
+    if (!SERVE_BAD_ADDR_RE.test(url)) return url
+  }
+  // ③ bindHost 仅当具体地址（0.0.0.0/::/畸形在 sanitize 里已拒）
+  const b = sanitizeServeHost(bindHost)
+  if (b) {
+    const url = `http://${bracket(b.host)}:${safePort}/`
+    if (!SERVE_BAD_ADDR_RE.test(url)) return url
+  }
+  // 兜底
+  return `http://127.0.0.1:${safePort}/`
 }
 
 // ---- 引擎装载（engine/* 由另一个 agent 编写；缺失时全部优雅降级） ---------
@@ -1001,17 +1116,27 @@ export async function startDaemon(opts = {}) {
     }
   }
 
-  function statePayload() {
+  function statePayload(hostHeader) {
     const all = loadAccountsAll()
     const accts = loadAccountsCn(all)
     const cur = runner?.current?.() ?? null
     const payload = {
-      // 绑定信息（B）：前端展示可点开的看板地址用；bindHost 是真实监听 host，
-      // 绑定 0.0.0.0/:: 时 reachableHint 提示 SSH 隧道/局域网地址（否则空串）。
-      // 口径与 lifecycle.bindHint 一致；key 绝不出现在任何响应里。
+      // 绑定信息（B）：bindHost 是真实监听 host，绑定 0.0.0.0/:: 时 reachableHint
+      // 提示 SSH 隧道/局域网地址（否则空串）。口径与 lifecycle.bindHint 一致；
+      // 两个字段原样保留（向后兼容），但不再是前端显示地址的来源。
       bindHost: host,
       port,
       reachableHint: bindHint(host),
+      // 访问地址（前端顶栏显示/复制的唯一来源）：取值链 Host 头 →
+      // MAGPIE_PUBLIC_URL hostname + 本端口 → bindHost → 127.0.0.1 兜底，
+      // Host 头过白名单校验、绝不返回 0.0.0.0/::/*；只有 host[:port]，不拼
+      // key 或任何查询串（详见 docs/CONTRACT.md §3）。
+      serveUrl: computeServeUrl({
+        hostHeader,
+        publicUrl: process.env.MAGPIE_PUBLIC_URL,
+        bindHost: host,
+        port,
+      }),
       accounts: accts.map(accountRow),
       // 纯国内版诊断计数（只读）：国际版账号的数量与去向说明。绝不列出 intl
       // 账号内容（uid/昵称都不给）—— 用户明确要求国际版账号「彻底不出现」。
@@ -1279,7 +1404,7 @@ export async function startDaemon(opts = {}) {
         const uids = refresh === "1" || refresh === "true" ? eligibleNow().map((a) => a.uid) : [refresh]
         await refreshSnapshots(uids, 12000)
       }
-      json(res, 200, statePayload())
+      json(res, 200, statePayload(req.headers?.host))
       return
     }
 

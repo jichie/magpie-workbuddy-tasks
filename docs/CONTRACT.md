@@ -169,7 +169,7 @@ accessToken/refreshToken 的导出并关停守护进程（README 安全段如实
 
 ```
 GET  /api/hello                 -> {name, version, ready}
-GET  /api/state                 -> {bindHost, port, reachableHint,
+GET  /api/state                 -> {serveUrl, bindHost, port, reachableHint,
                                     intlSkipped:{count,note},   // 只读诊断计数：国际版账号
                                     // 的数量与去向说明（note="本插件只服务国内版 workbuddy，
                                     // 国际版账号不列出、不参与任务、不默认导出"）；绝不列出
@@ -191,8 +191,27 @@ GET  /api/state                 -> {bindHost, port, reachableHint,
                                     // 被占用顺延后可能与配置值不同）。bindHost 为 0.0.0.0/:: 时
                                     // reachableHint = 「仅容器网桥/局域网可达，请用 SSH 隧道或局域网地址访问，
                                     // 切勿发布到公网」（lifecycle.bindHint 的同一句口径），否则为 ""。
-                                    // 前端拼可点开的看板地址用 bindHost:port；**daemon 的 key 字段
-                                    // 绝不出现在任何响应、页面或日志里**（它只在 state/daemon.json，
+                                    // 两个字段保留原语义（向后兼容），但不再是前端显示地址的来源。
+                                    //
+                                    // serveUrl：看板顶栏「看板地址」显示/复制的访问地址，形如
+                                    // http://192.0.2.10:4390/。0.0.0.0/:: 是监听值不是访问值，
+                                    // 取值链按序取第一个可用项：
+                                    //   ① 当前请求的 Host 头——用户实际用来访问的地址，最准确
+                                    //     （显式端口进 URL；无显式端口 = 走 80/默认映射，URL 不带端口）
+                                    //   ② 环境变量 MAGPIE_PUBLIC_URL（magpie 对外共享地址，运维显式声明）
+                                    //     的 hostname + 守护进程自己的端口（不用该 URL 里的端口）
+                                    //   ③ bindHost（仅当是具体地址，0.0.0.0/:: 通配不用）
+                                    //   ④ 兜底 http://127.0.0.1:<port>/
+                                    // Host 头是外部输入，必须过白名单（daemon.sanitizeServeHost）：
+                                    // 字符集只允许 字母数字 . - _ [ ] :，总长 ≤255、host ≤253，
+                                    // 端口 1-65535 无前导零；host 部分必须是 IPv4 字面量 | localhost |
+                                    // 单标签 LAN 主机名 | [IPv6] 字面量，带点的非 IPv4（evil.com 这类
+                                    // 公网/伪域名）与含 0.0.0.0/::/* 的值一律拒绝、落到下一级。
+                                    // MAGPIE_PUBLIC_URL 是配置输入，放行公网域名，但同样拒绝通配/
+                                    // 监听值（IPv6 字面量经 URL 规范化必含 ::，同样拒绝落级）。
+                                    // serveUrl 只含 scheme://host[:port]/——**绝不拼入 key
+                                    // 或任何查询串**，也绝不返回含 0.0.0.0/::/* 的地址（daemon 的 key
+                                    // 字段绝不出现在任何响应、页面或日志里，它只在 state/daemon.json，
                                     // 0600，向后兼容保留、不是访问凭据——API 全部免密钥）。
                                     // snapshot.tasks 的字段名 = §2 的规范 Task（daemon 只做投影，不猜第二种拼写）；
                                     // acceptStatus 是上游字符串状态（"not_accepted"|"accepted"|"completed"|"claimed"）

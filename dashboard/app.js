@@ -2,11 +2,12 @@
 //
 // 数据面（只消费 daemon.mjs 真实存在的路由，绝不发明接口）：
 //   GET  /api/hello            -> {name, version, ready}
-//   GET  /api/state[?refresh=1|<uid>] -> {bindHost, port, reachableHint,
+//   GET  /api/state[?refresh=1|<uid>] -> {serveUrl, bindHost, port, reachableHint,
 //                                        accounts, intlSkipped, scheduler, job, stats, settings, notice?, engineErrors?}
-//        顶层 bindHost/port/reachableHint = 真实监听 host、实际端口（顺延后真值）与通绑定提示
-//        （bindHost 为 0.0.0.0/:: 时非空）——顶栏「看板地址」项据此渲染；老后端缺字段时回退
-//        页面自身 origin，绝不报错（见 addrModel）
+//        顶层 serveUrl = 守护进程算好的「用户可达地址」（Host 头 → MAGPIE_PUBLIC_URL
+//        → bindHost 取值链，绝不返回 0.0.0.0/::/*）——顶栏「看板地址」项显示/复制的
+//        唯一来源；bindHost/port/reachableHint 保留（通绑定的安全提示仍用 reachableHint），
+//        老后端缺 serveUrl 时回退 bindHost 拼地址 / 页面自身 origin，绝不报错（见 addrModel）
 //        accounts[] 只含国内版（provider === "workbuddy"）；国际版不再出现在列表里。
 //        intlSkipped = {count, note}：被忽略的国际版账号数量与说明（只给数字，绝不给账号内容）。
 //        scheduler.holds = [{uid, nickname, releasedAt(ISO)}] —— 真正的风控冷却（403/11140）名单
@@ -342,19 +343,23 @@ async function copyText(text) {
 
 // ---- 顶栏渲染 -----------------------------------------------------------------------------
 
-// ---- 看板地址（消费 /api/state 顶层 bindHost / port / reachableHint） --------------------
-// 三种分支（CONTRACT §3 口径）：
-//   loopback：reachableHint 为 ""（回环绑定）→ http://<bindHost>:<port>/ + 复制按钮
-//   wildcard：reachableHint 非空（通绑定，典型 Docker/NAS）→ 占位地址 + hint 全文 +
-//             docker inspect / ssh -L 命令模板（各带复制按钮）。0.0.0.0 是监听值不是
-//             访问值，绝不渲染成可点地址。
-//   fallback：老后端三字段 undefined → 回退页面自身 origin（看板由守护进程同源服务），
-//             再兜底默认端口 4390；绝不报错。
+// ---- 看板地址（消费 /api/state 顶层 serveUrl；bindHost/port/reachableHint 兜底） --------
+// serveUrl 是守护进程算好的「用户可达地址」（Host 头 → MAGPIE_PUBLIC_URL → bindHost
+// 取值链，CONTRACT §3；0.0.0.0 是监听值不是访问值，serveUrl 绝不含它）：
+//   served：serveUrl 存在且形状合法（http(s)://host[:port]/，无查询串/凭据）→
+//           直接显示/复制这一串；通绑定的安全提示仍按 reachableHint 给进 title。
+//   loopback / wildcard / fallback：老后端（缺 serveUrl）时的既有逻辑——
+//           reachableHint 为 "" → http://<bindHost>:<port>/；通绑定 → 占位地址 +
+//           hint（title）；字段全缺 → 回退页面自身 origin（看板由守护进程同源服务），
+//           再兜底默认端口 4390；绝不报错。
 // key 永不进地址 / 复制内容 / title：地址项只显示 http://host:port/ 路径。
-// 守护进程无鉴权：地址旁只提示「默认只绑回环」，完整安全口径在页脚。
+// 顶栏只留品牌/状态/操作；这里渲染的是顶栏下方的一行次要文字（地址 + 今日统计），
+// 完整安全口径只在页脚，地址行不再重复无鉴权说明。
 
 const DEFAULT_PORT = 4390;
-const SECURITY_NOTE = "看板无鉴权 · 默认只绑 127.0.0.1";
+// serveUrl 形状防御：http(s) + 主机字面量（字母数字 . - _ []）+ 可选端口 + 结尾 /。
+// 不收 @（userinfo）、?、#、空白等——老后端/异常值一律不采用，走原有兜底。
+const SERVE_URL_RE = /^https?:\/\/[\w.\-\[\]]+(:\d{1,5})?\/$/;
 
 function isWildcardBind(host) {
   return host === "0.0.0.0" || host === "::";
@@ -370,6 +375,11 @@ export function addrModel(d) {
   const port = Number.isFinite(rawPort) && rawPort > 0 ? rawPort : null;
   const bindHost = typeof d?.bindHost === "string" && d.bindHost.trim() ? d.bindHost.trim() : "";
   const hint = typeof d?.reachableHint === "string" ? d.reachableHint.trim() : null;
+  const served = typeof d?.serveUrl === "string" ? d.serveUrl.trim() : "";
+  if (SERVE_URL_RE.test(served)) {
+    // 新后端：守护进程已按取值链给出可达地址，前端只做形状防御后直接采用。
+    return { mode: "served", url: served, port, hint: hint || "", bindHost, docker: bindHost === "0.0.0.0" };
+  }
   if (port == null || !bindHost || hint == null) {
     // 老后端：字段缺失 → 用当前页面 origin（就是用户正在访问的真实地址），
     // 非浏览器环境或 file:// 等再兜底默认端口，任何情况都不抛错。
@@ -407,8 +417,9 @@ function renderAddr() {
   const copyBtn = (text, label) =>
     el("button", {
       type: "button",
-      class: "mini-btn",
+      class: "mini-btn addr-copy",
       text: "复制",
+      title: `复制${label}`,
       "aria-label": `复制${label}`,
       onclick: async (ev) => {
         const ok = await copyText(text);
@@ -417,48 +428,22 @@ function renderAddr() {
       },
     });
 
-  const rows = [];
-  if (m.mode !== "wildcard") {
-    rows.push(
-      el("div", { class: "addr-row" },
-        el("span", { class: "label", text: "看板地址" }),
-        el("code", { class: "addr-url", text: m.url }),
-        copyBtn(m.url, "看板地址"),
-        el("span", { class: "addr-note", text: SECURITY_NOTE }),
-      ),
-    );
-  } else {
-    rows.push(
-      el("div", { class: "addr-row" },
-        el("span", { class: "label", text: "看板地址" }),
-        el("code", { class: "addr-url", text: m.url }),
-        el("span", {
-          class: "addr-note",
-          text: `把 <本机可达地址> 换成容器 IP 或局域网地址；SSH 隧道映射后仍可用 http://127.0.0.1:${m.port}/ 打开`,
-        }),
-      ),
-      el("div", { class: "addr-row" },
-        el("span", { class: "addr-note", text: m.hint ? `${m.hint} · ${SECURITY_NOTE}` : SECURITY_NOTE }),
-      ),
-    );
-    if (m.docker) {
-      const ipCmd = 'docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" magpie';
-      const sshCmd = `ssh -L ${m.port}:<容器IP>:${m.port} <user>@<NAS地址>`;
-      rows.push(
-        el("div", { class: "addr-row" },
-          el("span", { class: "addr-note", text: "查容器 IP" }),
-          el("code", { class: "addr-cmd", text: ipCmd }),
-          copyBtn(ipCmd, "查容器 IP 命令"),
-        ),
-        el("div", { class: "addr-row" },
-          el("span", { class: "addr-note", text: "SSH 隧道" }),
-          el("code", { class: "addr-cmd", text: sshCmd }),
-          copyBtn(sshCmd, "SSH 隧道命令"),
-        ),
-      );
-    }
-  }
-  box.replaceChildren(...rows);
+  // 一行次要文字：地址 + 复制。通绑定的说明（含容器/SSH 提示，served/wildcard 都给）
+  // 进 title，不再堆第二/第三行；窄屏隐藏「看板地址」标签，只留 URL（省略号收口）+
+  // 复制按钮。served 模式显示的就是真实可达地址，占位地址写法已移除。
+  const hint = m.hint || m.docker
+    ? [m.hint, m.docker ? "容器内可用 docker inspect 查 IP；或 ssh -L 做端口映射" : ""]
+        .filter(Boolean)
+        .join(" · ")
+    : "";
+  const row = el(
+    "div",
+    { class: "addr-row", title: hint || null },
+    el("span", { class: "label", text: "看板地址" }),
+    el("code", { class: "addr-url", text: m.url }),
+    copyBtn(m.url, "看板地址"),
+  );
+  box.replaceChildren(row);
   box.hidden = false;
 }
 
@@ -1075,6 +1060,20 @@ function snapMetrics(snap) {
   return el("span", { class: "acct-metrics" }, ...cells);
 }
 
+// 折叠标题只留一行紧凑文字（完整汇总在 title）：任务明细 · 19 项 · 可接取 5 · 待领奖 0。
+// 数字与 snapMetrics/taskSummary 同源；老后端没有 canAccept 字段时不硬编造这一项。
+function snapBrief(snap) {
+  const c = snapCounts(snap);
+  if (!c) return "任务明细 · 无快照";
+  const parts = ["任务明细", `${c.total} 项`];
+  const flags = (snap.tasks ?? []).map(taskFlags);
+  if (flags.some((f) => f.modern)) {
+    parts.push(`可接取 ${flags.filter((f) => f.canAccept).length}`);
+  }
+  parts.push(`待领奖 ${c.pending}`);
+  return parts.join(" · ");
+}
+
 function accountRow(a) {
   const isApiKey = String(a.masked ?? "").startsWith("API key");
   const uid = String(a.uid ?? "");
@@ -1160,14 +1159,21 @@ function accountRow(a) {
     { class: "acct-tasks" },
     el(
       "summary",
-      { class: "acct-tasks-head fold-sum" },
+      {
+        class: "acct-tasks-head fold-sum",
+        title: a.snapshot ? taskSummary(a.snapshot) : "任务快照：无（点「刷新快照」读取）",
+      },
       el("span", {
         class: expired ? "acct-tasks-label fold-label warn-text" : "acct-tasks-label fold-label",
-        text: expired ? "任务明细 · 快照已过期" : "任务明细",
+        text: snapBrief(a.snapshot),
       }),
-      snapMetrics(a.snapshot),
     ),
-    taskTable(a),
+    el(
+      "div",
+      { class: "acct-tasks-body" },
+      snapMetrics(a.snapshot),
+      taskTable(a),
+    ),
   );
   if (state.expanded.has(uid)) tasks.open = true;
   tasks.addEventListener("toggle", () => {

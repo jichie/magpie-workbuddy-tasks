@@ -19,21 +19,26 @@
     <div class="topbar-meta">
       <span class="pill pill-quiet" id="daemonPill" role="status" aria-live="polite">检查中…</span>
       <span class="pill pill-quiet" id="feedPill">未连接</span>
-      <dl class="stats" aria-label="今日收益">
-        <div><dt>今日积分</dt><dd id="statCredits">—</dd></div>
-        <div><dt>今日能量</dt><dd id="statEnergy">—</dd></div>
-        <div><dt>轮次</dt><dd id="statRuns">—</dd></div>
-      </dl>
     </div>
     <div class="topbar-actions">
       <button type="button" class="btn-quiet" id="themeBtn" aria-label="切换主题">主题：跟随系统</button>
       <button type="button" class="btn-quiet" id="daemonStartBtn">启动命令</button>
       <button type="button" class="btn-warn-quiet btn-quiet" id="daemonStopBtn">停止守护进程</button>
     </div>
-    <!-- 看板地址：连上守护进程后由 app.js 按 /api/state 的 bindHost/port/reachableHint 渲染。
-         地址只显示 http://host:port/。 -->
-    <div class="addr" id="addrBox" hidden aria-label="看板地址"></div>
   </header>
+
+  <!-- 顶栏只留品牌 / 状态 / 操作；看板地址与今日统计合并在这一行次要文字里
+       （地址复制按钮同处，安全说明只在页脚，绝不堆进 header）。 -->
+  <div class="subbar">
+    <!-- 看板地址：连上守护进程后由 app.js 按 /api/state 的 serveUrl 渲染（bindHost/port/
+         reachableHint 仅作老后端兜底）。地址只显示 http://host:port/，绝不含 0.0.0.0。 -->
+    <div class="addr" id="addrBox" hidden aria-label="看板地址"></div>
+    <dl class="stats" aria-label="今日收益">
+      <div><dt>今日积分</dt><dd id="statCredits">—</dd></div>
+      <div><dt>今日能量</dt><dd id="statEnergy">—</dd></div>
+      <div><dt>轮次</dt><dd id="statRuns">—</dd></div>
+    </dl>
+  </div>
 
   <main id="main" class="main">
 
