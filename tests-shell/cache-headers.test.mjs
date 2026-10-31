@@ -11,15 +11,20 @@
 //      会断流），且 Content-Type 仍是 text/event-stream
 // 断言全部走 fetch Headers API（键名大小写不敏感），另对原始报文做一次小写复核。
 
-import { test, describe } from "node:test"
+import { test, describe, after } from "node:test"
 import assert from "node:assert/strict"
 import http from "node:http"
-import { mkdtempSync } from "node:fs"
-import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { startDaemon } from "../daemon.mjs"
+import { cleanupAllSandboxes, makeSandbox } from "../tests/helpers.mjs"
 
 const KEY = "cache-headers-test-key-0123"
+
+// 兜底：boot() 内部创建的沙箱（每条用例独占，并发隔离是刻意的 —— 状态文件以
+// stateDir 为边界）在文件收尾统一回收；见 helpers.mjs 三道卫生线。
+after(() => {
+  cleanupAllSandboxes()
+})
 
 function fakeEngine() {
   return {
@@ -36,7 +41,7 @@ async function boot() {
   return startDaemon({
     key: KEY,
     port: 0,
-    stateDir: mkdtempSync(join(tmpdir(), "wb-cache-")),
+    stateDir: makeSandbox("wb-cache-").dir,
     engine: fakeEngine(),
     noTimers: true,
     skipExistingCheck: true,

@@ -2,18 +2,24 @@
 // 独立临时 cfg/state + 假 engine（store 用真实的 engine/store.mjs），零真实网络、
 // 零真实凭据。口径见 docs/CONTRACT.md §3（免密钥 + 路由登记表）与 §9（导入导出）。
 
-import { test, describe } from "node:test"
+import { test, describe, after } from "node:test"
 import assert from "node:assert/strict"
 import { createHash } from "node:crypto"
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 
 import { startDaemon, routeNeedsKey, API_ROUTE_AUTH } from "../daemon.mjs"
 import { eligibleAccounts, loadAccounts } from "../engine/store.mjs"
 import { cnRow, makeJwt, nineEntryAuth } from "../tests/accountio-fixture.mjs"
+import { cleanupAllSandboxes, makeSandbox } from "../tests/helpers.mjs"
 
 const KEY = "account-routes-test-key-0123456789"
+
+// 兜底：boot() 已在 cleanup() 里即删（finally 调用）；这里再兜一层 —— 个别用例
+// 漏删时在文件收尾统一回收（每条用例独占沙箱是刻意的并发隔离）。
+after(() => {
+  cleanupAllSandboxes()
+})
 const NOW = new Date(2026, 9, 31, 12, 0, 0).getTime()
 const DAY = 86400000
 const expSecIn = (days) => Math.floor(NOW / 1000) + days * 86400
@@ -32,29 +38,29 @@ function realStoreEngine() {
 }
 
 async function boot({ authObj = null, authText = null } = {}) {
-  const cfg = mkdtempSync(join(tmpdir(), "wb-acct-routes-cfg-"))
-  const state = mkdtempSync(join(tmpdir(), "wb-acct-routes-state-"))
-  if (authText !== null) writeFileSync(join(cfg, "plugin-auth.json"), authText)
-  else if (authObj) writeFileSync(join(cfg, "plugin-auth.json"), JSON.stringify(authObj, null, 2) + "\n")
+  const cfg = makeSandbox("wb-acct-routes-cfg-") // 每条用例独占 temp 沙箱，用完即删（见 helpers.mjs）
+  const state = makeSandbox("wb-acct-routes-state-")
+  if (authText !== null) writeFileSync(join(cfg.dir, "plugin-auth.json"), authText)
+  else if (authObj) writeFileSync(join(cfg.dir, "plugin-auth.json"), JSON.stringify(authObj, null, 2) + "\n")
   const h = await startDaemon({
     key: KEY,
     port: 0,
-    cfgDir: cfg,
-    stateDir: state,
+    cfgDir: cfg.dir,
+    stateDir: state.dir,
     engine: realStoreEngine(),
     now: () => NOW,
     noTimers: true,
     skipExistingCheck: true,
   })
-  const authFile = join(cfg, "plugin-auth.json")
+  const authFile = join(cfg.dir, "plugin-auth.json")
   return {
     h,
-    cfg,
-    state,
+    cfg: cfg.dir,
+    state: state.dir,
     authFile,
     cleanup: () => {
-      rmSync(cfg, { recursive: true, force: true })
-      rmSync(state, { recursive: true, force: true })
+      cfg.cleanup()
+      state.cleanup()
     },
   }
 }
@@ -145,8 +151,8 @@ describe("免密钥口径 HTTP 实测", () => {
       assert.equal(preview.status, 200)
       assert.equal((await preview.json()).wrote, false)
     } finally {
-      env.cleanup()
       await env.h.stop()
+      env.cleanup() // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 
@@ -186,8 +192,8 @@ describe("免密钥口径 HTTP 实测", () => {
       assert.equal((await get(env.h.port, "/api/accounts/export?secrets=1", "wrong-key")).status, 200)
       assert.equal((await get(env.h.port, "/api/accounts/export?secrets=1&k=whatever")).status, 200)
     } finally {
-      env.cleanup()
       await env.h.stop()
+      env.cleanup() // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 
@@ -226,8 +232,8 @@ describe("免密钥口径 HTTP 实测", () => {
       // 预览的 skip 报告也不含 token
       assert.ok(!maskedBodies[4].includes("eyJ"))
     } finally {
-      env.cleanup()
       await env.h.stop()
+      env.cleanup() // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 })
@@ -258,8 +264,8 @@ describe("GET /api/accounts/export（hub 语义 + 纯国内版默认）", () => 
       assert.equal(cn.realm, "cn")
       assert.equal(cn.nickname, "阿猫")
     } finally {
-      env.cleanup()
       await env.h.stop()
+      env.cleanup() // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 
@@ -303,8 +309,8 @@ describe("GET /api/accounts/export（hub 语义 + 纯国内版默认）", () => 
       assert.equal(weird.count, 2)
       assert.ok(weird.accounts.every((r) => r.realm === "cn"))
     } finally {
-      env.cleanup()
       await env.h.stop()
+      env.cleanup() // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 })
@@ -330,8 +336,8 @@ describe("POST /api/accounts/import（两段式）", () => {
       assert.equal(readFileSync(env.authFile, "utf8"), beforeBytes, "预览后文件逐字节不变")
       assert.deepEqual(readdirSync(env.cfg).sort(), dirBefore, "预览不产生任何新文件（含备份）")
     } finally {
-      env.cleanup()
       await env.h.stop()
+      env.cleanup() // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 
@@ -374,8 +380,8 @@ describe("POST /api/accounts/import（两段式）", () => {
       const untouched = stateBody.accounts.find((a) => a.uid === "cn-uid-a")
       assert.equal(untouched.imported, false)
     } finally {
-      env.cleanup()
       await env.h.stop()
+      env.cleanup() // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 
@@ -427,8 +433,8 @@ describe("POST /api/accounts/import（两段式）", () => {
       const stateBody = await (await get(env.h.port, "/api/state", KEY)).json()
       assert.equal(stateBody.accounts.find((a) => a.uid === "cn-uid-b").imported, true)
     } finally {
-      env.cleanup()
       await env.h.stop()
+      env.cleanup() // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 
@@ -447,8 +453,8 @@ describe("POST /api/accounts/import（两段式）", () => {
       assert.equal(readFileSync(env.authFile, "utf8"), beforeBytes, "零写盘")
       assert.equal(readdirSync(env.cfg).filter((f) => f.includes(".bak-hubimport")).length, 0, "没有可写变更就不备份")
     } finally {
-      env.cleanup()
       await env.h.stop()
+      env.cleanup() // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 
@@ -472,8 +478,8 @@ describe("POST /api/accounts/import（两段式）", () => {
       assert.equal(ok.status, 200)
       assert.equal((await ok.json()).wrote, true)
     } finally {
-      env.cleanup()
       await env.h.stop()
+      env.cleanup() // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 
@@ -487,8 +493,8 @@ describe("POST /api/accounts/import（两段式）", () => {
       assert.equal(cf.status, 409)
       assert.equal(readFileSync(env.authFile, "utf8"), "{broken")
     } finally {
-      env.cleanup()
       await env.h.stop()
+      env.cleanup() // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 
@@ -520,8 +526,8 @@ describe("POST /api/accounts/import（两段式）", () => {
         await env2.h.stop()
       }
     } finally {
-      env.cleanup()
       await env.h.stop()
+      env.cleanup() // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 })

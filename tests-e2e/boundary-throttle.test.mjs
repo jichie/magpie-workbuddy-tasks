@@ -16,10 +16,10 @@
 
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { startDaemon } from "../daemon.mjs";
+import { makeSandbox } from "../tests/helpers.mjs";
 
 const DAEMON_KEY = "bt-e2e-key-0123456789abcdef";
 const UID = "u-bt0001";
@@ -90,7 +90,11 @@ const tasksClaimed = new Set(); // skill_1 只成功领一次，之后如实 400
 
 // ---- 夹具 ------------------------------------------------------------------------
 
-const root = mkdtempSync(join(tmpdir(), "wb-tasks-bt-"));
+// 全文件共用一个 temp 沙箱：单 daemon 单账号的连续时序故事，共享目录是有意设计
+// （与 tests/、tests-shell/ 的「每用例独立沙箱」并发隔离不冲突 —— 用例间零共享
+// 状态）。登记进 helpers 卫生线（after 兜底 + exit 钩子都回收它）。
+const rootSb = makeSandbox("wb-tasks-bt-");
+const root = rootSb.dir;
 const cfgDir = join(root, "config");
 const stateDir = join(cfgDir, "workbuddy-tasks", "state");
 mkdirSync(stateDir, { recursive: true });
@@ -251,6 +255,6 @@ after(async () => {
     await h?.stop();
   } catch {}
   try {
-    rmSync(root, { recursive: true, force: true });
+    rootSb.cleanup();
   } catch {}
 });

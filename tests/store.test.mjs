@@ -1,7 +1,7 @@
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, statSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 import {
@@ -13,11 +13,18 @@ import {
   stateDir,
   tasksStateFile,
 } from "../engine/store.mjs";
+import { cleanupAllSandboxes, cleanupSandbox, makeSandbox } from "./helpers.mjs";
 
+// 每条用例独占一个 temp 沙箱（并发隔离：node --test 多进程并行 + 用例交错，
+// daemon 状态文件以 stateDir 为边界，共享目录会互相踩）；用完即删，见 helpers.mjs。
 function tmpCfg() {
-  const dir = mkdtempSync(join(tmpdir(), "wbtasks-test-"));
-  return dir;
+  return makeSandbox("wb-store-").dir;
 }
+
+// 兜底：个别用例漏删时在文件收尾统一回收（正常情况下登记簿已是空的）。
+after(() => {
+  cleanupAllSandboxes();
+});
 
 const AUTH = {
   workbuddy: {
@@ -83,10 +90,10 @@ test("loadAccounts：只吃 workbuddy* 条目，映射成内部形状", () => {
       writeFileSync(authFile(bad), "{not json");
       assert.deepEqual(loadAccounts(bad), []);
     } finally {
-      rmSync(bad, { recursive: true, force: true });
+      cleanupSandbox(bad);
     }
   } finally {
-    rmSync(cfg, { recursive: true, force: true });
+    cleanupSandbox(cfg);
   }
 });
 
@@ -117,7 +124,7 @@ test("loadAccounts：tasksEnabled 来自本插件状态文件（uid 或 acctKey 
     assert.deepEqual(enabled.includes("uid-1"), false);
     assert.deepEqual(enabled.includes("uid-2"), false);
   } finally {
-    rmSync(cfg, { recursive: true, force: true });
+    cleanupSandbox(cfg);
   }
 });
 
@@ -150,7 +157,7 @@ test("saveAccountRefresh：只改 token 字段，未知字段与兄弟条目原�
     assert.equal(raw["other-provider"].access, "xx");
     assert.equal(raw["workbuddy-tasks"].key, "shared");
   } finally {
-    rmSync(cfg, { recursive: true, force: true });
+    cleanupSandbox(cfg);
   }
 });
 
@@ -170,7 +177,7 @@ test("saveAccountRefresh：原子落盘（无 tmp 残留）、合法 JSON、权�
       assert.equal(mode, 0o600);
     }
   } finally {
-    rmSync(cfg, { recursive: true, force: true });
+    cleanupSandbox(cfg);
   }
 });
 
@@ -181,7 +188,7 @@ test("saveAccountRefresh：文件不存在时创建（不丢其它 provider—�
     const raw = JSON.parse(readFileSync(authFile(cfg), "utf8"));
     assert.deepEqual(raw, { workbuddy: { access: "at-new", refresh: "rt-new", expires: 5 } });
   } finally {
-    rmSync(cfg, { recursive: true, force: true });
+    cleanupSandbox(cfg);
   }
 });
 
@@ -192,7 +199,7 @@ test("saveAccountRefresh：坏 JSON 拒绝回写（不冒丢数据的风险）",
     assert.throws(() => saveAccountRefresh(cfg, "workbuddy", { access: "x" }), /拒绝回写/);
     assert.equal(readFileSync(authFile(cfg), "utf8"), "{broken");
   } finally {
-    rmSync(cfg, { recursive: true, force: true });
+    cleanupSandbox(cfg);
   }
 });
 

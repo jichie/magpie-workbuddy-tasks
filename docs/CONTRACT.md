@@ -412,7 +412,8 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
   批次）、快照 energy/streak 只认 data.balance / data.streak.days（毒键不误读）；
 - store：回写只改 access/refresh/expires，保留未知字段，产出合法 JSON 且权限 600；
 - runner：两个 `start()` → 第二个 409；`stop()` 能在步骤边界中止；
-- schedule：窗口判定（09:00/21:00 成长+旅行，01:00 夜猫，夜猫只认 23:00–08:00）。
+- schedule：窗口判定（09:00/21:00 成长+旅行，01:00 夜猫，夜猫只认 23:00–08:00）；
+- 沙箱卫生：测试 temp 沙箱一律走 `tests/helpers.mjs` 的 `makeSandbox()`（用完即删 + after/exit 兜底），跑完套件 temp 不残留 `wb-*` 沙箱（`tests/sandbox-hygiene.test.mjs` 钉死）。
 
 ## 9. 账号 JSON 导入 / 导出（hub 移植口径；engine/accountio.mjs）
 

@@ -27,8 +27,7 @@ import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import net from "node:net";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { startDaemon } from "../daemon.mjs";
@@ -42,6 +41,7 @@ import {
   writeControl,
 } from "../lifecycle.mjs";
 import { makeUpstreamStub } from "./upstream-stub.mjs";
+import { makeSandbox } from "../tests/helpers.mjs";
 
 const PLUGIN_ROOT = fileURLToPath(new URL("../", import.meta.url));
 
@@ -142,7 +142,12 @@ const SECRET_STRINGS = [
 
 // ---- 全局夹具 ------------------------------------------------------------------
 
-const root = mkdtempSync(join(tmpdir(), "wb-tasks-e2e-"));
+// 全文件共用一个 temp 沙箱：e2e 全回路是一条连续故事（同一 daemon、同一
+// plugin-auth.json、同一 state 被跨用例断言），共享目录在这里是有意设计；
+// 与 tests/、tests-shell/ 的「每用例独立沙箱」并发隔离不冲突 —— 那些文件的
+// 用例之间零共享状态。登记进 helpers 卫生线（after 兜底 + exit 钩子都回收它）。
+const rootSb = makeSandbox("wb-tasks-e2e-");
+const root = rootSb.dir;
 const cfgDir = join(root, "config");
 const stateDir = join(cfgDir, "workbuddy-tasks", "state"); // 生产布局 stateDirFor(cfgDir)
 mkdirSync(stateDir, { recursive: true });
@@ -275,7 +280,7 @@ after(async () => {
     gateway.close();
   } catch {}
   try {
-    rmSync(root, { recursive: true, force: true });
+    rootSb.cleanup();
   } catch {}
 });
 

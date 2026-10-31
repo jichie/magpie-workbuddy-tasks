@@ -7,15 +7,21 @@
 // 通配绑定（0.0.0.0/::）的端到端断言在容器里做（本机不给 node 绑通配地址，
 // 避免 Windows 防火墙弹窗）；这里覆盖 parseAddr/bindHint 单元 + 127.0.0.1 集成。
 
-import { test, describe } from "node:test"
+import { test, describe, after } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, readFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { readFileSync } from "node:fs"
 import { join } from "node:path"
 import { startDaemon, parseAddr } from "../daemon.mjs"
 import { WILDCARD_HINT, bindHint, isWildcardHost, readDaemonInfo } from "../lifecycle.mjs"
+import { cleanupAllSandboxes, makeSandbox } from "../tests/helpers.mjs"
 
 const KEY = "bind-addr-test-key-0123456789"
+
+// 兜底：boot() 内部创建的沙箱（每条用例独占，并发隔离是刻意的 —— 状态文件以
+// stateDir 为边界）在文件收尾统一回收；见 helpers.mjs 三道卫生线。
+after(() => {
+  cleanupAllSandboxes()
+})
 
 function fakeEngine() {
   return {
@@ -35,7 +41,7 @@ async function boot(extra = {}) {
   const h = await startDaemon({
     key: KEY,
     port: 0,
-    stateDir: mkdtempSync(join(tmpdir(), "wb-bind-")),
+    stateDir: makeSandbox("wb-bind-").dir,
     engine: fakeEngine(),
     noTimers: true,
     skipExistingCheck: true,

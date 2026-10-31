@@ -14,17 +14,32 @@
 //      snapshot:null —— 前端显示「快照已过期，请刷新」，绝不带错误判断渲染。
 // 零真实网络：fetch/时钟全注入，并断言缓存读取路径一次上游请求都不发。
 
-import { test, describe } from "node:test"
+import { test, describe, after } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 
 import { SNAP_VERSION, canReprojectTask, projectSnapshot, snapTask, startDaemon } from "../daemon.mjs"
 import { fetchTasks } from "../engine/tasks.mjs"
-import { fakeClock, localTime, makeAcct, task, wbBackend } from "../tests/helpers.mjs"
+import {
+  cleanupAllSandboxes,
+  cleanupSandbox,
+  fakeClock,
+  localTime,
+  makeAcct,
+  makeSandbox,
+  task,
+  wbBackend,
+} from "../tests/helpers.mjs"
 
 const KEY = "test-key-snap-cache"
+
+// 兜底：bootWithCache 内部创建的沙箱（每条用例独占，并发隔离是刻意的 —— 缓存
+// 形态断言都落在 stateDir/snapshots.json 上）在文件收尾统一回收；见 helpers.mjs
+// 三道卫生线。
+after(() => {
+  cleanupAllSandboxes()
+})
 const jumpOf = (id) =>
   `https://www.workbuddy.cn/work/launch/?deeplink=workbuddy%3A%2F%2Fexperts%3FexpertId%3D${id}&buddy_type=workbuddy`
 
@@ -209,7 +224,7 @@ function engineFor(recorder, throwOnCall = true) {
 }
 
 async function bootWithCache(cache, hooks) {
-  const stateDir = mkdtempSync(join(tmpdir(), "wb-tasks-cache-"))
+  const stateDir = makeSandbox("wb-tasks-cache-").dir
   writeFileSync(join(stateDir, "snapshots.json"), JSON.stringify(cache, null, 2) + "\n")
   const h = await startDaemon({
     key: KEY,
@@ -325,7 +340,7 @@ describe("P2 集成：版本戳不符 / 缺字段 → 整份过期，宁可空�
 
 describe("P2 集成：落盘规范 Task + snapVersion；重启后缓存读出 === 直接刷新（幂等）", () => {
   test("?refresh=1 落盘投影前形状（判断字段不落盘）；换进程读缓存与刷新结果逐字节一致", async () => {
-    const stateDir = mkdtempSync(join(tmpdir(), "wb-tasks-cache-"))
+    const stateDir = makeSandbox("wb-tasks-cache-").dir
     const canonical = await canonicalTasks()
 
     // 进程 A（直接刷新路径）：fetchTasks 吐真实引擎的 canonical Task
@@ -365,6 +380,7 @@ describe("P2 集成：落盘规范 Task + snapVersion；重启后缓存读出 ==
       assert.deepEqual(snapB, snapA, "重建投影 === 直接刷新投影（幂等）")
     } finally {
       await hB.stop()
+      cleanupSandbox(stateDir) // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 })

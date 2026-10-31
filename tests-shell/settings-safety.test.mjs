@@ -4,14 +4,20 @@
 // 不会自动往上游打请求；只有 POST /api/settings 显式开启才生效；排程 tick 在
 // 关闭时绝不动作（不启动 job、不写 lastFired.json）。node --test，fake engine。
 
-import { test, describe } from "node:test"
+import { test, describe, after } from "node:test"
 import assert from "node:assert/strict"
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { existsSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { startDaemon } from "../daemon.mjs"
+import { cleanupAllSandboxes, cleanupSandbox, makeSandbox } from "../tests/helpers.mjs"
 
 const KEY = "settings-safety-test-key-0123456789"
+
+// 兜底：个别用例漏删时在文件收尾统一回收（每条用例独占沙箱是刻意的并发隔离：
+// settings.json/lastFired.json 都以 stateDir 为边界）；见 helpers.mjs 三道卫生线。
+after(() => {
+  cleanupAllSandboxes()
+})
 
 // fake engine：runner 可启动/查询（契约 §2 最小形状），账号 u1 可参与
 function fakeEngine() {
@@ -104,7 +110,7 @@ const waitQuiet = async (h) => {
 
 describe("C1：scheduler 安全默认", () => {
   test("settings.json 缺失 → /api/state scheduler.enabled=false，落盘默认值也是 false", async () => {
-    const stateDir = mkdtempSync(join(tmpdir(), "wb-safe-"))
+    const stateDir = makeSandbox("wb-safe-").dir
     assert.equal(existsSync(join(stateDir, "settings.json")), false, "boot 前不该有 settings.json")
     const h = await boot(stateDir)
     try {
@@ -116,11 +122,12 @@ describe("C1：scheduler 安全默认", () => {
       assert.equal(onDisk.claim, true)
     } finally {
       await h.stop()
+      cleanupSandbox(stateDir) // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 
   test("settings.json 损坏 → 回落安全（scheduler=false），/api/settings 仍可显式开启并持久化", async () => {
-    const stateDir = mkdtempSync(join(tmpdir(), "wb-safe-"))
+    const stateDir = makeSandbox("wb-safe-").dir
     writeFileSync(join(stateDir, "settings.json"), "{ this is not json !!!", "utf8")
     const h = await boot(stateDir)
     try {
@@ -135,11 +142,12 @@ describe("C1：scheduler 安全默认", () => {
       assert.equal(JSON.parse(readFileSync(join(stateDir, "settings.json"), "utf8")).scheduler, true, "持久化")
     } finally {
       await h.stop()
+      cleanupSandbox(stateDir) // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 
   test("settings.json 里 truthy 垃圾（scheduler:\"yes\"）也开不了排程", async () => {
-    const stateDir = mkdtempSync(join(tmpdir(), "wb-safe-"))
+    const stateDir = makeSandbox("wb-safe-").dir
     writeFileSync(join(stateDir, "settings.json"), JSON.stringify({ scheduler: "yes", claim: 1 }), "utf8")
     const h = await boot(stateDir)
     try {
@@ -147,11 +155,12 @@ describe("C1：scheduler 安全默认", () => {
       assert.equal(s.scheduler.enabled, false, "非布尔 truthy 必须被钉成 false")
     } finally {
       await h.stop()
+      cleanupSandbox(stateDir) // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 
   test("排程关闭时 tick 绝不动作：窗口命中也不启动 job、不写 lastFired.json", async () => {
-    const stateDir = mkdtempSync(join(tmpdir(), "wb-safe-"))
+    const stateDir = makeSandbox("wb-safe-").dir
     const h = await boot(stateDir)
     try {
       // 把 growth 窗口钉在当前小时，令「窗口命中」条件必然成立
@@ -165,11 +174,12 @@ describe("C1：scheduler 安全默认", () => {
       assert.equal(existsSync(join(stateDir, "lastFired.json")), false, "绝不写触发记录")
     } finally {
       await h.stop()
+      cleanupSandbox(stateDir) // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 
   test("显式开启后：窗口命中触发一次（trigger=schedule），同窗口去重不二发", async () => {
-    const stateDir = mkdtempSync(join(tmpdir(), "wb-safe-"))
+    const stateDir = makeSandbox("wb-safe-").dir
     const h = await boot(stateDir)
     try {
       const nowHour = new Date().getHours()
@@ -188,6 +198,7 @@ describe("C1：scheduler 安全默认", () => {
       assert.ok(fired.lastCycle, "触发记录落盘（含 lastCycle）")
     } finally {
       await h.stop()
+      cleanupSandbox(stateDir) // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 })

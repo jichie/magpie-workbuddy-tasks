@@ -9,21 +9,30 @@
 //   5. 拒绝双开（已有健康守护进程时，第二个 startDaemon 必须拒绝）
 //   6. 附加：凭据不外泄、/api/stop、SSE、/api/checkin、settings、排程窗口
 
-import { test, describe } from "node:test"
+import { test, describe, after } from "node:test"
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { existsSync, readFileSync, writeFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { startDaemon } from "../daemon.mjs"
 import { readControl, writeControl } from "../lifecycle.mjs"
+import { cleanupAllSandboxes, cleanupSandbox, makeSandbox } from "../tests/helpers.mjs"
 
 const KEY = "test-key-0123456789abcdef"
 
+// 每条用例独占一个 temp 沙箱（并发隔离是刻意的：node --test 多进程并行 + 用例
+// 交错，control.json/settings.json/daemon.json 都以 stateDir 为边界，共享目录会
+// 互相踩）；用完即删 —— 有 stateDir 局部量的用例在 finally 里显式删，其余由本
+// 文件末尾的 after 兜底统一回收（见 helpers.mjs 三道卫生线）。
 function tmpState() {
-  return mkdtempSync(join(tmpdir(), "wb-tasks-"))
+  return makeSandbox("wb-tasks-").dir
 }
+
+// 兜底：boot() 内部创建的沙箱在文件收尾统一回收（正常情况下登记簿已是空的）。
+after(() => {
+  cleanupAllSandboxes()
+})
 
 // ---- fake engine（按契约 §2 的最小形状） ---------------------------------
 
@@ -467,6 +476,7 @@ describe("快照投影 · 参与任务开关 · 风控冷却", () => {
       assert.equal(fb.canLight, false, "claimed 的任务无可点亮")
     } finally {
       await h.stop()
+      cleanupSandbox(stateDir) // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 
@@ -510,6 +520,7 @@ describe("快照投影 · 参与任务开关 · 风控冷却", () => {
       await waitJobQuiet(h)
     } finally {
       await h.stop()
+      cleanupSandbox(stateDir) // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 
@@ -573,6 +584,7 @@ describe("生命周期", () => {
       await assert.rejects(() => fetch(base(h.port) + "/api/hello", { signal: AbortSignal.timeout(1500) }))
     } finally {
       await h.stop().catch(() => {})
+      cleanupSandbox(stateDir) // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 
@@ -603,6 +615,7 @@ describe("生命周期", () => {
     } finally {
       dummy.kill()
       await h.stop()
+      cleanupSandbox(stateDir) // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 
@@ -631,6 +644,7 @@ describe("生命周期", () => {
       void engine
     } finally {
       await h.stop()
+      cleanupSandbox(stateDir) // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 })

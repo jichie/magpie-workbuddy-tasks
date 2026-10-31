@@ -1,10 +1,9 @@
 // tests/accountio-import.test.mjs —— 账号 JSON 导入/导出引擎层测试（node --test）。
 // 全部纯函数 + 真实 tmp 目录，零网络、零真实凭据。口径见 docs/CONTRACT.md §7.1/§9。
 
-import { test, describe } from "node:test";
+import { test, describe, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -29,14 +28,22 @@ import {
 } from "../engine/accountio.mjs";
 import { loadAccounts } from "../engine/store.mjs";
 import { CN_ISS, INTL_ISS, cnRow, makeJwt, nineEntryAuth } from "./accountio-fixture.mjs";
+import { cleanupAllSandboxes, cleanupSandbox, makeSandbox } from "./helpers.mjs";
 
 const NOW = new Date(2026, 9, 31, 12, 0, 0).getTime(); // 固定本地时间（假时钟）
 const DAY = 86400000;
 const expSecIn = (days) => Math.floor(NOW / 1000) + days * 86400;
 
+// 每条用例独占一个 temp 沙箱（并发隔离是刻意的：写盘纪律/备份/键序断言都要求
+// 干净起点，共享目录会互相踩）；用完即删，兜底见 helpers.mjs 与本文件末尾的 after。
 function tmpCfg() {
-  return mkdtempSync(join(tmpdir(), "wb-accountio-"));
+  return makeSandbox("wb-accountio-").dir;
 }
+
+// 兜底：个别用例漏删时在文件收尾统一回收（正常情况下登记簿已是空的）。
+after(() => {
+  cleanupAllSandboxes();
+});
 
 // ---- 1. 四种输入形态 + 信封校验 ---------------------------------------------
 
@@ -393,7 +400,7 @@ describe("applyImport：写前备份、逐字节保留其它 provider、坏 JSON
         assert.equal(statSync(join(cfg, "plugin-auth.json")).mode & 0o777, 0o600);
       }
     } finally {
-      rmSync(cfg, { recursive: true, force: true });
+      cleanupSandbox(cfg);
     }
   });
 
@@ -419,7 +426,7 @@ describe("applyImport：写前备份、逐字节保留其它 provider、坏 JSON
       assert.equal(after.workbuddy.expires, expSecIn(30) * 1000);
       assert.equal(after.workbuddy.importedFrom, "hub-json");
     } finally {
-      rmSync(cfg, { recursive: true, force: true });
+      cleanupSandbox(cfg);
     }
   });
 
@@ -432,7 +439,7 @@ describe("applyImport：写前备份、逐字节保留其它 provider、坏 JSON
       assert.equal(readFileSync(join(cfg, "plugin-auth.json"), "utf8"), "{broken");
       assert.equal(readdirSync(cfg).filter((f) => f.startsWith("plugin-auth.json.bak-")).length, 0, "失败不留备份");
     } finally {
-      rmSync(cfg, { recursive: true, force: true });
+      cleanupSandbox(cfg);
     }
   });
 
@@ -449,8 +456,8 @@ describe("applyImport：写前备份、逐字节保留其它 provider、坏 JSON
       assert.equal(r.backedUpTo, null, "没有旧文件就没有备份");
       assert.equal(JSON.parse(readFileSync(join(cfg2, "plugin-auth.json"), "utf8")).workbuddy.type, "oauth");
     } finally {
-      rmSync(cfg, { recursive: true, force: true });
-      rmSync(cfg2, { recursive: true, force: true });
+      cleanupSandbox(cfg);
+      cleanupSandbox(cfg2);
     }
   });
 });
@@ -561,10 +568,10 @@ describe("round-trip：导出 → 导入 → 再导出 幂等", () => {
         // 写入的是官方字段名，导入回灌 uid/expires 无损
         assert.equal(doc2.workbuddy.expires, first.workbuddy.expires);
       } finally {
-        rmSync(cfg2, { recursive: true, force: true });
+        cleanupSandbox(cfg2);
       }
     } finally {
-      rmSync(cfg, { recursive: true, force: true });
+      cleanupSandbox(cfg);
     }
   });
 });

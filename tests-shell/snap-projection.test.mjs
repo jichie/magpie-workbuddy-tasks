@@ -8,15 +8,27 @@
 //      上游数据里塞毒键（data.energy / data.days）也不会被误读。
 // 零真实网络：fetch 全部注入假后端 / 假引擎。
 
-import { test, describe } from "node:test"
+import { test, describe, after } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 
 import { snapTask, startDaemon } from "../daemon.mjs"
 import { fetchTasks } from "../engine/tasks.mjs"
-import { fakeClock, localTime, makeAcct, task, wbBackend } from "../tests/helpers.mjs"
+import {
+  cleanupAllSandboxes,
+  cleanupSandbox,
+  fakeClock,
+  localTime,
+  makeAcct,
+  makeSandbox,
+  task,
+  wbBackend,
+} from "../tests/helpers.mjs"
+
+// 兜底：个别用例漏删时在文件收尾统一回收（每条用例独占沙箱是刻意的并发隔离：
+// 状态文件以 stateDir 为边界）；见 helpers.mjs 三道卫生线。
+after(() => {
+  cleanupAllSandboxes()
+})
 
 const jumpOf = (id) =>
   `https://www.workbuddy.cn/work/launch/?deeplink=workbuddy%3A%2F%2Fexperts%3FexpertId%3D${id}&buddy_type=workbuddy`
@@ -243,10 +255,11 @@ function engineWithPoisonedUpstream() {
 
 describe("P1：快照 energy/streak 单一字段口径", () => {
   test("?refresh=1 只读 data.balance 与 data.streak.days（毒键不误读）", async () => {
+    const sb = makeSandbox("wb-tasks-snap-") // 独立临时 state（并发隔离），finally 里即删
     const h = await startDaemon({
       key: "test-key-snap-projection",
       port: 0,
-      stateDir: mkdtempSync(join(tmpdir(), "wb-tasks-snap-")), // 独立临时 state，测完随系统清理
+      stateDir: sb.dir,
       engine: engineWithPoisonedUpstream(),
       noTimers: true,
       skipExistingCheck: true,
@@ -266,6 +279,7 @@ describe("P1：快照 energy/streak 单一字段口径", () => {
       assert.equal(snap.tasks[0].canLight, true, "投影判断字段照常下发")
     } finally {
       await h.stop()
+      cleanupSandbox(sb.dir) // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 })

@@ -8,18 +8,23 @@
 // 硬规则：serveUrl 绝不含 0.0.0.0 / :: / *，只有 host[:port]，不拼 key/查询串；
 // bindHost/port/reachableHint 字段与语义原样保留（向后兼容）。
 
-import { test, describe } from "node:test"
+import { test, describe, after } from "node:test"
 import assert from "node:assert/strict"
 import http from "node:http"
 import net from "node:net"
-import { mkdtempSync } from "node:fs"
-import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { computeServeUrl, sanitizeServeHost, startDaemon } from "../daemon.mjs"
 import { addrModel } from "../dashboard/app.js"
+import { cleanupAllSandboxes, makeSandbox } from "../tests/helpers.mjs"
 
 const KEY = "serve-url-test-key-0123456789"
 const BAD = /0\.0\.0\.0|::|\*/ // serveUrl 任何情况下都不得命中的串
+
+// 兜底：boot() 内部创建的沙箱（每条用例独占，并发隔离是刻意的 —— 状态文件以
+// stateDir 为边界）在文件收尾统一回收；见 helpers.mjs 三道卫生线。
+after(() => {
+  cleanupAllSandboxes()
+})
 
 function fakeEngine() {
   return {
@@ -36,7 +41,7 @@ async function boot(extra = {}) {
   return startDaemon({
     key: KEY,
     port: 0,
-    stateDir: mkdtempSync(join(tmpdir(), "wb-serve-")),
+    stateDir: makeSandbox("wb-serve-").dir,
     engine: fakeEngine(),
     noTimers: true,
     skipExistingCheck: true,

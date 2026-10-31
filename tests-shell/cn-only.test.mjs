@@ -5,15 +5,21 @@
 // intlSkipped 只给计数与说明、绝不列出 intl 账号内容。
 // 口径见 docs/CONTRACT.md §2（层级边界）与 §3（/api/state、导出）。
 
-import { test, describe } from "node:test"
+import { test, describe, after } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 
 import { startDaemon } from "../daemon.mjs"
 import { eligibleAccounts, loadAccounts } from "../engine/store.mjs"
 import { nineEntryAuth } from "../tests/accountio-fixture.mjs"
+import { cleanupAllSandboxes, makeSandbox } from "../tests/helpers.mjs"
+
+// 兜底：boot() 已在 cleanup() 里即删（finally 调用）；这里再兜一层 —— 个别用例
+// 漏删时在文件收尾统一回收（每条用例独占沙箱是刻意的并发隔离）。
+after(() => {
+  cleanupAllSandboxes()
+})
 
 const NOW = new Date(2026, 9, 31, 12, 0, 0).getTime()
 const INTL_NOTE = "本插件只服务国内版 workbuddy，国际版账号不列出、不参与任务、不默认导出"
@@ -57,14 +63,14 @@ function realStoreEngine(started = []) {
 }
 
 async function boot({ authObj = null } = {}) {
-  const cfg = mkdtempSync(join(tmpdir(), "wb-cn-only-cfg-"))
-  const state = mkdtempSync(join(tmpdir(), "wb-cn-only-state-"))
-  if (authObj) writeFileSync(join(cfg, "plugin-auth.json"), JSON.stringify(authObj, null, 2) + "\n")
+  const cfg = makeSandbox("wb-cn-only-cfg-") // 每条用例独占 temp 沙箱，用完即删（见 helpers.mjs）
+  const state = makeSandbox("wb-cn-only-state-")
+  if (authObj) writeFileSync(join(cfg.dir, "plugin-auth.json"), JSON.stringify(authObj, null, 2) + "\n")
   const started = []
   const h = await startDaemon({
     port: 0,
-    cfgDir: cfg,
-    stateDir: state,
+    cfgDir: cfg.dir,
+    stateDir: state.dir,
     engine: realStoreEngine(started),
     now: () => NOW,
     noTimers: true,
@@ -73,11 +79,11 @@ async function boot({ authObj = null } = {}) {
   return {
     h,
     started,
-    cfg,
-    state,
+    cfg: cfg.dir,
+    state: state.dir,
     cleanup: () => {
-      rmSync(cfg, { recursive: true, force: true })
-      rmSync(state, { recursive: true, force: true })
+      cfg.cleanup()
+      state.cleanup()
     },
   }
 }
@@ -114,8 +120,8 @@ describe("纯国内版口径：国际版账号彻底不出现", () => {
       // 国内版行的 eligible 判定不受影响
       assert.ok(st.accounts.every((a) => a.eligible), "2 条国内版 OAuth 都可参与")
     } finally {
-      env.cleanup()
       await env.h.stop()
+      env.cleanup() // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 
@@ -135,8 +141,8 @@ describe("纯国内版口径：国际版账号彻底不出现", () => {
       assert.equal(rescan.eligible, 2)
       assert.ok(!JSON.stringify(rescan).includes("intl-uid"), "rescan 报告不出现国际版 uid")
     } finally {
-      env.cleanup()
       await env.h.stop()
+      env.cleanup() // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 
@@ -159,8 +165,8 @@ describe("纯国内版口径：国际版账号彻底不出现", () => {
       assert.deepEqual([...env.started[1].uids].sort(), CN_UIDS, "排程触发的 job 名单只有国内版 uid")
       assert.equal(env.started.length, 2)
     } finally {
-      env.cleanup()
       await env.h.stop()
+      env.cleanup() // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 
@@ -177,8 +183,8 @@ describe("纯国内版口径：国际版账号彻底不出现", () => {
       const text = JSON.stringify([body])
       assert.ok(!text.includes("GlobalA"))
     } finally {
-      env.cleanup()
       await env.h.stop()
+      env.cleanup() // 先停 daemon 再删：避免在途异步写把目录重建出来
     }
   })
 })
