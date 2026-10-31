@@ -160,6 +160,89 @@ export function snapTask(t) {
   }
 }
 
+// ---- 快照缓存（读取路径 = 投影的唯一出口）-----------------------------------
+// state/snapshots.json 的磁盘格式：
+//   v2（SNAP_VERSION，本版起）：{ snapVersion, tasks:规范Task[], energy, streak,
+//     days, updatedISO } —— 落盘「投影前」的规范 Task（fetchTasks 的返回形状；
+//     raw 非枚举本就不进 JSON），6 个判断字段不落盘，读取时重算。
+//   v1 及更老（无版本戳）：{ tasks:投影后形态[], … } —— 8 键（最老）或 14 键。
+//
+// 升级缺陷（真实环境实测）：旧版 daemon 落盘的就是投影结果，新版读取时原样
+// 吐出缓存 —— 8 键旧缓存里 6 个判断字段全是 undefined，前端把按钮可用性判错。
+// 修复口径：缓存里的任务只是投影的「输入」，绝不是输出；accountRow()/statePayload()
+// 出门前一律 projectSnapshot() 现场重投影。
+export const SNAP_VERSION = 2
+
+// 落盘用：规范 Task 的可序列化形状（只挑契约 §2 字段，raw/多余键不落盘）。
+// ?? 兜底保证 v2 条目「字段完备」——哪怕引擎违约给了缺字段的 Task，落盘后
+// 依然是可完整重投影的规范形状（v2 读取端因此可以信任条目）。
+function cacheTask(t) {
+  const p = t?.progress ?? {}
+  return {
+    code: t?.code ?? "",
+    title: t?.title ?? "",
+    description: t?.description ?? "",
+    jumpUrl: t?.jumpUrl ?? "",
+    acceptStatus: t?.acceptStatus ?? "",
+    taskType: t?.taskType ?? "",
+    progress: { current: Number(p.current) || 0, target: Number(p.target) || 0 },
+    rewardCredit: Number(t?.rewardCredit) || 0,
+    rewardEnergy: Number(t?.rewardEnergy) || 0,
+    unforgeable: t?.unforgeable === true,
+    reason: String(t?.reason ?? ""),
+  }
+}
+
+// v2 条目只需是对象（字段完备性由 cacheTask 的兜底保证）；数组/原始值一律挡下。
+function isCacheEntryObject(t) {
+  return !!t && typeof t === "object" && !Array.isArray(t)
+}
+
+// 旧版缓存条目能否无损重建投影：snapTask/resolveTaskKind 读的每个键都必须在，
+// 且类型是旧写入路径（投影后 8/14 键）必然产出的那种。缺任何一个键都不是旧
+// 写入路径写出的（它每键必落盘）—— 只能是文件残缺或更老的未知格式，而缺口
+// 会让判断静默翻转：code 缺 → 全落「未收录任务」；taskType 缺 → auto 被当
+// 非 auto；acceptStatus 缺/空 → 判断全 false（规范化后它永不为空）。
+// 允许空串的只有上游真实会缺的字段：code/title/jumpUrl/taskType。
+export function canReprojectTask(t) {
+  if (!isCacheEntryObject(t)) return false
+  if (typeof t.code !== "string") return false
+  if (typeof t.title !== "string") return false
+  if (typeof t.acceptStatus !== "string" || !t.acceptStatus) return false
+  if (typeof t.jumpUrl !== "string") return false
+  if (typeof t.taskType !== "string") return false
+  const p = t.progress
+  if (!p || typeof p !== "object" || Array.isArray(p)) return false
+  if (!Number.isFinite(Number(p.current)) || !Number.isFinite(Number(p.target))) return false
+  if (!Number.isFinite(Number(t.rewardCredit)) || !Number.isFinite(Number(t.rewardEnergy))) return false
+  return true
+}
+
+// snapshots[uid] → /api/state 的 snapshot。永远现场 snapTask 重投影（snapTask
+// 幂等：对投影后形态再投影，6 个判断字段由 code/title/acceptStatus/taskType/
+// jumpUrl 重算，与直接刷新逐字节一致 —— 旧 8 键缓存升级读不必等下一次
+// ?refresh=）；无法无损重建 → 整份快照过期返回 null，前端显示「快照已过期，
+// 请刷新」。宁可空，不可错。
+export function projectSnapshot(snap) {
+  if (!snap || typeof snap !== "object" || Array.isArray(snap)) return null
+  if (!Array.isArray(snap.tasks)) return null
+  if (snap.snapVersion === SNAP_VERSION) {
+    // v2：本版本写入路径的产物，信任 + 重投影；只挡非对象条目（防手改坏文件）
+    if (!snap.tasks.every(isCacheEntryObject)) return null
+  } else {
+    // 版本不符（含无版本戳的 v1）：先验「能否无损重建」，重建不出可信判断
+    // 就整份作废 —— 部分重建会让前端拿着「看起来全对」的表渲染错按钮
+    if (!snap.tasks.every(canReprojectTask)) return null
+  }
+  return {
+    tasks: snap.tasks.map(snapTask),
+    energy: snap.energy ?? null,
+    streak: snap.streak ?? null,
+    days: snap.days ?? null,
+    updatedISO: snap.updatedISO ?? "",
+  }
+}
+
 // ---- 启动参数 -----------------------------------------------------------
 
 function parseArgs(argv = process.argv.slice(2)) {
@@ -435,8 +518,11 @@ export async function startDaemon(opts = {}) {
             // 没有 days/streakDays 键，绝不回退去猜。
             if (s?.ok && s?.code === 0) days = s.data?.streak?.days ?? 0
           }
+          // 落盘「投影前」的规范 Task + 版本戳：投影只在读取路径发生
+          //（projectSnapshot → snapTask），引擎侧判断演进后老缓存也能读出新结论
           snapshots[uid] = {
-            tasks: (Array.isArray(tasks) ? tasks : []).map(snapTask),
+            snapVersion: SNAP_VERSION,
+            tasks: (Array.isArray(tasks) ? tasks : []).map(cacheTask),
             energy: energy ?? snapshots[uid]?.energy ?? null,
             streak: days ?? snapshots[uid]?.streak ?? null,
             days: days ?? snapshots[uid]?.days ?? null,
@@ -811,7 +897,9 @@ export async function startDaemon(opts = {}) {
 
   function accountRow(a) {
     const exp = Number(a.expires) || 0
-    const snap = snapshots[a.uid] ?? null
+    // 读取路径 = 投影的唯一出口：缓存（无论 v2 规范还是旧版投影形态）出门前
+    // 一律 projectSnapshot 现场重投影；无法无损重建 → null（快照已过期）
+    const snap = projectSnapshot(snapshots[a.uid] ?? null)
     return {
       uid: a.uid ?? "",
       nickname: a.nickname ?? a.accountId ?? a.uid ?? "",

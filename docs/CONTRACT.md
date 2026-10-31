@@ -176,6 +176,14 @@ GET  /api/state                 -> {bindHost, port, reachableHint,
                                     //   pinnedExpertId —— 非空 = 事件 id 钉死该专家（TASK_SPECS 钉死
                                     //     或 jump_url 派生）；空串 = 不钉 id（expert/team 类走池子
                                     //     轮换，其它 kind 无专家 id）
+                                    // 快照缓存（state/snapshots.json）落盘「投影前」的规范 Task +
+                                    // snapVersion 版本戳；/api/state 读取时一律用 snapTask 现场重投影
+                                    //（读取路径是投影的唯一出口）：旧版 8 键缓存靠重算无损升级（缺的
+                                    // 6 个判断字段绝不以 undefined 下发），版本不符且条目缺投影所需
+                                    // 字段、无法无损重建时整份 snapshot 返回 null（前端显示「快照已
+                                    // 过期，请刷新」；宁可空，不可错）。判断永远来自引擎投影，前端
+                                    // 不得按 jumpUrl 形状自行猜桌面端/专家 id（真实数据 19/19 都有
+                                    // 非空 jumpUrl，猜了必错）。
                                     // snapshot.energy / streak / days 的读径与 engine 同一口径
                                     // （P1 实测 2026-10-31，两真实账号验证）：energy = data.balance
                                     //（GET /v2/activity/growth/energy），streak/days = data.streak.days

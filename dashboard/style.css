@@ -459,8 +459,13 @@ input[type="checkbox"] { accent-color: var(--btn); width: 14px; height: 14px; ma
 }
 .prog-text { font-family: var(--font-mono); font-size: 12px; color: var(--ink2); white-space: nowrap; }
 
-/* 深链 */
-.jump-hint { font-size: 11.5px; color: var(--warn); display: block; margin-top: 2px; }
+/* 任务行标注：桌面端 / 无法自动化徽章、钉死的专家 id、原因原文 —— 全部由 daemon
+   下发的判断字段驱动（desktopOnly / unforgeable / reason / pinnedExpertId），
+   只用既有 token（--ink3 / --warn），不加新配色。 */
+.cell-badges { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 3px; }
+.pin-id { font-family: var(--font-mono); font-size: 11px; color: var(--ink3); white-space: nowrap; }
+.row-note { font-size: 11.5px; color: var(--ink3); margin-top: 2px; max-width: 420px; word-break: break-word; }
+.snap-stale { font-size: 11.5px; color: var(--warn); padding: 8px 14px 0; }
 .row-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .mini-btn {
   font-family: var(--font-ui);
@@ -498,6 +503,9 @@ input[type="checkbox"] { accent-color: var(--btn); width: 14px; height: 14px; ma
 .batchbar .legs legend { padding: 0; margin-bottom: 2px; }
 .batch-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-left: auto; }
 .sel-count { font-size: 12px; color: var(--ink3); white-space: nowrap; }
+/* 「批量接任务」旁的不可接取说明（数字来自 canAccept 字段）：允许换行，不抢注意力 */
+.accept-note { font-size: 11.5px; color: var(--ink3); max-width: 280px; }
+.accept-note[hidden] { display: none; }
 .batch-status {
   flex-basis: 100%;
   font-size: 12.5px;
@@ -719,11 +727,15 @@ dialog::backdrop { background: rgba(0, 0, 0, .35); }
     display: flex;
     align-items: baseline;
     justify-content: space-between;
-    gap: 14px;
+    gap: 8px 14px;
+    flex-wrap: wrap;
     border-bottom: none;
     padding: 5px 12px;
     text-align: left;
   }
+  /* 窄屏：标注行 / 原因 / 操作各占一行，避免与 data-label 挤在一起 */
+  .tbl td .cell-badges, .tbl td .row-note { flex-basis: 100%; }
+  .tbl td .row-actions { flex: 1 1 100%; justify-content: flex-start; }
   .tbl td.num { text-align: right; }
   .tbl td::before {
     content: attr(data-label);

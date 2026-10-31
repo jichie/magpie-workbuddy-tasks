@@ -10,7 +10,12 @@
 //        scheduler.holds = [{uid, nickname, releasedAt(ISO)}] —— 真正的风控冷却（403/11140）名单
 //        accounts[].tasksEnabled 可写（见 /api/account/toggle）；snapshot.tasks[] 为规范化
 //        camelCase：{code,title,acceptStatus,progress:{current,target},rewardCredit,rewardEnergy,
-//        jumpUrl,taskType("single"|"auto"|"")}
+//        jumpUrl,taskType("single"|"auto"|"")} + 六个引擎判断字段（daemon.snapTask 投影自
+//        engine/taskkind.resolveTaskKind，与流水线决策同一判断源）：
+//        {desktopOnly,unforgeable,reason,canAccept,canLight,pinnedExpertId}
+//        —— 任务表的所有「能不能自动化」判断只来自这六个字段，前端不再自己拼规则
+//        （详见下方 taskFlags）。老后端字段缺失时按 legacy 回退，绝不报错。
+//        snapshot.expired 若为 true（后端将来下发）按「快照已过期」渲染；前端不发明字段。
 //   GET  /api/events?k=        -> SSE {kind:'job'|'step'|'log'|'scheduler'}
 //   GET  /api/history?limit=   -> {rows:[{at,uid,nickname,leg,state,detail,credit,energy,jobId,trigger}]}
 //   POST /api/run {uids?,legs?,claim?} -> {job} | 409 busy | 400 无账号 | 503 引擎不可用
@@ -620,30 +625,85 @@ function rewardCell(t) {
   return el("span", { class: "mono", text: parts.length ? parts.join(" · ") : "—" });
 }
 
-function isDesktopDeepLink(url) {
-  return typeof url === "string" && url !== "" && !/^https?:/i.test(url);
+// ---- 任务判断字段（P0-2：只消费 daemon 下发的六个字段，前端不自己拼规则） --------------
+// daemon.snapTask 把引擎判断（engine/taskkind.resolveTaskKind）投影进 snapshot.tasks[]：
+//   desktopOnly    true = 只能在本机桌面 App 完成（伪造事件不推进、领奖必失败）
+//   unforgeable    true = 根本无法自动化（关注公众号满 24 小时、真实捐赠，以及未收录任务）
+//   reason         unforgeable / desktopOnly 的人话原因（可为空串）
+//   canAccept      true = 能进「批量接取」（引擎口径，已排除 auto / unforgeable / 未收录）
+//   canLight       true = 能被自动化点亮（上报进度事件）
+//   pinnedExpertId 非空 = 事件 id 钉死该专家（ex_…）；空串 = 走池子轮换
+// 纪律：**绝不**拿 jumpUrl 形状猜「需桌面端完成」—— 真实账号 19 项 jumpUrl 全部非空
+// （14 项 workbuddy:// 深链、5 项 https），其中只有 3 项真是桌面端专属。
+// 老后端（六个字段 undefined）→ legacy 回退：不显示桌面端 / 无法自动化标注，接取按钮照旧
+// 按状态显示（由后端 400/404 兜底），绝不禁用整列。
+// 导出仅为 Node 下单元验证；浏览器里 <script type="module"> 不受影响。
+export function taskFlags(t) {
+  const isBool = (k) => typeof t?.[k] === "boolean";
+  const code = String(t?.code ?? "");
+  const status = String(t?.acceptStatus ?? "");
+  const unforgeable = t?.unforgeable === true;
+  return {
+    // 后端给了任一新判断字段 = 新口径；否则整行按 legacy 渲染
+    modern: isBool("desktopOnly") || isBool("unforgeable") || isBool("canAccept") || isBool("canLight"),
+    desktopOnly: t?.desktopOnly === true,
+    unforgeable,
+    reason: String(t?.reason ?? "").trim(),
+    // canLight 用 null 表示「老后端没给」——与 false（引擎判定不点亮）语义分开
+    canLight: isBool("canLight") ? t.canLight === true : null,
+    // 接取门控：新后端只认 canAccept（再兜一层缺码 / unforgeable 守卫）；
+    // 老后端回退旧口径 not_accepted && 非 auto && 有 code
+    canAccept: isBool("canAccept")
+      ? t.canAccept === true && code !== "" && !unforgeable
+      : status === "not_accepted" && t?.taskType !== "auto" && code !== "",
+    pinnedExpertId: String(t?.pinnedExpertId ?? "").trim(),
+  };
 }
 
+// 领奖门控（维持既有口径）：acceptStatus==="completed"，或进度已达标（current>=target>0）。
+// 已领奖（claimed）的不再给按钮 —— 真实快照里 11 项 claimed 都是 1/1，不排除会长出
+// 11 个必然失败的按钮。缺码时不给按钮（无从 POST）。
+export function claimableTask(t) {
+  if (String(t?.code ?? "") === "") return false;
+  const status = String(t?.acceptStatus ?? "");
+  if (status === "completed") return true;
+  if (status === "claimed") return false;
+  const cur = Number(t?.progress?.current) || 0;
+  const tgt = Number(t?.progress?.target) || 0;
+  return tgt > 0 && cur >= tgt;
+}
+
+// 快照过期语义：snapshot === null → 「快照为空」；后端将来下发 snapshot.expired === true
+// 也按过期处理。只认后端真值字段，前端不发明 expiredAt / stale 之类。
+export function snapExpired(snap) {
+  return snap?.expired === true;
+}
+
+// pinnedExpertId 是次要信息：短串展示（等宽、--ink3），全值走 title。
+function pinShort(id) {
+  const s = String(id ?? "");
+  return s.length > 18 ? `${s.slice(0, 17)}…` : s;
+}
+
+// jumpUrl 只决定「用什么方式打开」，不决定任务性质：
+//   非 http(s) 深链（workbuddy://…）浏览器打不开 → 只给「复制深链」
+//   http(s) → 「打开链接」
+// 「需在桌面端完成」徽章由 desktopOnly 字段单独负责（见 taskRow）。
 function jumpCell(t) {
   const url = String(t.jumpUrl ?? "");
   if (!url) return el("span", { class: "muted", text: "—" });
-  if (isDesktopDeepLink(url)) {
-    return el(
-      "div",
-      { class: "row-actions" },
-      el("span", { class: "jump-hint", text: "需在桌面端完成" }),
-      el("button", {
-        type: "button",
-        class: "mini-btn",
-        text: "复制深链",
-        title: url,
-        onclick: async (ev) => {
-          const ok = await copyText(url);
-          toast(ok ? `深链已复制：${url}` : `复制失败，请手动复制：${url}`, ok ? "info" : "warn", 7000);
-          ev.target.blur();
-        },
-      }),
-    );
+  if (!/^https?:/i.test(url)) {
+    return el("button", {
+      type: "button",
+      class: "mini-btn",
+      text: "复制深链",
+      title: `${url}（浏览器打不开自定义协议，复制到本机桌面 App 用）`,
+      onclick: async (ev) => {
+        const ok = await copyText(url);
+        toast(ok ? `深链已复制：${url}` : `复制失败，请手动复制：${url}`, ok ? "info" : "warn", 7000);
+        ev.target.blur();
+      },
+    });
   }
   return el(
     "a",
@@ -700,29 +760,44 @@ async function claimOne(uid, code, btn) {
   }
 }
 
+// 单行任务：所有「能不能自动化」的标注与门控都来自 taskFlags（后端字段），
+// 服务端字符串（title / code / reason / id）一律走 textContent。
 function taskRow(a, t) {
   const code = String(t.code ?? "");
+  const f = taskFlags(t);
+  const status = String(t.acceptStatus ?? "");
   const isAuto = t.taskType === "auto";
-  const canClaim = t.acceptStatus === "completed" && code !== "";
-  const canAccept = t.acceptStatus === "not_accepted" && code !== "" && !isAuto;
   const actions = el("div", { class: "row-actions" });
-  if (canAccept) {
+
+  // 接取：仅当后端 canAccept === true（老后端回退旧口径，见 taskFlags）
+  if (f.canAccept) {
     actions.append(
       el("button", {
         type: "button",
         class: "mini-btn",
         text: "接取",
+        title: f.desktopOnly
+          ? "可以接取，但引擎不会为它伪造进度：需在本机桌面 App 完成后再领奖"
+          : null,
         onclick: (ev) => acceptOne(a.uid, code, ev.target),
       }),
     );
-  } else if (isAuto && (t.acceptStatus === "not_accepted" || t.acceptStatus === "accepted")) {
+  } else if (isAuto && (status === "not_accepted" || status === "accepted")) {
     // taskType:"auto"：上游拒绝接取，不给「接取」按钮
     actions.append(el("span", { class: "muted", text: "自动任务，无需接取" }));
-  } else if (t.acceptStatus === "not_accepted" && code === "") {
+  } else if (f.unforgeable) {
+    // 规则 2：unforgeable 行不参与批量（原因原文在任务列显示）
+    actions.append(el("span", { class: "muted", text: "不参与批量" }));
+  } else if (status === "not_accepted" && code === "") {
     // 窄守卫：快照真缺任务码时才提示（规范化后的快照 code 恒非空）
     actions.append(el("span", { class: "muted", text: "快照缺任务码，无法接取" }));
+  } else if (status === "not_accepted" && f.modern) {
+    // 引擎判定现在不能接（已接过 / 未收录 / 桌面端族）—— 不静默，给一句说明
+    actions.append(el("span", { class: "muted", text: f.reason || "引擎判定不可自动接取" }));
   }
-  if (canClaim) {
+
+  // 领奖：维持既有条件（completed，或进度已达标；claimed 不再给按钮）
+  if (claimableTask(t)) {
     actions.append(
       el("button", {
         type: "button",
@@ -731,10 +806,47 @@ function taskRow(a, t) {
         onclick: (ev) => claimOne(a.uid, code, ev.target),
       }),
     );
-  } else if (t.acceptStatus === "completed" && code === "") {
+  } else if (status === "completed" && code === "") {
     actions.append(el("span", { class: "muted", text: "快照缺任务码，改用「批量做任务」" }));
   }
+
+  // 规则 3：canLight === false 且既非桌面端也非不可自动化 → 没有「点亮」类操作可给，
+  // 说明原因（reason 原文优先）。已领奖的行不再堆提示。
+  if (f.canLight === false && !f.desktopOnly && !f.unforgeable && status !== "claimed") {
+    actions.append(
+      el("span", {
+        class: "muted",
+        text: f.reason || "引擎暂不点亮这项",
+        title: f.reason || "守护进程判定 canLight=false：引擎不会为这项上报进度事件（状态变化后会重新判定）",
+      }),
+    );
+  }
+
   actions.append(jumpCell(t));
+
+  // 任务列标注：桌面端徽章 ⇐ desktopOnly === true；无法自动化徽章 ⇐ unforgeable === true
+  //（附 reason 原文）；pinnedExpertId 非空时给一个等宽短串（次要信息，全值在 title）。
+  const marks = [];
+  if (f.desktopOnly) {
+    const b = badge("需在桌面端完成", "badge-warn");
+    b.title = "引擎判定：伪造事件不推进、领奖必失败，只能在本机桌面 App 完成";
+    marks.push(b);
+  }
+  if (f.unforgeable) {
+    const b = badge("无法自动化", "badge-warn");
+    b.title = "引擎判定：无法自动化，不接取 / 不上报 / 不领奖";
+    marks.push(b);
+  }
+  if (f.pinnedExpertId) {
+    marks.push(
+      el("span", {
+        class: "pin-id",
+        text: pinShort(f.pinnedExpertId),
+        title: `事件 id 钉死该专家：${f.pinnedExpertId}`,
+      }),
+    );
+  }
+  const reasonNote = f.reason && (f.unforgeable || f.desktopOnly) ? f.reason : "";
 
   return el(
     "tr",
@@ -744,13 +856,18 @@ function taskRow(a, t) {
       { "data-label": "任务" },
       el("span", { class: "cell-main", text: String(t.title ?? code ?? "（无标题）") }),
       code ? el("span", { class: "cell-sub", text: code }) : null,
+      marks.length ? el("div", { class: "cell-badges" }, marks) : null,
+      reasonNote ? el("div", { class: "row-note", text: reasonNote }) : null,
     ),
-    el("td", { "data-label": "状态" }, acceptBadge(t.acceptStatus)),
+    el("td", { "data-label": "状态" }, acceptBadge(status)),
     el("td", { "data-label": "进度" }, progressCell(t.progress)),
     el("td", { "data-label": "奖励", class: "num" }, rewardCell(t)),
     el("td", { "data-label": "操作" }, actions),
   );
 }
+
+// 只读刷新的说明：刷新快照只读取上游，不会接取任务也不会上报进度。
+const REFRESH_NOTE = "点账号行右侧「刷新快照」读取（只读，不会接取或上报；守护进程内置限速：两次上游调用至少间隔 1 秒）。";
 
 function taskTable(a) {
   const snap = a.snapshot;
@@ -758,15 +875,18 @@ function taskTable(a) {
     return el(
       "p",
       { class: "muted", style: { padding: "10px 14px" } },
-      "尚无任务快照。点账号行右侧「刷新快照」从上游拉取（守护进程内置限速：两次上游调用至少间隔 1 秒，刷新期间不会与运行中的批量任务抢窗口）。",
+      `快照为空，${REFRESH_NOTE}`,
     );
   }
   const tasks = Array.isArray(snap.tasks) ? snap.tasks : [];
+  const expired = snapExpired(snap);
   if (!tasks.length) {
     return el(
       "p",
       { class: "muted", style: { padding: "10px 14px" } },
-      `快照为空（${fmtDateTime(snap.updatedISO)} 更新）：该账号当前没有成长任务，或上游返回为空。`,
+      expired
+        ? `快照已过期（${fmtDateTime(snap.updatedISO)} 更新），${REFRESH_NOTE}`
+        : `快照为空（${fmtDateTime(snap.updatedISO)} 更新）：该账号当前没有成长任务，或上游返回为空。`,
     );
   }
   const head = el(
@@ -783,12 +903,23 @@ function taskTable(a) {
     ),
   );
   const body = el("tbody", {}, tasks.map((t) => taskRow(a, t)));
-  return el("div", { class: "tbl-wrap" }, el("table", { class: "tbl" }, head, body));
+  const table = el("div", { class: "tbl-wrap" }, el("table", { class: "tbl" }, head, body));
+  if (!expired) return table;
+  // 后端标记过期：数据仍展示（比空白有用），但明确说明陈旧并给只读刷新入口
+  return el(
+    "div",
+    {},
+    el("p", { class: "snap-stale", text: `快照已过期（${fmtDateTime(snap.updatedISO)} 更新），${REFRESH_NOTE}` }),
+    table,
+  );
 }
 
-function taskSummary(snap) {
+// 账号行的轻量汇总：状态分布 + 后端判断字段的计数（共 N 项 · 桌面端 N · 无法自动化 N ·
+// 可接取 N）。数字全部来自同一批字段统计，绝不硬编码；老后端没给字段时不追加这三项。
+// 导出仅为 Node 下单元验证；浏览器里 <script type="module"> 不受影响。
+export function taskSummary(snap) {
   const tasks = snap ? (Array.isArray(snap.tasks) ? snap.tasks : []) : [];
-  if (!snap) return "任务快照：无";
+  if (!snap) return "任务快照：无（点「刷新快照」读取，只读，不会接取或上报）";
   const count = (st) => tasks.filter((t) => t.acceptStatus === st).length;
   const parts = [
     `共 ${tasks.length} 项`,
@@ -797,7 +928,51 @@ function taskSummary(snap) {
     `待领奖 ${count("completed")}`,
     `已领奖 ${count("claimed")}`,
   ];
-  return `任务快照：${parts.join(" · ")}`;
+  const flags = tasks.map(taskFlags);
+  if (flags.some((f) => f.modern)) {
+    const n = (pred) => flags.filter(pred).length;
+    parts.push(
+      `桌面端 ${n((f) => f.desktopOnly)}`,
+      `无法自动化 ${n((f) => f.unforgeable)}`,
+      `可接取 ${n((f) => f.canAccept)}`,
+    );
+  }
+  return `任务快照${snapExpired(snap) ? "（已过期）" : ""}：${parts.join(" · ")}`;
+}
+
+// 账号行上的快照标签：snapshot === null → 「快照为空」；后端标记 expired → 「快照已过期」
+function snapLabel(snap) {
+  if (!snap) return "快照为空";
+  const at = fmtTime(snap.updatedISO);
+  return snapExpired(snap) ? `快照已过期 ${at}` : `快照 ${at}`;
+}
+
+// 批量接取计划（规则 4）：codes 只取 canAccept === true 的项（判断只来自后端字段），
+// 同时把「未接取但引擎判定不可自动接取」的项数分开统计，好在按钮旁说明，而不是静默少接。
+// 导出仅为 Node 下单元验证。
+export function acceptPlan(tasks) {
+  const list = Array.isArray(tasks) ? tasks : [];
+  const codes = [];
+  let blocked = 0; // 桌面端 / 未收录 / 引擎判定不可接
+  let auto = 0; // taskType:"auto"：上游无需接取
+  let noCode = 0; // 快照真缺任务码
+  let pending = 0; // 未接取项总数
+  for (const t of list) {
+    if (String(t?.acceptStatus ?? "") !== "not_accepted") continue;
+    pending++;
+    const f = taskFlags(t);
+    if (!String(t?.code ?? "")) {
+      noCode++;
+      continue;
+    }
+    if (f.canAccept) {
+      codes.push(String(t.code));
+      continue;
+    }
+    if (t?.taskType === "auto") auto++;
+    else blocked++;
+  }
+  return { codes, blocked, auto, noCode, pending };
 }
 
 async function refreshSnap(uid, btn) {
@@ -900,7 +1075,7 @@ function accountRow(a) {
       }),
       state.toggling.has(uid) ? "提交中…" : "参与任务",
     ),
-    el("span", { class: "acct-snap", text: a.snapshot ? `快照 ${fmtTime(a.snapshot.updatedISO)}` : "无快照" }),
+    el("span", { class: "acct-snap", text: snapLabel(a.snapshot) }),
     isApiKey
       ? null
       : el("button", {
@@ -908,6 +1083,7 @@ function accountRow(a) {
           class: "mini-btn",
           dataset: { snapRefresh: uid },
           text: "刷新快照",
+          title: "只读刷新：读取上游任务快照，不会接取任务也不会上报进度",
           onclick: (ev) => refreshSnap(uid, ev.target),
         }),
   );
@@ -988,6 +1164,31 @@ function renderAccounts() {
   updateSelectionUI();
 }
 
+// 「批量接任务」按钮旁的常驻说明（规则 4）：勾选范围内有多少未接取项被引擎判定为
+// 不可自动接取（桌面端 / 未收录）。数字只来自后端 canAccept 字段；老后端没给字段、
+// 或计数为 0 时不显示（不猜、不静默少接）。
+function renderAcceptNote() {
+  const box = $("#acceptNote");
+  if (!box) return;
+  let blocked = 0;
+  let noSnap = 0;
+  let modern = false;
+  for (const a of targetAccounts()) {
+    const tasks = a.snapshot?.tasks;
+    if (!Array.isArray(tasks)) {
+      noSnap++;
+      continue;
+    }
+    if (tasks.some((t) => taskFlags(t).modern)) modern = true;
+    blocked += acceptPlan(tasks).blocked;
+  }
+  const parts = [];
+  if (modern && blocked > 0) parts.push(`${blocked} 项不可自动接取（桌面端/未收录）`);
+  if (noSnap > 0) parts.push(`${noSnap} 个账号无快照（接取前会先只读刷新）`);
+  box.textContent = parts.join(" · ");
+  box.hidden = parts.length === 0;
+}
+
 function updateSelectionUI() {
   const elig = eligibleAccounts();
   const selCount = state.selected.size;
@@ -1012,6 +1213,9 @@ function updateSelectionUI() {
   } else {
     $("#btnRun").title = "完整流水线：接取 → 点亮（上报进度）→ 领奖";
   }
+  // 批量接取只提交 canAccept === true 的 codes；不可接取的项数在按钮旁说明
+  $("#btnAccept").title = "只接取守护进程判定 canAccept 的任务（桌面端 / 未收录 / 自动任务不会进名单）";
+  renderAcceptNote();
 }
 
 // ---- 实时进度区 --------------------------------------------------------------------------
@@ -1195,6 +1399,7 @@ async function acceptSelected() {
       already = 0,
       failed = 0;
     const noCode = [];
+    const blockedNotes = [];
     const notes = [];
     for (let i = 0; i < targets.length; i++) {
       const a0 = targets[i];
@@ -1210,20 +1415,20 @@ async function acceptSelected() {
         notes.push(`${a0.nickname || a0.uid}：快照刷新失败（${e.message}）`);
         continue;
       }
-      const tasks = a.snapshot?.tasks ?? [];
-      // 规范化快照的 code 恒非空；!t.code 只是针对真缺码数据的窄守卫。
-      // taskType:"auto" 的任务上游拒绝接取，不进批量接取名单。
-      const codes = tasks
-        .filter((t) => t.acceptStatus === "not_accepted" && t.taskType !== "auto" && t.code)
-        .map((t) => String(t.code));
-      const emptyCodeCount = tasks.filter((t) => t.acceptStatus === "not_accepted" && !t.code).length;
-      const autoCount = tasks.filter((t) => t.acceptStatus === "not_accepted" && t.taskType === "auto").length;
+      const plan = acceptPlan(a.snapshot?.tasks);
+      const codes = plan.codes;
+      // 规则 4：不可自动接取的项要说出来，不能静默少接
+      if (plan.blocked) {
+        blockedNotes.push(`${a.nickname || a.uid}：${plan.blocked} 项不可自动接取（桌面端/未收录）`);
+      }
       if (!codes.length) {
-        const why = emptyCodeCount
+        const why = plan.noCode
           ? "快照缺任务码"
-          : autoCount
-            ? `仅 ${autoCount} 项自动任务，无需接取`
-            : "无未接任务";
+          : plan.blocked
+            ? `${plan.blocked} 项不可自动接取（桌面端/未收录）`
+            : plan.auto
+              ? `仅 ${plan.auto} 项自动任务，无需接取`
+              : "无未接任务";
         noCode.push(`${a.nickname || a.uid}（${why}）`);
         continue;
       }
@@ -1241,6 +1446,7 @@ async function acceptSelected() {
       }
     }
     const parts = [`批量接取完成：新接 ${accepted} · 已接过 ${already} · 失败 ${failed}`];
+    if (blockedNotes.length) parts.push(`不可自动接取：${blockedNotes.join("、")}`);
     if (noCode.length) parts.push(`跳过：${noCode.join("、")}`);
     if (notes.length) parts.push(notes.join("；"));
     setBatchStatus(parts.join("。"));
