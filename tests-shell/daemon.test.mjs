@@ -168,16 +168,22 @@ const tick = (ms = 50) => new Promise((r) => setTimeout(r, ms))
 // ---- 1–3. HTTP 外壳 ------------------------------------------------------
 
 describe("daemon HTTP 外壳", () => {
-  test("密钥门禁：/api/hello 豁免，其余无 key/错 key 一律 401", async () => {
+  test("密钥分级（契约 §3）：只读免密钥，写操作无 key/错 key 一律 401", async () => {
     const { h } = await boot()
     try {
       assert.equal((await get(h.port, "/api/hello")).status, 200)
 
-      assert.equal((await get(h.port, "/api/state")).status, 401)
-      assert.equal((await get(h.port, "/api/state", "wrong-key")).status, 401)
-      assert.equal((await get(h.port, "/api/history?k=wrong")).status, 401)
-      assert.equal((await post(h.port, "/api/run", {}, null)).status, 401)
+      // 免密钥（只读、无副作用）：打开看板不再弹密钥
+      assert.equal((await get(h.port, "/api/state")).status, 200)
+      assert.equal((await get(h.port, "/api/history")).status, 200)
+      assert.equal((await get(h.port, "/api/state", "wrong-key")).status, 200, "免密钥路由不校验 key（错 key 也不挡）")
 
+      // 写操作：无 key 401
+      assert.equal((await post(h.port, "/api/run", {}, null)).status, 401)
+      assert.equal((await post(h.port, "/api/stop", undefined, null)).status, 401)
+      assert.equal((await post(h.port, "/api/settings", {}, null)).status, 401)
+
+      // 带 key（header 或 ?k=）一切照旧
       assert.equal((await get(h.port, "/api/state", KEY)).status, 200)
       assert.equal((await get(h.port, `/api/state?k=${encodeURIComponent(KEY)}`)).status, 200)
     } finally {
@@ -317,7 +323,7 @@ describe("daemon HTTP 外壳", () => {
     }
   })
 
-  test("SSE /api/events：text/event-stream，先发 retry 行；无 key 401", async () => {
+  test("SSE /api/events：text/event-stream，先发 retry 行；免密钥可连（契约 §3 只读分级）", async () => {
     const { h } = await boot()
     const ctrl = new AbortController()
     try {
@@ -331,7 +337,9 @@ describe("daemon HTTP 外壳", () => {
       const { value } = await reader.read()
       assert.ok(new TextDecoder().decode(value).includes("retry"))
 
-      assert.equal((await fetch(base(h.port) + "/api/events", { signal: ctrl.signal })).status, 401)
+      const anon = await fetch(base(h.port) + "/api/events", { signal: ctrl.signal })
+      assert.equal(anon.status, 200, "SSE 是只读事件流，免密钥")
+      anon.body?.cancel?.().catch(() => {})
     } finally {
       ctrl.abort()
       await h.stop()

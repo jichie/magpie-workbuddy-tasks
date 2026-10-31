@@ -37,10 +37,11 @@
         <a class="wb-btn wb-btn-primary" id="dashLink" href="http://127.0.0.1:4390" target="_blank" rel="noopener noreferrer">在新窗口打开看板</a>
       </div>
       <p class="wb-hint" id="dashHint">
-        地址来自插件选项 <code>dashboardUrl</code>（magpie 插件页可改）。看板 API 需要守护进程密钥：
-        在地址后加 <code>?k=&lt;key&gt;</code> 打开，密钥在
-        <code>&lt;magpie 配置目录&gt;/workbuddy-tasks/state/daemon.json</code> 的 <code>key</code> 字段（权限 0600，实际端口同文件）。
-        密钥请勿贴进链接分享。
+        地址来自插件选项 <code>dashboardUrl</code>（magpie 插件页可改）。看板<strong>直接打开即可</strong>：
+        账号、任务、历史等只读数据免密钥；批量任务、导入写入、含凭据导出等有副作用的操作，
+        在看板右上<strong>「解锁写操作」</strong>里填入密钥 —— 密钥在
+        <code>&lt;magpie 配置目录&gt;/workbuddy-tasks/state/daemon.json</code> 的 <code>key</code> 字段
+        （权限 0600，实际端口同文件），只存浏览器本标签页的 sessionStorage。密钥请勿贴进链接分享。
       </p>
       <p class="wb-hint" id="tunnelHint" hidden>
         magpie 跑在 NAS/容器里、你用 SSH 隧道访问？隧道映射后仍可用
@@ -104,7 +105,11 @@
             （<code>ex_…</code>）—— 前端不自己猜，判断只来自后端；
             风控冷却（403/11140）名单直接显示解除时间；
             实时步骤与滚动日志走 SSE，断线自动回退 3 秒轮询；小时窗口排程可编辑并预览下一次运行；
-            历史记录失败 / 跳过都会留一行说明。
+            历史记录失败 / 跳过都会留一行说明；
+            <strong>账号导入 / 导出</strong>：导出为 hub 同款 <code>workbuddy-accounts</code> JSON
+            （默认含凭据，可改脱敏；脱敏免密钥，含凭据需解锁），导入走「先预览（免密钥、不写盘）→
+            确认写入 <code>plugin-auth.json</code>（写前自动备份）」两段式，只同步国内版、智能合并，
+            不删除任何现有账号。
           </p>
         </div>
       </details>

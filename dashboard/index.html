@@ -19,6 +19,8 @@
     <div class="topbar-meta">
       <span class="pill pill-quiet" id="daemonPill" role="status" aria-live="polite">检查中…</span>
       <span class="pill pill-quiet" id="feedPill">未连接</span>
+      <!-- 读写分级标识：只读免密钥；「已解锁」= sessionStorage 里有 key，可执行写操作 -->
+      <span class="pill pill-quiet" id="modePill">只读模式</span>
       <dl class="stats" aria-label="今日收益">
         <div><dt>今日积分</dt><dd id="statCredits">—</dd></div>
         <div><dt>今日能量</dt><dd id="statEnergy">—</dd></div>
@@ -27,7 +29,8 @@
     </div>
     <div class="topbar-actions">
       <button type="button" class="btn-quiet" id="themeBtn" aria-label="切换主题">主题：跟随系统</button>
-      <button type="button" class="btn-quiet" id="keyBtn">密钥</button>
+      <button type="button" class="btn-quiet" id="unlockBtn" aria-pressed="false"
+        title="解锁写操作：批量任务、参与任务开关、保存窗口、导入写出、含凭据导出等有副作用的操作需要守护进程密钥（state/daemon.json 的 key）；只读数据免密钥">未解锁（只读）</button>
       <button type="button" class="btn-quiet" id="daemonStartBtn">启动命令</button>
       <button type="button" class="btn-warn-quiet btn-quiet" id="daemonStopBtn">停止守护进程</button>
     </div>
@@ -37,6 +40,72 @@
   </header>
 
   <main id="main" class="main">
+
+    <!-- 账号导入 / 导出（契约 §9：hub 移植口径）
+         导出：GET /api/accounts/export?secrets=1|0&realm=&uid=&download=1 —— secrets=0 免密钥，
+         含凭据（secrets=1）必须密钥；下载走 fetch+Blob（key 只进 Authorization 头，绝不进 URL）。
+         导入：POST /api/accounts/import 两段式 —— 预览免密钥不写盘；confirm:true 写
+         plugin-auth.json（写前自动备份），必须密钥。 -->
+    <section class="card" aria-labelledby="ioTitle">
+      <div class="card-head">
+        <h2 class="label" id="ioTitle">账号导入 / 导出</h2>
+        <div class="card-head-actions">
+          <span class="io-hint">机器之间迁移 WorkBuddy 账号的 JSON</span>
+        </div>
+      </div>
+
+      <div class="io-block">
+        <div class="io-block-head">
+          <span class="label">导出</span>
+          <span class="io-hint">API key 类账号不导出；导出文件可直接用于另一台机器的「导入」</span>
+        </div>
+        <div class="io-row">
+          <span class="label io-rowlabel">范围</span>
+          <label class="check"><input type="radio" name="expScope" value="all" checked> 全部</label>
+          <label class="check"><input type="radio" name="expScope" value="cn"> 仅国内版（cn）</label>
+          <label class="check"><input type="radio" name="expScope" value="intl"> 仅国际版（intl）</label>
+          <label class="check"><input type="radio" name="expScope" value="selected"> 仅勾选的账号</label>
+        </div>
+        <div class="io-row">
+          <label class="check"><input type="checkbox" id="expSecrets" checked> 含凭据（accessToken / refreshToken）</label>
+        </div>
+        <p class="io-warn" id="expSecretsWarn">导出文件内含 accessToken / refreshToken，等同账号钥匙：妥善保管，别外发、别截图分享。</p>
+        <p class="io-hint" id="expSanitizedNote" hidden>脱敏清单不能用于登录，只能用来看。</p>
+        <div class="io-row">
+          <button type="button" class="btn" id="expBtn">导出并下载</button>
+          <span class="io-hint" id="expKeyHint">含凭据导出需要密钥（未解锁时会先弹「解锁写操作」）；脱敏导出免密钥。</span>
+        </div>
+        <p class="io-status" id="expStatus" role="status" aria-live="polite"></p>
+      </div>
+
+      <div class="io-block">
+        <div class="io-block-head">
+          <span class="label">导入</span>
+          <span class="io-hint">两段式：先预览（免密钥、不写盘），确认后才写入 magpie</span>
+        </div>
+        <p class="io-note">
+          接受四种形态：本插件的导出信封（<code>format: workbuddy-accounts</code>）、裸账号数组、单个账号对象、桌面端凭据
+          <code>{"auth":{…},"account":{…}}</code>。规则（后端执行，这里只转述）：<strong>只同步国内版</strong> ——
+          国际版（intl）账号一律拒绝；<strong>智能合并</strong> —— uid 已存在且现有 token 未过期则跳过，现有已过期且导入的更新则覆盖
+          access/refresh/expires，导入项没有 refreshToken 而现有有则跳过。
+          <strong>导入不会删除任何现有账号，也不会动其他供应商的条目。</strong>
+        </p>
+        <div class="io-row">
+          <label class="btn-quiet io-file-label" for="impFile">选择本地 .json 文件…</label>
+          <input type="file" id="impFile" accept=".json,application/json" hidden>
+          <span class="io-hint" id="impFileNote"></span>
+        </div>
+        <textarea id="impText" class="input input-mono io-textarea" spellcheck="false" autocomplete="off"
+          aria-label="导入的账号 JSON" placeholder="把账号 JSON 粘贴到这里，或先选择本地 .json 文件（读取后填进这里）"></textarea>
+        <div class="io-row">
+          <button type="button" class="btn-quiet" id="impPreviewBtn">预览（不写入）</button>
+          <button type="button" class="btn" id="impConfirmBtn" hidden>确认写入 magpie</button>
+          <span class="io-hint" id="impKeyHint">预览免密钥；确认写入需要密钥（未解锁时会先弹「解锁写操作」）。</span>
+        </div>
+        <p class="io-status" id="impStatus" role="status" aria-live="polite"></p>
+        <div id="impResult"></div>
+      </div>
+    </section>
 
     <!-- 账号 + 批量操作 -->
     <section class="card" aria-labelledby="accountsTitle">
@@ -182,29 +251,32 @@
   </main>
 
   <footer class="foot">
-    WorkBuddy 任务看板 · 数据只来自本机守护进程 · access/refresh token 永不出现在本页
+    WorkBuddy 任务看板 · 数据只来自本机守护进程 · access/refresh token 不在页面显示（含凭据导出只落下载文件）
   </footer>
 
   <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
 
-  <!-- 密钥对话框 -->
+  <!-- 解锁写操作对话框（原「看板密钥」启动弹框；只读接口免密钥后仅在写操作 401 或
+       用户点右上「解锁写操作」时出现。key 只存 sessionStorage、只走 Authorization 头，
+       绝不进 URL / 复制内容 / 下载链接。） -->
   <dialog id="keyDialog" aria-labelledby="keyDlgTitle">
     <form method="dialog" class="dialog-body" id="keyForm">
-      <h2 class="label" id="keyDlgTitle">看板密钥</h2>
+      <h2 class="label" id="keyDlgTitle">解锁写操作</h2>
       <p class="dialog-text">
-        除 <code>/api/hello</code> 外，所有接口都需要守护进程密钥。密钥保存在浏览器
-        sessionStorage（只发往本机守护进程），也可以用 <code>?k=&lt;key&gt;</code> 打开本页。
+        只读数据（账号、任务、历史、脱敏导出、导入预览）免密钥。批量任务、参与任务开关、保存窗口、
+        导入写入、含凭据导出这类<strong>有副作用或涉及凭据</strong>的操作需要守护进程密钥。
       </p>
       <p class="dialog-text">
         密钥在 <code>&lt;magpie 配置目录&gt;/workbuddy-tasks/state/daemon.json</code> 的
-        <code>key</code> 字段里（文件权限 0600，实际端口也写在同一文件）。
+        <code>key</code> 字段里（文件权限 0600，实际端口也写在同一文件）。密钥只保存在本标签页的
+        sessionStorage，只发往本机守护进程（<code>Authorization: Bearer</code> 头），不进地址栏。
       </p>
       <input type="password" class="input input-mono" id="keyInput" placeholder="daemon key"
         autocomplete="off" spellcheck="false" aria-label="守护进程密钥">
       <p class="error-text" id="keyError" hidden></p>
       <div class="dialog-actions">
         <button type="submit" class="btn-quiet" value="cancel">取消</button>
-        <button type="submit" class="btn" value="save">保存并连接</button>
+        <button type="submit" class="btn" value="save">保存并解锁</button>
       </div>
     </form>
   </dialog>

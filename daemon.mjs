@@ -47,6 +47,18 @@ import {
 // 插件自带、无网络依赖的模块 —— 缺文件与 lifecycle.mjs 缺失同级（整个模块装不上），
 // 不属于 engine/* 的可选降级范畴。
 import { resolveTaskKind } from "./engine/taskkind.mjs"
+// 账号 JSON 导入/导出（契约 §9）：静态导入与 taskkind 同级 —— 纯函数模块、
+// 只依赖 node: 内置与 engine/store.mjs，缺文件属于整个模块装不上的范畴。
+import {
+  applyImport,
+  buildExportDocument,
+  coerceImportRows,
+  exportFileName,
+  planImport,
+  planView,
+} from "./engine/accountio.mjs"
+// 导入/导出路由直接读凭据文件（读-计划-复查-写 的竞态守卫需要原文与哈希）
+import { readAuthDocument } from "./engine/store.mjs"
 
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const VERSION = (() => {
@@ -120,6 +132,53 @@ function timingSafeEqual(a, b) {
 
 function shortErr(e) {
   return scrub(e?.message ?? String(e)).slice(0, 200)
+}
+
+// ---- 路由 → 是否需密钥（单一数据源；契约 §3）--------------------------------
+// 用户口径：「打开看板页面不再弹密钥」落实为按副作用分级：
+//   free     —— 只读、无副作用、响应不含凭据
+//   write    —— 有副作用或响应含凭据（红线：secrets=1 的导出免密钥就能把
+//               所有 access/refresh 打包下载走，绝不放开）
+//   secrets  —— GET /api/accounts/export：仅 secrets=0（脱敏）免密钥，
+//               缺省/secrets=1 一律要密钥
+//   confirm  —— POST /api/accounts/import：预览分支免密钥，confirm=true 要密钥
+// 未登记的路由一律按需密钥处理（默认关死，绝不给默认免密；带 key 访问未知路由
+// 才能看到 404）。
+const API_ROUTE_AUTH = [
+  { method: "GET", re: /^\/api\/hello$/, level: "free" },
+  { method: "GET", re: /^\/api\/state$/, level: "free" },
+  { method: "GET", re: /^\/api\/history$/, level: "free" },
+  { method: "GET", re: /^\/api\/jobs\/[A-Za-z0-9_-]+$/, level: "free" },
+  { method: "GET", re: /^\/api\/events$/, level: "free" },
+  { method: "POST", re: /^\/api\/accounts$/, level: "free" }, // 重扫本地文件，无副作用
+  { method: "GET", re: /^\/api\/accounts\/export$/, level: "secrets" },
+  { method: "POST", re: /^\/api\/accounts\/import$/, level: "confirm" },
+  { method: "POST", re: /^\/api\/run$/, level: "write" },
+  { method: "POST", re: /^\/api\/stop$/, level: "write" },
+  { method: "POST", re: /^\/api\/task\/claim$/, level: "write" },
+  { method: "POST", re: /^\/api\/task\/accept$/, level: "write" },
+  { method: "POST", re: /^\/api\/checkin$/, level: "write" },
+  { method: "POST", re: /^\/api\/settings$/, level: "write" },
+  { method: "POST", re: /^\/api\/account\/toggle$/, level: "write" },
+  { method: "POST", re: /^\/api\/shutdown$/, level: "write" },
+]
+
+export const KEY_REQUIRED_MSG =
+  "此操作会改动账号或涉及凭据，需要守护进程密钥：请在看板右上「解锁写操作」里填入 state/daemon.json 的 key（Authorization: Bearer <key> 或 ?k=<key>）"
+
+const TRUTHY = ["1", "true", "yes"]
+const isTruthyParam = (v) => TRUTHY.includes(String(v ?? "").trim().toLowerCase())
+// secrets=0/false/no = 脱敏导出（免密钥）；缺省/1/true/其他值 = 含凭据（必须密钥）
+const isSecretsFree = (v) => ["0", "false", "no"].includes(String(v ?? "").trim().toLowerCase())
+
+// routeNeedsKey(method, pathname, {secrets, confirm}) -> boolean（导出供测试）
+export function routeNeedsKey(method, pathname, cond = {}) {
+  const row = API_ROUTE_AUTH.find((r) => r.method === method && r.re.test(pathname))
+  if (!row) return true
+  if (row.level === "free") return false
+  if (row.level === "secrets") return !isSecretsFree(cond.secrets)
+  if (row.level === "confirm") return cond.confirm === true
+  return true
 }
 
 // ---- 快照投影（导出供测试）-------------------------------------------------
@@ -367,6 +426,9 @@ export async function startDaemon(opts = {}) {
   const historyFile = join(stateDir, "history.json")
   const firedFile = join(stateDir, "lastFired.json")
   const accountsFile = join(stateDir, "accounts.json") // uid -> tasksEnabled 布尔（/api/account/toggle 写入）
+  // 本插件经手 JSON 导入的 acctKey 台账（契约 §9）：magpie 整体覆写 plugin-auth.json
+  // 会抹掉 importedFrom 标记，这份记录让 /api/state 的 imported 仍可用（尽力而为口径）
+  const hubImportsFile = join(stateDir, "hub-imports.json")
 
   let settings = { ...DEFAULT_SETTINGS, ...readJson(settingsFile, {}) }
   // 安全默认（C1）：settings.json 缺失或损坏时 readJson 落 {}，scheduler 按
@@ -381,6 +443,8 @@ export async function startDaemon(opts = {}) {
   let history = Array.isArray(readJson(historyFile, [])) ? readJson(historyFile, []) : []
   let fired = readJson(firedFile, {})
   let tasksEnabledMap = readJson(accountsFile, {})
+  let hubImports = readJson(hubImportsFile, {})
+  if (!hubImports || typeof hubImports !== "object" || Array.isArray(hubImports)) hubImports = {}
 
   function readSettings() {
     return JSON.parse(JSON.stringify(settings))
@@ -390,6 +454,7 @@ export async function startDaemon(opts = {}) {
   const saveHistory = () => writeJson(historyFile, history.slice(-HISTORY_CAP))
   const saveFired = () => writeJson(firedFile, fired)
   const saveAccountsState = () => writeJson(accountsFile, tasksEnabledMap)
+  const saveHubImports = () => writeJson(hubImportsFile, hubImports)
 
   if (!existsSync(settingsFile)) saveSettings()
 
@@ -910,6 +975,10 @@ export async function startDaemon(opts = {}) {
       expiresInMs: exp ? exp - now() : null,
       expiresInDays: exp ? Math.max(0, Math.ceil((exp - now()) / 86400000)) : null,
       tasksEnabled: a.tasksEnabled !== false,
+      // 该账号行来自 JSON 导入（契约 §9）：importedFrom 标记 || 本插件导入台账。
+      // 两者都是尽力而为（magpie 覆写会抹标记、删 state 会丢台账），只作展示，
+      // 绝不作为任何逻辑判断依据。
+      imported: a.importedFrom === "hub-json" || !!hubImports[a.key],
       eligible:
         a.provider === "workbuddy" && !a.isApiKey && !a.enterpriseId && a.tasksEnabled !== false,
       snapshot: snap,
@@ -1002,7 +1071,7 @@ export async function startDaemon(opts = {}) {
 <body style="font-family:system-ui,sans-serif;max-width:42rem;margin:4rem auto;padding:0 1rem;color:#333">
 <h2>看板尚未构建</h2>
 <p>本插件的 <code>dashboard/</code> 目录还没有前端文件。任务 API、排程与守护进程已在运行。</p>
-<p>把看板文件放进 <code>dashboard/</code> 后刷新本页即可。<code>/api/hello</code> 可确认服务状态；其余 <code>/api/*</code> 需要密钥（见 <code>state/daemon.json</code>）。</p>
+<p>把看板文件放进 <code>dashboard/</code> 后刷新本页即可。<code>/api/hello</code> 可确认服务状态；只读接口免密钥，改动账号或涉及凭据的接口需要密钥（见 <code>state/daemon.json</code>）。</p>
 </body></html>`
   }
 
@@ -1045,6 +1114,123 @@ export async function startDaemon(opts = {}) {
     return JSON.parse(text)
   }
 
+  // ---- POST /api/accounts/import（契约 §9：两段式，预览默认不写盘）----------
+  // body = 账号数据本体（信封/裸数组/单对象/桌面端凭据）或 {"blob":<同上>,"confirm":bool}
+  // 预览: {wrote:false, note:"预览未写入任何文件", preview:{adds,updates,skips,rejects,totals}}
+  // 确认: {wrote:true, added,updated,skipped,backedUpTo,needReload:true,reloadHint}
+  // 错误: 无可导入账号→400；auth 解析失败→409 拒写；预览后文件已变→409 重新预览。
+  // 零凭据外泄：响应与日志只有 uid/昵称/key 与计数，绝不出现 token。
+  let lastImportPreview = null // {hash, at} —— 竞态守卫的依据（内存态，重启即失效）
+
+  function sha256Hex(text) {
+    return crypto.createHash("sha256").update(text).digest("hex")
+  }
+
+  async function handleAccountsImport(req, res, u) {
+    let body
+    try {
+      body = await readBody(req)
+    } catch (e) {
+      json(res, 400, { error: `请求体不是合法 JSON：${shortErr(e)}` })
+      return
+    }
+    const confirm =
+      (body && typeof body === "object" && body.confirm === true) || isTruthyParam(u.searchParams.get("confirm"))
+    // 门禁（confirm=true 有副作用 → 必须密钥；预览免密钥，见 API_ROUTE_AUTH）
+    if (confirm && !authorized(req, u)) {
+      json(res, 401, { error: KEY_REQUIRED_MSG })
+      return
+    }
+
+    const blob =
+      body && typeof body === "object" && !Array.isArray(body) && "blob" in body ? body.blob : body
+    const coerced = coerceImportRows(blob)
+    if (coerced.error) {
+      json(res, 400, { error: `无法读取账号文档：${scrub(coerced.error)}` })
+      return
+    }
+
+    const auth = readAuthDocument(cfgDir)
+    if (!auth.ok && !auth.missing) {
+      // 坏 JSON 拒写：连「读现有账号做智能合并」都做不到，更不能覆盖别人的凭据文件
+      json(res, 409, {
+        error: "plugin-auth.json 解析失败，拒绝写入以免丢数据；请先手工备份并修复该文件",
+        detail: scrub(auth.error),
+      })
+      return
+    }
+    const existingData = auth.ok ? auth.data : {}
+    const hash = sha256Hex(auth.ok ? auth.text : "")
+    const plan = planImport(coerced.rows, existingData, { now })
+
+    if (!confirm) {
+      lastImportPreview = { hash, at: now() }
+      json(res, 200, { wrote: false, note: "预览未写入任何文件", preview: planView(plan) })
+      return
+    }
+
+    // ---- 确认分支（已过密钥门禁）----
+    if (lastImportPreview && lastImportPreview.hash !== hash) {
+      // 用户确认的是「预览时看到的那份文件」；文件已变（magpie 可能刚刷新过 token）
+      // 就绝不能按旧印象写，要求重新预览
+      json(res, 409, {
+        error: "plugin-auth.json 在预览后发生了变化（magpie 可能刷新过 token），为防覆盖请重新预览后再确认",
+        needRepreview: true,
+      })
+      return
+    }
+    if (!plan.totals.adds && !plan.totals.updates) {
+      json(res, 200, {
+        wrote: false,
+        note: "没有需要写入的变更（新增/更新均为 0，全部跳过或拒绝）",
+        added: [],
+        updated: [],
+        skipped: plan.skips,
+        backedUpTo: null,
+        needReload: false,
+        preview: planView(plan),
+      })
+      return
+    }
+    // 写前竞态复查：文件必须仍是刚才计划所依据的那一份
+    const re = readAuthDocument(cfgDir)
+    if (!re.ok && !re.missing) {
+      json(res, 409, { error: "plugin-auth.json 读取失败，拒绝写入以免丢数据", detail: scrub(re.error) })
+      return
+    }
+    if (sha256Hex(re.ok ? re.text : "") !== hash) {
+      json(res, 409, { error: "plugin-auth.json 在计划过程中发生了变化，请重新预览后再确认", needRepreview: true })
+      return
+    }
+    let r
+    try {
+      r = applyImport(cfgDir, plan, { existingData: re.ok ? re.data : {}, now })
+    } catch (e) {
+      json(res, 500, { error: `写入 plugin-auth.json 失败：${shortErr(e)}` })
+      return
+    }
+    // 导入台账：记录本插件经手的 acctKey（magpie 覆写会抹 importedFrom，这份
+    // 记录让 /api/state 的 imported 仍可靠；尽力而为口径，只作展示）
+    for (const op of plan.ops) {
+      hubImports[op.key] = {
+        uid: op.entry?.uid ?? "",
+        importedAt: new Date(now()).toISOString(),
+      }
+    }
+    saveHubImports()
+    broadcast({ kind: "accounts", event: "import", added: plan.totals.adds, updated: plan.totals.updates })
+    log(`[import] 确认写入：新增 ${plan.totals.adds}、更新 ${plan.totals.updates}、跳过 ${plan.totals.skips}、拒绝 ${plan.totals.rejects}（备份 ${r.backedUpTo ?? "无"}）`)
+    json(res, 200, {
+      wrote: true,
+      added: plan.adds, // [{uid,nickname,key}]
+      updated: plan.updates, // [{uid,nickname,key,fromExpires,toExpires,reason}]
+      skipped: plan.skips,
+      backedUpTo: r.backedUpTo,
+      needReload: true,
+      reloadHint: "在 magpie「插件管理」里把 WorkBuddy 关掉再打开，新账号才会被 magpie 认到",
+    })
+  }
+
   async function handleApi(req, res, u) {
     const p = u.pathname
 
@@ -1053,8 +1239,15 @@ export async function startDaemon(opts = {}) {
       return
     }
 
-    if (!authorized(req, u)) {
-      json(res, 401, { error: "需要守护进程密钥：Authorization: Bearer <key> 或 ?k=<key>（密钥见 state/daemon.json）" })
+    // 导入路由单独前置：confirm 可以在 body 里，必须先读完 body 才能定门禁
+    // （读 body 本身无副作用）。其余路由按 API_ROUTE_AUTH 表判级。
+    if (p === "/api/accounts/import" && req.method === "POST") {
+      await handleAccountsImport(req, res, u)
+      return
+    }
+
+    if (routeNeedsKey(req.method, p, { secrets: u.searchParams.get("secrets") }) && !authorized(req, u)) {
+      json(res, 401, { error: KEY_REQUIRED_MSG })
       return
     }
 
@@ -1225,6 +1418,47 @@ export async function startDaemon(opts = {}) {
         added: [...afterIds].filter((x) => !before.has(x)),
         removed: [...before].filter((x) => !afterIds.has(x)),
       })
+      return
+    }
+
+    if (p === "/api/accounts/export" && req.method === "GET") {
+      // hub /accounts/export（wb_proxy.py:19314）的移植：realm/secrets/uid/download。
+      // secrets=0/false/no = 脱敏（免密钥，见 API_ROUTE_AUTH）；缺省/secrets=1 = 含
+      // access/refresh 的真值导出（必须密钥 —— 红线）。导出文件本身必须真值，否则
+      // 回灌无效；打码只属于界面展示层。
+      const realmParam = u.searchParams.get("realm")
+      const realm = realmParam === "cn" || realmParam === "intl" ? realmParam : null
+      const includeSecrets = !isSecretsFree(u.searchParams.get("secrets"))
+      const uids = u.searchParams
+        .getAll("uid")
+        .flatMap((s) => String(s).split(","))
+        .map((s) => s.trim())
+        .filter(Boolean)
+      const accts = loadAccountsAll()
+      if (uids.length) {
+        const known = new Set(accts.map((a) => a.uid))
+        const missing = uids.filter((x) => !known.has(x))
+        if (missing.length) {
+          json(res, 404, { error: `no such account: ${missing.slice(0, 5).join(", ")}` })
+          return
+        }
+      }
+      const doc = buildExportDocument(accts, { realm, includeSecrets, uids: uids.length ? uids : null, now: now() })
+      log(`[export] realm=${realm ?? "all"} secrets=${includeSecrets ? 1 : 0} uids=${uids.length} count=${doc.count}`)
+      if (isTruthyParam(u.searchParams.get("download"))) {
+        // hub _download()：attachment + 净化文件名 + no-store
+        const name = exportFileName({ uids, realm, now: now() })
+        const text = JSON.stringify(doc, null, 2)
+        res.writeHead(200, {
+          "Content-Type": "application/json; charset=utf-8",
+          "Content-Length": Buffer.byteLength(text),
+          "Content-Disposition": `attachment; filename="${name}"`,
+          "Cache-Control": "no-store",
+        })
+        res.end(text)
+        return
+      }
+      json(res, 200, doc)
       return
     }
 

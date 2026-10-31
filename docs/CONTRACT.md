@@ -129,16 +129,34 @@ class JobRunner {
 **时间必须可注入**：所有 sleep/now 走 `opts.sleep/opts.now`，测试里换成假时钟，保证「≥1 s 间隔」可断言、测试秒级完成。
 **fetch 同样可注入**：runner/daemon 全程把 `opts.fetch` 透传给 upstream（daemon 亦接受 `startDaemon({fetch})`，并注入到快照刷新、手动领奖/接取/签到等每一路引擎调用），测试以假 fetch 替换全部上游调用，零真实网络。跨腿/跨刷新的边界由 runner 在每条腿前补一拍 `gap`（腿内由 `makeCtx.breathe` 保证），使「任意两次上游调用 ≥1 s」在整条链路上成立。
 
-## 3. daemon HTTP API（前端唯一依赖；全部 JSON；除 `/api/hello` 外都要 key）
+## 3. daemon HTTP API（前端唯一依赖；全部 JSON；**按副作用分级要 key**）
 
-鉴权：`Authorization: Bearer <daemon key>` 或 `?k=<daemon key>`；key 由 `index.mjs` 生成存 `state/daemon.json`。
+鉴权分级（用户口径「打开看板页面不再弹密钥」）：`Authorization: Bearer <daemon key>` 或 `?k=<daemon key>`；
+key 由 `index.mjs` 生成存 `state/daemon.json`。**路由→是否需密钥的单一数据源**在 `daemon.mjs` 的
+`API_ROUTE_AUTH` + `routeNeedsKey()`（导出供测试），任何新路由都必须登记进表，别散在各处 if：
+
+- **免密钥（只读、无副作用、响应不含凭据）**：`GET /` 与静态资源、`GET /api/hello`、`GET /api/state`
+  （含现有 `?refresh=` 语义——它只打上游只读 GET，保持免密钥）、`GET /api/history`、`GET /api/jobs/:id`、
+  `GET /api/events`(SSE)、`POST /api/accounts`（重扫本地文件，无副作用）、
+  `GET /api/accounts/export?secrets=0`（脱敏导出）、`POST /api/accounts/import` 的**预览分支**
+  （confirm 缺省）。
+- **必须密钥（有副作用或含凭据）**：`POST /api/run`、`/api/stop`、`/api/task/claim`、`/api/task/accept`、
+  `/api/checkin`、`/api/settings`、`/api/account/toggle`、`/api/shutdown`、
+  `POST /api/accounts/import?confirm=true`（或 body `{"confirm":true}`）、
+  `GET /api/accounts/export` 缺省或 `secrets=1`（**红线：这条免密钥就能把所有 access/refresh
+  打包下载走，绝不放开**）。
+- 无密钥访问需密钥路由 → `401 {error: KEY_REQUIRED_MSG}`，文案说明「此操作会改动账号或涉及凭据，
+  请在看板右上「解锁写操作」里填入 state/daemon.json 的 key」。
+- **未登记的路由一律按需密钥处理**（默认关死；带 key 才能看到 404）。
+
 绑定：`127.0.0.1` 默认；链路 `options.listenAddress → WB_DAEMON_ADDR → --addr`，设 `0.0.0.0`/`::` 才对外
 （README 强调只在局域网/VPN 用；真实绑定 host 由 daemon 心跳写进 `daemon.json` 的 `host`，三处日志/提示同口径）。
 
 ```
 GET  /api/hello                 -> {name, version, ready}
 GET  /api/state                 -> {bindHost, port, reachableHint,
-                                    accounts:[{uid,nickname,masked,domain,expiresInMs,expiresInDays,tasksEnabled,eligible,
+                                    accounts:[{uid,nickname,masked,domain,expiresInMs,expiresInDays,tasksEnabled,
+                                             imported,eligible,
                                              snapshot:{tasks:[{code,title,acceptStatus,progress:{current,target},
                                              rewardCredit,rewardEnergy,jumpUrl,taskType,
                                              desktopOnly,unforgeable,reason,canAccept,canLight,pinnedExpertId}],
@@ -193,6 +211,9 @@ GET  /api/state                 -> {bindHost, port, reachableHint,
                                     // releasedAt 为 ISO 8601 字符串（epoch ms 由 runner.holds() 给出，这里转 ISO）
                                     // tasksEnabled 为生效值：accounts.json 显式条目 > engine/store 的
                                     // tasks-accounts.json > 缺省 true
+                                    // imported = 该账号行来自 JSON 导入（§9）：importedFrom 标记 ||
+                                    // 本插件导入台账 state/hub-imports.json。尽力而为的展示标记
+                                    // （magpie 覆写会抹标记、删 state 会丢台账），不作判断依据
                                     // expiresInMs = token 原始剩余毫秒（exp - now，可为负 = 已过期）；
                                     // expiresInDays = ceil 口径的天数（Math.max(0,…)），token 还剩
                                     // 2 小时时会显示 1 —— 区分「不足一天」必须用 expiresInMs。
@@ -206,6 +227,13 @@ POST /api/settings              body 部分 settings -> 新的 settings（写 st
 POST /api/accounts              -> 重新读 plugin-auth.json -> {count, eligible, added[], removed[]}
                                     // count = workbuddy* 全部条目（含 API key，不参与任务）；
                                     // eligible = 可参与任务的 OAuth 账号数（engine.store.eligibleAccounts 口径）
+GET  /api/accounts/export?realm=cn|intl&secrets=0|1&uid=a,b&download=1
+                                    -> {format:"workbuddy-accounts",version:1,
+                                        exportedAt:"YYYY-MM-DD HH:MM:SS",count,accounts:[hub 形状行]}
+                                    // hub /accounts/export（wb_proxy.py:19314）移植；语义/文件名/404
+                                    // 规则与脱敏行为见 §9；secrets=0 免密钥，缺省/secrets=1 必须密钥
+POST /api/accounts/import       -> 预览/确认两段式（body 形状、响应形状、错误码见 §9）；
+                                    // 预览免密钥，confirm=true 必须密钥
 POST /api/account/toggle        body {uid, tasksEnabled:bool} -> account 行（同 /api/state 的 accounts[] 元素）
                                     // 「参与任务」开关（hub 的 task_active）：写 state/accounts.json 并回读；
                                     // 400 缺 uid / tasksEnabled 非布尔，404 账号不存在；
@@ -292,6 +320,28 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
 - `first_buddy` 是 `task_type==='auto'`：不许进接取批次，必须先点亮+领奖，否则单任务接取报 `prerequisite not met`。
 - 领奖竞态：上报后等 1.5 s，轮询进度最多 6 次（在涨就再等 2.5 s），没到位就把领奖顺延到下一轮，绝不硬闯。
 
+### 7.1 hub 移植的时间单位：expiresAt = epoch 秒，magpie expires = epoch 毫秒（双向换算）
+
+**结论**：hub 导出文档/凭据档里的 `expiresAt` 单位是 **epoch 秒**；magpie `plugin-auth.json` 里的
+`expires` 单位是 **epoch 毫秒**。换算：hub→magpie `×1000`；magpie→hub `floor(÷1000)`（<1s 精度
+丢弃，对过期判断无影响）。`0` 在两边都表示「未知」，绝不当作 1970。
+
+**Python 源码证据**（本仓库 `/tmp/wbsrc/repo` 快照，逐行核对）：
+
+| 证据 | 行号 | 内容 |
+| --- | --- | --- |
+| 写入处 | `wb_accounts.py:919-920` | `self.expires_at = (0 if self.is_api_key else normalize_epoch(data.get("expiresAt")) or jwt_exp(token))` —— `jwt_exp()` 返回 JWT `exp` 声明（RFC 7519 恒为秒），:514-518 |
+| 归一处 | `wb_accounts.py:526-533` | `normalize_epoch()`：`if number > 1e11: number /= 1000.0` —— >1e11 一律当毫秒除成秒，内部表示是秒 |
+| 比较处 1 | `wb_accounts.py:1230-1232` | `public()`：`exp = self.expires_at or jwt_exp(...)`；`now = time.time()`；`is_token_expired = … (exp and exp <= now)` —— 与 **`time.time()`（秒）** 比较 |
+| 比较处 2 | `wb_accounts.py:1829-1831` | `exp - now <= 120` → 「凭证已过期」，`now` 由调用方传 `time.time()`（秒）；`ready()` 同款 `remaining = exp - time.time()`（:1817 起） |
+| 反证（毫秒口径的存在） | `wb_accounts.py:5413-5414` | cockpit snake_case 行注释：**「expires_at is milliseconds, which normalize_epoch() below converts to seconds」** —— 外来毫秒值只在入口处被换算成秒，内部从不是毫秒 |
+| magpie 侧 | 真实 `plugin-auth.json` | `expires` 全部为 13 位毫秒值（如 1.79e12），9 个条目无一例外 |
+
+**为什么必须写死**：单位搞错会让导入账号「立刻已过期」（秒值当毫秒读 = 1970 年）或
+「永不过期」（毫秒值当秒读 = 5 万年后），且智能合并的分支会**静默走错**（未过期判成已过期 →
+把在用的新 token 换成 JSON 里的旧 token）。tests 里有专门防秒/毫秒混淆的用例
+（`tests/accountio-import.test.mjs`：双向换算 + 智能合并分支在秒/毫秒两套输入下结论一致）。
+
 ## 8. 测试门槛（没有这些不算完成）
 
 `bun test` 全绿，且**零真实网络**（`fetch` 注入 mock）：
@@ -307,3 +357,94 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
 - store：回写只改 access/refresh/expires，保留未知字段，产出合法 JSON 且权限 600；
 - runner：两个 `start()` → 第二个 409；`stop()` 能在步骤边界中止；
 - schedule：窗口判定（09:00/21:00 成长+旅行，01:00 夜猫，夜猫只认 23:00–08:00）。
+
+## 9. 账号 JSON 导入 / 导出（hub 移植口径；engine/accountio.mjs）
+
+WorkBuddy 账号在机器之间以一份自描述 JSON 迁移（hub `wb_accounts.py` 的 export/import 移植）。
+**产品口径（已定，不得扩张）**：只同步国内版（`realm==="cn"` → provider `workbuddy`）；国际版
+一律不导入（rejects，reason「只同步国内版 workbuddy，国际版账号不导入」）；**导入直接写 magpie 的
+`plugin-auth.json`，绝不建第二份私有账号库**（同账号两条 token 血统会在 refresh 轮换时互相踢下线）。
+
+### 9.1 导出（`GET /api/accounts/export`）
+
+```
+GET /api/accounts/export?realm=cn|intl&secrets=0|1&uid=a,b&download=1
+  -> {format:"workbuddy-accounts", version:1, exportedAt:"YYYY-MM-DD HH:MM:SS",
+      count:N, accounts:[hub 形状行]}
+```
+
+- 语义照 hub `_get_accounts_export`（wb_proxy.py:19314）：`realm` 过滤（cn/intl，其他值=不过滤）、
+  `uid` 逗号分隔可重复（未知的 uid → `404 {error:"no such account: …"}`）、`download=1` 走
+  `Content-Disposition: attachment`（文件名规则同 hub，见下）、`secrets=0|false|no` 按 hub 行为
+  **删除 accessToken/refreshToken 两键**（其余字段保留）。
+- **secrets 缺省 = 1（含 token），必须密钥**；`secrets=0` 免密钥（§3 门禁红线）。
+- 文件名（hub :19347-19353 + `_download` :18706 净化）：单 uid →
+  `workbuddy-accounts-<uid 前 8 位><YYYYMMDD-HHMMSS>.json`；多 uid/无 uid →
+  `workbuddy-accounts-[<realm>-]<YYYYMMDD-HHMMSS>.json`；`[^A-Za-z0-9._-]`→`_`，截 120。
+- `exportedAt` 为本地时间 `YYYY-MM-DD HH:MM:SS`（hub `time.strftime` 口径）。
+- **导出行是 hub 字段名**（`Account.to_dict()`，wb_accounts.py:1136，为准的字段表）：
+
+| hub 行字段 | 类型 | 来源（magpie 官方条目/我们的 Account） |
+| --- | --- | --- |
+| `uid` | string | entry.uid（缺则由 JWT sub 派生，store 载入时已定） |
+| `nickname` | string | entry.accountId（magpie 的显示名） |
+| `domain` | string | entry.domain |
+| `realm` | "cn"\|"intl" | provider：workbuddy→cn、workbuddy-ai→intl |
+| `platform` | string | 常量 "CLI"（hub 缺省） |
+| `product` | string | 常量 "workbuddy"（hub `normalize_product` 缺省） |
+| `enterpriseId` | string | entry.enterpriseId |
+| `accessToken` | string | entry.access（**secrets=0 时删除**） |
+| `refreshToken` | string | entry.refresh（**secrets=0 时删除**） |
+| `expiresAt` | number | **epoch 秒** = floor(entry.expires/1000)（§7.1） |
+| `source` | string | 常量 "magpie" |
+| `apiKey` | bool | 是否 API Key 条目（此类条目整行不导出——没有 OAuth 凭据可导） |
+| `enabled` | bool | 恒 true |
+| `tasksEnabled` | bool | 本插件 state 的生效值 |
+
+  `to_dict()` 的其余字段（addedAt/proxySlot/proxy/weight/note/disabledModels/lastError/
+  cooldownUntil/restrictedUntil/credits/tier/lastCheckin/lastDailyChat/lastActivityReport/
+  modelCaps）是 hub 本地运行时状态或 magpie 侧不存在的信息，**不携带**；导入侧本就按
+  `VOLATILE_FIELDS`（wb_accounts.py:5317）丢弃，回灌无损。
+- **导出文件本身必须真值**（含昵称与 token，不打码）——否则回灌无效；打码只属于界面展示层。
+- 导入侧绝不信任行上的易失字段（cooldownUntil/lastError 等），与 hub 同款。
+
+### 9.2 导入（`POST /api/accounts/import`，两段式）
+
+body = 账号数据本体（**四种形态**，hub `_coerce_account_rows` wb_accounts.py:5366 逐字移植：
+导出信封 `{format,accounts}`、裸数组、单账号对象、桌面端凭据 `{"auth":{…},"account":{…}}`；
+cockpit snake_case 行 `access_token/expires_at(毫秒)` 也认）或 `{"blob":<同上>,"confirm":bool}`。
+
+- **预览（默认，免密钥，绝不写盘）**：
+  `{wrote:false, note:"预览未写入任何文件", preview:{adds:[{uid,nickname,key}],
+  updates:[{uid,nickname,key,fromExpires,toExpires,reason}], skips:[{uid,nickname,reason}],
+  rejects:[{index,reason,inputHint}], totals:{adds,updates,skips,rejects}}}`
+  （index 从 1 起，hub 口径；`inputHint` 只含身份字段/字段名清单，**绝不含 token**）
+- **确认（`confirm:true`，必须密钥）**：
+  `{wrote:true, added:[…], updated:[…], skipped:[…], backedUpTo:"plugin-auth.json.bak-hubimport-<stamp>",
+  needReload:true, reloadHint:"在 magpie「插件管理」里把 WorkBuddy 关掉再打开，新账号才会被 magpie 认到"}`
+- **错误**：文档读不出可导入账号 → `400`；`plugin-auth.json` 解析失败 → `409` 拒写（连预览也拒：
+  智能合并没有可靠的「现有」可用）；**预览后文件已变（竞态）→ `409 {needRepreview:true}`**；
+  落盘本身失败 → `500`。确认时若本进程里没有预览缓存，按当前文件现场计划后直接执行
+  （纯函数同规则 ⇒ 同输入同结论；竞态守卫针对「预览过但文件已变」）。
+
+**智能合并**（uid 已存在时，provider `workbuddy` 条目；顺序即优先级）：
+1. 导入项无 `refresh` 而现有有 → `skip`（「写进去会削弱续期能力」）；
+2. 现有 `expires > now`（未过期）→ `skip`（「绝不把在用的新 token 换成 JSON 里的旧 token」）；
+3. 现有已过期且 `导入.expires > 现有.expires` → `update`（覆盖 access/refresh/expires）；
+4. 其余 → `skip`（「导入的 token 并不比现有的新」）。
+每个分支都给人话 reason。**更新只动 token 三件套**（access/refresh/expires）+ 补 `importedFrom`
+标记：domain/tokenType/accountId 是 magpie 官方登录流程写下的现场信息，JSON 不比它权威；
+未知字段靠条目展开原样保留。
+
+**写入纪律**（`applyImport` 才写；`planImport(rows, existingAuth, {now})` 是纯函数，预览与确认
+共用——同输入必同结论）：写前自动备份（逐字节 copy）；tmp+rename 原子落盘、mode 0600
+（复用 `engine/store.mjs` 的原语，不另起一套）；解析失败拒写；其它 provider 与未知字段逐值
+原样保留（测试用含 9 条目的 fixture 逐条比对）；key 分配沿用官方规则——**首个裸 id
+`workbuddy`，其余 `#`+6 位小写数字字母，不得与文件里任何已有 key 撞**。
+
+**写进 `plugin-auth.json` 的行用官方字段名**（非 hub 名）：
+`{type:"oauth", access, refresh, expires(毫秒), refreshExpiresAt?, domain, tokenType, uid,
+enterpriseId?, accountId(=可读昵称，magpie 用它显示账号名), importedFrom:"hub-json"}`。
+`importedFrom` 是**易失标记**：magpie 下次整体覆写可能抹掉——因此 `/api/state` 的
+`imported` 布尔 = `importedFrom==="hub-json"` || 本插件台账 `state/hub-imports.json` 有该 key，
+两者都只是**尽力而为的展示标记，不作为任何逻辑判断依据**。

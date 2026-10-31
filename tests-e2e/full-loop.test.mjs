@@ -297,7 +297,9 @@ test("e2e 启动：真实 daemon + 真实引擎，/api/hello ready，密钥门�
   assert.equal(hello.name, "workbuddy-tasks");
   assert.equal(hello.ready, true, "真实引擎应完整装载");
 
-  assert.equal((await fetch(api.base() + "/api/state")).status, 401);
+  // 密钥分级（契约 §3）：只读免密钥（打开看板不再弹密钥），写操作才要密钥
+  assert.equal((await fetch(api.base() + "/api/state")).status, 200);
+  assert.equal((await fetch(api.base() + "/api/run", { method: "POST" })).status, 401);
   assert.equal((await api.json(api.get("/api/state"))).status, 200);
 
   startSse();

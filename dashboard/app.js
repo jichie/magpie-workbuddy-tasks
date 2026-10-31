@@ -16,7 +16,7 @@
 //        —— 任务表的所有「能不能自动化」判断只来自这六个字段，前端不再自己拼规则
 //        （详见下方 taskFlags）。老后端字段缺失时按 legacy 回退，绝不报错。
 //        snapshot.expired 若为 true（后端将来下发）按「快照已过期」渲染；前端不发明字段。
-//   GET  /api/events?k=        -> SSE {kind:'job'|'step'|'log'|'scheduler'}
+//   GET  /api/events           -> SSE {kind:'job'|'step'|'log'|'scheduler'|'accounts'}（免密钥）
 //   GET  /api/history?limit=   -> {rows:[{at,uid,nickname,leg,state,detail,credit,energy,jobId,trigger}]}
 //   POST /api/run {uids?,legs?,claim?} -> {job} | 409 busy | 400 无账号 | 503 引擎不可用
 //   POST /api/stop             -> {job} | 404 没有任务在跑
@@ -24,14 +24,31 @@
 //   POST /api/task/claim  {uid,code}      -> {ok,credit,energy,via("chat"|"web"|""),reason}
 //   POST /api/checkin     {uids?}         -> [{uid,outcome,credit?,streak?,message}]
 //   POST /api/settings    (部分字段)       -> 完整 settings {scheduler,claim,legs,gapMs,hours,host}
-//   POST /api/accounts                    -> {count,eligible,added,removed}
+//   POST /api/accounts                    -> {count,eligible,added,removed}（重扫本地文件，免密钥）
 //   POST /api/account/toggle {uid,tasksEnabled:bool} -> 200 该账号的最新行（accounts[] 元素同形状）
 //                                            | 400/404 {error:"…"}（中文）
 //   POST /api/shutdown                    -> {ok:true}（随后守护进程退出）
-// 鉴权：所有请求带 ?k=<key>（浏览器对 EventSource 等子资源无法设 header，daemon 认 query）。
+//   GET  /api/accounts/export?secrets=1|0&realm=cn|intl&uid=a,b&download=1
+//                                         -> 信封 {format:"workbuddy-accounts",version,exportedAt,count,accounts}
+//        secrets=0（脱敏）免密钥；缺省/secrets=1（含 token）必须密钥（契约 §3 红线）。
+//        download=1 时走 Content-Disposition 附件（文件名取响应头，取不到按 hub 规则本地拼）。
+//   POST /api/accounts/import   body = {"blob":<账号数据本体>,"confirm":bool}
+//        预览（confirm 缺省/false）免密钥不写盘 -> {wrote:false,note,preview:{adds,updates,skips,rejects,totals}}
+//        确认（confirm:true）必须密钥 -> {wrote:true,added,updated,skipped,backedUpTo,needReload,reloadHint}
+//        409 needRepreview = 预览后 plugin-auth.json 被改动，要求重新预览（契约 §9.2）。
 //
-// 安全：服务端字符串（任务标题、detail、msg、日志）一律经 textContent 进 DOM —— 本文件
-// 不使用 innerHTML 注入任何动态内容。token 永不展示（daemon 也只给 uid/昵称/掩码）。
+// 鉴权（契约 §3 按副作用分级；用户口径「打开看板页面不再弹密钥」）：
+//   只读、无副作用的路由免密钥 —— 首屏直接渲染，没有启动弹框。
+//   有副作用或含凭据的路由需要密钥：fetch 一律带 Authorization: Bearer <key> 头；
+//   key 绝不拼进 URL / <a href> / 复制内容（会进浏览器历史）。唯一例外：老守护进程
+//   （只读路由也 401，legacyAuth 标记）下 EventSource 无法设 header，SSE 才回退 ?k=。
+//   401 → 弹一次「解锁写操作」密钥框 → 存 sessionStorage → 自动重试刚才那一个调用
+//   （见 withUnlockRetry）。右上「解锁写操作」按钮可随时先解锁 / 撤销解锁。
+//
+// 安全：服务端字符串（任务标题、detail、msg、日志、导入 reason、文件名）一律经
+// textContent 进 DOM —— 本文件不使用 innerHTML 注入任何动态内容。token 永不渲染到
+// 页面文本（daemon 只给 uid/昵称/掩码；导入响应经后端 planView 剥掉 token；含凭据
+// 导出只落下载文件，页面只显示计数/时间/文件名）。
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
@@ -66,7 +83,8 @@ const LS_THEME = "wbt.theme"; // 主题：localStorage 持久化
 const state = {
   key: "",
   hello: null,
-  conn: "checking", // checking | online | nokey | down | stopped
+  conn: "checking", // checking | online | nokey(仅旧守护进程) | down | stopped
+  legacyAuth: false, // 只读路由也 401 = 旧口径守护进程（新口径只读免密钥）；SSE 需 ?k= 兜底
   feed: "idle", // sse | poll | idle
   data: null, // 最近一次 /api/state
   selected: new Set(), // 勾选的 uid
@@ -226,15 +244,22 @@ class ApiError extends Error {
   }
 }
 
-async function api(path, { method = "GET", body, params } = {}) {
+// 新口径下绝对免密钥的只读路由（契约 §3）：它们也 401 = 对面是旧守护进程，
+// 标记 legacyAuth（SSE 需要 ?k= 兜底；EventSource 无法设 header）。
+const LEGACY_PROBE_RE = /^api\/(hello|state|history|jobs\/)/;
+
+async function apiOnce(path, { method = "GET", body, params } = {}) {
   const url = new URL(path, location.href);
-  if (state.key) url.searchParams.set("k", state.key);
   if (params) for (const [k, v] of Object.entries(params)) url.searchParams.set(k, String(v));
+  // key 只走 Authorization 头（daemon 认 Bearer 与 ?k= 两种；头不进浏览器历史/访问日志）
+  const headers = {};
+  if (state.key) headers.Authorization = `Bearer ${state.key}`;
+  if (body !== undefined) headers["Content-Type"] = "application/json";
   let res;
   try {
     res = await fetch(url, {
       method,
-      headers: body !== undefined ? { "Content-Type": "application/json" } : undefined,
+      headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
   } catch {
@@ -252,17 +277,54 @@ async function api(path, { method = "GET", body, params } = {}) {
   return data;
 }
 
+// 401 → 弹一次密钥框 → 存 sessionStorage → 自动重试刚才那一个调用（不让用户从头再点）。
+// 并发 401 共享同一个对话框与结果（promptKeyAsync 单飞）；用户取消 → 抛 unlockCancelled
+// （toast 已说明，调用方静默收尾）。重试后仍 401（密钥不对）→ 原样抛出，绝不循环弹框。
+async function withUnlockRetry(fn, cancelMsg) {
+  try {
+    return await fn();
+  } catch (e) {
+    if (!(e instanceof ApiError) || e.status !== 401) throw e;
+    const ok = await promptKeyAsync(e.message);
+    if (!ok) {
+      toast(cancelMsg || "已取消解锁：该操作会改动账号或涉及凭据，需要密钥，未执行。", "warn", 7000);
+      const c = new Error("已取消解锁");
+      c.unlockCancelled = true;
+      throw c;
+    }
+    return await fn(); // 自动重试同一个调用（此时 state.key 已是新值）
+  }
+}
+
+async function api(path, opts = {}) {
+  return await withUnlockRetry(async () => {
+    try {
+      return await apiOnce(path, opts);
+    } catch (e) {
+      if (
+        e instanceof ApiError &&
+        e.status === 401 &&
+        (opts.method ?? "GET") === "GET" &&
+        LEGACY_PROBE_RE.test(path)
+      ) {
+        state.legacyAuth = true; // 只读 GET 也要密钥 = 旧守护进程
+      }
+      throw e;
+    }
+  });
+}
+
 // 把异常翻译成人话（后端给的中文原样透出，绝不显示堆栈）
 function humanErr(e, prefix = "操作失败") {
+  if (e && e.unlockCancelled) return; // 取消解锁：withUnlockRetry 已 toast 说明
   if (e instanceof ApiError) {
     if (e.status === 409) {
       toast("已有批量任务在跑：同一时刻只允许一个 job。等它结束，或先点「停止当前任务」。", "warn", 7000);
       return;
     }
     if (e.status === 401) {
-      state.conn = "nokey";
-      renderTop();
-      promptKey(e.message || "密钥不对或未设置。");
+      // withUnlockRetry 已弹过一次并重试过；到这里 = 密钥不对，不再弹框（避免循环）
+      toast("密钥不正确（或守护进程已更换密钥）：点右上「解锁写操作」重新输入。密钥在 state/daemon.json 的 key 字段。", "warn", 9000);
       return;
     }
     toast(`${prefix}（HTTP ${e.status}）：${e.message}`, "warn", 8000);
@@ -277,7 +339,7 @@ function humanErr(e, prefix = "操作失败") {
   toast(`${prefix}：${e && e.message ? e.message : String(e)}`, "warn", 8000);
 }
 
-// ---- 密钥 ---------------------------------------------------------------------------
+// ---- 密钥 / 解锁写操作 ----------------------------------------------------------------
 
 function readKeyFromUrl() {
   const q = new URLSearchParams(location.search).get("k");
@@ -310,6 +372,27 @@ function promptKey(msg) {
   }
   $("#keyInput").value = state.key || "";
   if (!dlg.open) dlg.showModal();
+}
+
+// 打开密钥对话框并等待结果：true = 已保存（state.key 生效），false = 取消/ESC。
+// 单飞：并发多个 401（或用户连点）共享同一个对话框与同一个 Promise。
+let unlockWait = null;
+let unlockResolve = null;
+
+function promptKeyAsync(msg) {
+  if (unlockWait) return unlockWait;
+  unlockWait = new Promise((resolve) => {
+    unlockResolve = resolve;
+  });
+  promptKey(msg);
+  return unlockWait;
+}
+
+function settleUnlock(ok) {
+  const r = unlockResolve;
+  unlockWait = null;
+  unlockResolve = null;
+  if (r) r(ok);
 }
 
 // ---- 主题（默认跟随系统；显式选择持久化到 localStorage） -----------------------------
@@ -542,6 +625,24 @@ function renderTop() {
   } else {
     feed.classList.add("pill-quiet");
     feed.textContent = "连接中…";
+  }
+
+  // 读写分级标识（轻量胶囊）+「解锁写操作」按钮：只读免密钥，写操作需 key
+  const mp = $("#modePill");
+  if (mp) {
+    mp.className = state.key ? "pill pill-ok" : "pill pill-quiet";
+    mp.textContent = state.key ? "已解锁" : "只读模式";
+    mp.title = state.key
+      ? "写操作已解锁：密钥只存本标签页的 sessionStorage，点右上「已解锁」可撤销"
+      : "只读模式：账号、任务、历史等只读数据免密钥；有副作用的操作会提示解锁";
+  }
+  const ub = $("#unlockBtn");
+  if (ub) {
+    ub.textContent = state.key ? "已解锁" : "未解锁（只读）";
+    ub.setAttribute("aria-pressed", state.key ? "true" : "false");
+    ub.title = state.key
+      ? "已解锁写操作：点击撤销（清除 sessionStorage 里的密钥，回到只读模式）"
+      : "解锁写操作：批量任务、参与任务开关、保存窗口、导入写出、含凭据导出等有副作用的操作需要守护进程密钥（state/daemon.json 的 key）";
   }
 
   const st = state.data?.stats;
@@ -1412,6 +1513,10 @@ async function acceptSelected() {
           setBatchStatus("已有批量任务在跑，接取中止（守护进程限速保护）。");
           return;
         }
+        if (e && e.unlockCancelled) {
+          setBatchStatus("已取消解锁：批量接取中止（该操作需要密钥）。");
+          return;
+        }
         notes.push(`${a0.nickname || a0.uid}：快照刷新失败（${e.message}）`);
         continue;
       }
@@ -1440,6 +1545,11 @@ async function acceptSelected() {
       } catch (e) {
         if (e instanceof ApiError && e.status === 409) {
           setBatchStatus("已有批量任务在跑，接取中止（守护进程限速保护）。");
+          return;
+        }
+        if (e && e.unlockCancelled) {
+          // 取消解锁 = 用户明确不继续：中止整个批次，绝不对下一个账号再弹框
+          setBatchStatus("已取消解锁：批量接取中止（该操作需要密钥）。");
           return;
         }
         notes.push(`${a.nickname || a.uid}：${e.message}`);
@@ -1475,6 +1585,10 @@ async function claimSelected() {
           setBatchStatus("已有批量任务在跑，领奖中止。");
           return;
         }
+        if (e && e.unlockCancelled) {
+          setBatchStatus("已取消解锁：只领奖中止（该操作需要密钥）。");
+          return;
+        }
         failNotes.push(`${a0.nickname || a0.uid}：快照刷新失败`);
         continue;
       }
@@ -1495,6 +1609,10 @@ async function claimSelected() {
         } catch (e) {
           if (e instanceof ApiError && e.status === 409) {
             setBatchStatus("已有批量任务在跑，领奖中止。");
+            return;
+          }
+          if (e && e.unlockCancelled) {
+            setBatchStatus("已取消解锁：只领奖中止（该操作需要密钥）。");
             return;
           }
           failNotes.push(`${a.nickname || a.uid}/${code}：${e.message}`);
@@ -1568,6 +1686,434 @@ async function rescanAccounts() {
   } finally {
     btn.disabled = false;
   }
+}
+
+// ---- 账号导出 / 导入（契约 §9；hub 移植口径）------------------------------------------
+// 纪律：
+//   - key 只进 Authorization 头，绝不进 URL / <a href> / 复制内容（防浏览器历史泄漏）；
+//     下载走 fetch → Blob → URL.createObjectURL（object URL 不含 key）。
+//   - token 只出现在下载的导出文件里：页面文本绝不渲染 accessToken/refreshToken
+//     （导入响应经后端 planView 本就剥掉 token；导出只读 count/exportedAt 做摘要）。
+//   - uid / 目标 key / 文件名 / 备份名一律等宽（.mono / code）。
+//   - 服务端字符串（note/reason/reloadHint/inputHint/error）全部经 el() 的 textContent。
+
+// 纯函数：解析 Content-Disposition 里的文件名（后端 download=1 时给
+// attachment; filename="workbuddy-accounts-….json"，已净化为 ASCII）。
+// RFC 5987 的 filename*=UTF-8''… 优先；解析不出返回 ""（调用方按 hub 规则本地拼）。
+// 顺手再挡一遍路径分隔符（纵深防御，正常后端不会给）。导出仅为 Node 下单元验证。
+export function filenameFromDisposition(cd) {
+  const s = String(cd ?? "");
+  if (!s) return "";
+  const star = /filename\*\s*=\s*(?:UTF-8|utf-8)''([^;]+)/i.exec(s);
+  if (star) {
+    try {
+      return decodeURIComponent(star[1].trim()).replace(/^"|"$/g, "").replace(/[\\/:*?"<>|]/g, "_").slice(0, 120);
+    } catch {}
+  }
+  const plain = /filename\s*=\s*"?([^";]+)"?/i.exec(s);
+  const name = plain ? plain[1].trim() : "";
+  return name.replace(/[\\/:*?"<>|]/g, "_").slice(0, 120);
+}
+
+// Content-Disposition 取不到时的本地兜底文件名：与 hub 规则
+//（engine/accountio.exportFileName）逐字同款。导出仅为 Node 下单元验证。
+export function localExportFileName({ uids = [], realm = null, now = Date.now() } = {}) {
+  const p = (n) => String(n).padStart(2, "0");
+  const d = new Date(Number(now) || Date.now());
+  const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  const label = Array.isArray(uids) && uids.length === 1 ? String(uids[0]).slice(0, 8) : realm ? `${realm}-` : "";
+  const safe = `workbuddy-accounts-${label}${stamp}.json`.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120);
+  return safe || "export.json";
+}
+
+const SCOPE_NAMES = { all: "全部", cn: "仅国内版", intl: "仅国际版", selected: "仅勾选的账号" };
+
+function triggerBlobDownload(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = el("a", { href: url, download: filename, style: { display: "none" } });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+function exportScope() {
+  const radio = $('input[name="expScope"]:checked');
+  const scope = radio ? radio.value : "all";
+  if (scope === "cn" || scope === "intl") return { scope, realm: scope, uids: [] };
+  if (scope === "selected") return { scope, realm: null, uids: [...state.selected] };
+  return { scope, realm: null, uids: [] };
+}
+
+// 「含凭据」勾选联动：默认勾上（与 hub 一致）；勾/取消各自给一行说明
+function syncExportHints() {
+  const secrets = $("#expSecrets").checked;
+  $("#expSecretsWarn").hidden = !secrets;
+  $("#expSanitizedNote").hidden = secrets;
+  $("#expKeyHint").textContent = secrets
+    ? "含凭据导出需要密钥（secrets=1）：未解锁时会先弹「解锁写操作」，保存后自动继续下载。"
+    : "脱敏导出免密钥（secrets=0，后端删掉 accessToken/refreshToken 两键）。";
+}
+
+async function exportAccounts(btn) {
+  const secrets = $("#expSecrets").checked;
+  const { scope, realm, uids } = exportScope();
+  const status = $("#expStatus");
+  if (scope === "selected" && !uids.length) {
+    toast("「仅勾选的账号」需要先在下方账号区勾选至少一个账号。", "warn", 6500);
+    return;
+  }
+  btn.disabled = true;
+  status.textContent = `正在导出（${SCOPE_NAMES[scope] ?? scope} · ${secrets ? "含凭据" : "脱敏"}）…`;
+  const doFetch = async () => {
+    const url = new URL("api/accounts/export", location.href);
+    url.searchParams.set("secrets", secrets ? "1" : "0");
+    url.searchParams.set("download", "1");
+    if (realm) url.searchParams.set("realm", realm);
+    if (uids.length) url.searchParams.set("uid", uids.join(","));
+    const headers = {};
+    if (state.key) headers.Authorization = `Bearer ${state.key}`; // key 只进头，绝不进 URL
+    let res;
+    try {
+      res = await fetch(url, { headers });
+    } catch {
+      const err = new Error("连不上守护进程");
+      err.network = true;
+      throw err;
+    }
+    if (!res.ok) {
+      let data = null;
+      try {
+        data = await res.json();
+      } catch {}
+      throw new ApiError(res.status, data);
+    }
+    return res;
+  };
+  try {
+    // secrets=1 未解锁 → 401 → 弹一次密钥框 → 自动重试本次下载；secrets=0 免密钥直接过
+    const res = await withUnlockRetry(doFetch, "已取消解锁：含凭据导出需要密钥，未导出任何内容。");
+    const name = filenameFromDisposition(res.headers.get("Content-Disposition")) || localExportFileName({ uids, realm });
+    const blob = await res.blob();
+    // 摘要只取 count / exportedAt（绝不把账号行、token 渲染进页面）
+    let doc = null;
+    try {
+      doc = JSON.parse(await blob.text());
+    } catch {}
+    triggerBlobDownload(blob, name);
+    const count = Number(doc?.count);
+    const parts = [
+      Number.isFinite(count) ? `已导出 ${count} 个账号` : "已导出",
+      `${SCOPE_NAMES[scope] ?? scope} · ${secrets ? "含凭据" : "脱敏"}`,
+    ];
+    if (typeof doc?.exportedAt === "string" && doc.exportedAt) parts.push(doc.exportedAt);
+    status.replaceChildren(
+      el("span", { text: `${parts.join(" · ")}：` }),
+      el("code", { class: "mono", text: name }),
+      secrets
+        ? el("span", { class: "warn-text", text: " · 文件内含 accessToken/refreshToken，等同钥匙，别外发。" })
+        : el("span", { class: "muted", text: " · 脱敏清单不能用于登录，只能用来看。" }),
+    );
+  } catch (e) {
+    if (e && e.unlockCancelled) {
+      status.textContent = "";
+    } else if (e && e.network) {
+      status.textContent = "";
+      humanErr(e, "导出失败");
+    } else if (e instanceof ApiError) {
+      // 后端中文 error 原样透出（如 404 no such account），不显示堆栈
+      status.textContent = `导出失败（HTTP ${e.status}）：${e.message}`;
+    } else {
+      status.textContent = `导出失败：${e?.message ?? e}`;
+    }
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ---- 导入（两段式：预览免密钥不写盘 → 确认写入需密钥）--------------------------------
+// impState.blob = 预览用的已解析对象（确认必须与预览同一份内容）；previewOk = 预览
+// 成功才显示「确认写入」。textarea / 文件的任何变动都让预览失效 —— 后端的哈希竞态
+// 守卫只盯 plugin-auth.json 的变化，「导入内容改了没重新预览」只能前端挡。
+const impState = { blob: null, previewOk: false, totals: null };
+
+function impInvalidate(note) {
+  const wasOk = impState.previewOk;
+  impState.blob = null;
+  impState.previewOk = false;
+  impState.totals = null;
+  $("#impConfirmBtn").hidden = true;
+  if (wasOk && note) setImpStatus(note);
+}
+
+function setImpStatus(text) {
+  $("#impStatus").textContent = text ?? "";
+}
+
+function readImportJson() {
+  const text = $("#impText").value.trim();
+  if (!text) {
+    setImpStatus("请先粘贴账号 JSON，或选择本地 .json 文件读入。");
+    return undefined;
+  }
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    setImpStatus(`本地 JSON 解析失败（还没有发请求）：${e?.message ?? e}`);
+    return undefined;
+  }
+}
+
+async function importPreview() {
+  const btn = $("#impPreviewBtn");
+  const parsed = readImportJson();
+  if (parsed === undefined) return;
+  btn.disabled = true;
+  $("#impConfirmBtn").hidden = true;
+  $("#impResult").replaceChildren();
+  setImpStatus("正在预览…（免密钥，不写盘）");
+  try {
+    // body = {"blob":<账号数据本体>}：confirm 缺省 = 预览分支（免密钥）
+    const r = await api("api/accounts/import", { method: "POST", body: { blob: parsed, confirm: false } });
+    impState.blob = parsed;
+    impState.previewOk = true;
+    impState.totals = r?.preview?.totals ?? null;
+    renderImportPreview(r);
+    setImpStatus(String(r?.note ?? "预览未写入任何文件"));
+    $("#impConfirmBtn").hidden = false;
+  } catch (e) {
+    impInvalidate();
+    renderImportError(e, "预览失败");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// 预览四组列表：adds/updates 常规色；skips 用 --ink3（muted）；rejects 用 --warn ——
+// 不用刺眼的红。每条显示 uid、昵称、目标 key 与 reason 原文（全部 textContent）。
+function impWho(x) {
+  return String(x?.nickname || x?.uid || "—");
+}
+
+function impUidKeyCells(x) {
+  const cells = [];
+  if (x?.uid != null && x.uid !== "") cells.push(el("span", { class: "mono imp-uid", text: String(x.uid) }));
+  if (x?.key) cells.push(el("span", { class: "mono imp-key", text: String(x.key) }));
+  return cells;
+}
+
+function impGroup(title, rows, rowCls) {
+  if (!rows.length) return null;
+  return el(
+    "div",
+    { class: "imp-group" },
+    el("p", { class: "label imp-group-title", text: `${title}（${rows.length}）` }),
+    ...rows.map((x) => el("div", { class: `imp-row ${rowCls}`.trim() }, ...x)),
+  );
+}
+
+function renderImportPreview(r) {
+  const box = $("#impResult");
+  box.replaceChildren();
+  const pv = r?.preview ?? {};
+  const t = pv.totals ?? {};
+  const adds = Array.isArray(pv.adds) ? pv.adds : [];
+  const updates = Array.isArray(pv.updates) ? pv.updates : [];
+  const skips = Array.isArray(pv.skips) ? pv.skips : [];
+  const rejects = Array.isArray(pv.rejects) ? pv.rejects : [];
+
+  box.append(
+    el("p", {
+      class: "imp-totals",
+      text: `新增 ${Number(t.adds) || 0} · 更新 ${Number(t.updates) || 0} · 跳过 ${Number(t.skips) || 0} · 拒绝 ${Number(t.rejects) || 0}`,
+    }),
+  );
+
+  const groups = [
+    impGroup(
+      "新增",
+      adds.map((x) => [
+        el("span", { class: "imp-name", text: impWho(x) }),
+        ...impUidKeyCells(x),
+      ]),
+      "",
+    ),
+    impGroup(
+      "更新（覆盖 access/refresh/expires）",
+      updates.map((x) => [
+        el("span", { class: "imp-name", text: impWho(x) }),
+        ...impUidKeyCells(x),
+        el("span", {
+          class: "mono imp-expiry",
+          text: `${fmtDateTime(x?.fromExpires)} → ${fmtDateTime(x?.toExpires)}`,
+        }),
+        el("span", { class: "imp-reason", text: String(x?.reason ?? "") }),
+      ]),
+      "",
+    ),
+    impGroup(
+      "跳过（不写入）",
+      skips.map((x) => [
+        el("span", { class: "imp-name", text: impWho(x) }),
+        ...impUidKeyCells(x),
+        el("span", { class: "imp-reason", text: String(x?.reason ?? "") }),
+      ]),
+      "imp-row-skip",
+    ),
+    impGroup(
+      "拒绝（不导入）",
+      rejects.map((x) => [
+        el("span", { class: "mono imp-index", text: `#${Number(x?.index) || 0}` }),
+        el("span", { class: "imp-reason", text: String(x?.reason ?? "") }),
+        x?.inputHint ? el("span", { class: "mono imp-hint", text: String(x.inputHint) }) : null,
+      ]),
+      "imp-row-reject",
+    ),
+  ].filter(Boolean);
+
+  if (!groups.length) {
+    box.append(el("p", { class: "muted", text: "文档里没有可解析的行。" }));
+    return;
+  }
+  box.append(...groups);
+}
+
+async function importConfirm() {
+  const btn = $("#impConfirmBtn");
+  if (!impState.previewOk || impState.blob == null) {
+    setImpStatus("请先「预览」成功后再确认写入。");
+    return;
+  }
+  const t = impState.totals ?? {};
+  // 明示三行后果（备份名规则来自后端 applyImport：bak-hubimport-<YYYYMMDD-HHMMSS>）
+  const ok = confirm(
+    "确认写入 magpie？\n\n" +
+      `· 将写入 <magpie 配置目录>/plugin-auth.json：新增 ${Number(t.adds) || 0} · 更新 ${Number(t.updates) || 0}` +
+      `（跳过 ${Number(t.skips) || 0} · 拒绝 ${Number(t.rejects) || 0} 不写入）\n` +
+      "· 写前自动逐字节备份为 plugin-auth.json.bak-hubimport-<YYYYMMDD-HHMMSS>\n" +
+      "· 国际版（intl）账号不会写入（已在拒绝列表里）\n\n" +
+      "写入后需要在 magpie「插件管理」里把 WorkBuddy 关掉再打开，新账号才会被认到。",
+  );
+  if (!ok) return;
+  btn.disabled = true;
+  setImpStatus("正在写入 plugin-auth.json…");
+  try {
+    // confirm:true 需密钥：未解锁 → api() 弹一次密钥框 → 自动重试本次确认
+    const r = await api("api/accounts/import", { method: "POST", body: { blob: impState.blob, confirm: true } });
+    impInvalidate(); // 本次预览已被消耗：再写必须重新预览
+    $("#impResult").replaceChildren();
+    renderImportResult(r);
+    setImpStatus("");
+    await loadState(); // 账号列表变了：重拉只读 state（SSE 的 accounts 广播也会触发一次，无害）
+  } catch (e) {
+    renderImportError(e, "确认写入失败");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderImportResult(r) {
+  const box = $("#impResult");
+  box.replaceChildren();
+  if (!r || typeof r !== "object") {
+    box.append(el("div", { class: "banner" }, el("p", { text: "写入完成（守护进程未返回详情）。" })));
+    return;
+  }
+  if (r.wrote !== true) {
+    // 无变更分支：{wrote:false, note:"没有需要写入的变更…"}
+    box.append(
+      el("div", { class: "banner" },
+        el("strong", { text: "未写入" }),
+        el("p", { text: String(r.note ?? "没有需要写入的变更（新增/更新均为 0）。") }),
+      ),
+    );
+    return;
+  }
+  const added = Array.isArray(r.added) ? r.added.length : 0;
+  const updated = Array.isArray(r.updated) ? r.updated.length : 0;
+  const skipped = Array.isArray(r.skipped) ? r.skipped.length : 0;
+  box.append(
+    el("p", { class: "imp-totals", text: `已写入：新增 ${added} · 更新 ${updated} · 跳过 ${skipped}` }),
+    r.backedUpTo
+      ? el("p", { class: "imp-line" },
+          el("span", { text: "写前已备份：" }),
+          el("code", { class: "mono", text: String(r.backedUpTo) }),
+        )
+      : el("p", { class: "imp-line muted", text: "本次没有生成备份（原 plugin-auth.json 不存在，从零建）。" }),
+    el("p", { class: "imp-line", text: String(r.reloadHint ?? "在 magpie「插件管理」里把 WorkBuddy 关掉再打开，新账号才会被 magpie 认到") }),
+    el("div", { class: "banner banner-warn imp-reload" },
+      el("strong", { text: "导入后需要重载" }),
+      el("p", { text: "magpie 只有重启插件宿主才会认到新账号（插件管理里关掉再打开 WorkBuddy）。" }),
+    ),
+  );
+}
+
+function renderImportError(e, prefix) {
+  const box = $("#impResult");
+  if (e instanceof ApiError && e.status === 409 && e.data?.needRepreview) {
+    // 竞态守卫：预览后 plugin-auth.json 被改动（magpie 可能刷新过 token）→ 一键重预览
+    impState.previewOk = false;
+    $("#impConfirmBtn").hidden = true;
+    setImpStatus("凭据文件在预览后被改动，请重新预览后再确认。");
+    box.replaceChildren(
+      el("div", { class: "banner banner-warn" },
+        el("strong", { text: "需要重新预览" }),
+        el("p", { text: String(e.message || "plugin-auth.json 在预览后发生了变化，为防覆盖已拒绝写入。") }),
+        el("p", {},
+          el("button", {
+            type: "button",
+            class: "btn-quiet",
+            text: "重新预览",
+            onclick: () => importPreview(),
+          }),
+        ),
+      ),
+    );
+    return;
+  }
+  if (e && e.unlockCancelled) {
+    setImpStatus("已取消解锁：确认写入需要密钥，未写入任何文件。");
+    return;
+  }
+  box.replaceChildren();
+  if (e instanceof ApiError) {
+    // 400 无可导入账号 / 409 auth 解析失败 等：后端中文 error 原样透出，不显示堆栈
+    setImpStatus(`${prefix}（HTTP ${e.status}）：${e.message}`);
+    return;
+  }
+  if (e && e.network) {
+    setImpStatus("");
+    humanErr(e, prefix);
+    return;
+  }
+  setImpStatus(`${prefix}：${e?.message ?? e}`);
+}
+
+function wireImportFile() {
+  $("#impFile").addEventListener("change", (ev) => {
+    const f = ev.target.files && ev.target.files[0];
+    ev.target.value = ""; // 允许再次选择同一文件
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      $("#impText").value = String(reader.result ?? "");
+      $("#impFileNote").textContent = `已读入 ${f.name}（${f.size} 字节）`;
+      $("#impResult").replaceChildren();
+      impInvalidate();
+      setImpStatus("文件已读入：点「预览（不写入）」看看会写入什么。");
+    };
+    reader.onerror = () => {
+      $("#impFileNote").textContent = "";
+      setImpStatus(`读取文件失败：${f.name}`);
+    };
+    reader.readAsText(f);
+  });
+  $("#impText").addEventListener("input", () => {
+    if (impState.previewOk) {
+      $("#impResult").replaceChildren();
+      impInvalidate("内容已修改：上次预览已失效，请重新预览后再确认。");
+    }
+  });
 }
 
 // ---- 排程区 ----------------------------------------------------------------------------------
@@ -1754,7 +2300,8 @@ async function loadHistory() {
     if (state.history.page > maxPage) state.history.page = maxPage;
     renderHistory();
   } catch (e) {
-    if (!(e instanceof ApiError && e.status === 401)) renderHistoryError(e);
+    // 401（旧守护进程已弹过框）与取消解锁不进错误空态：密钥补上后会自动重拉
+    if (!(e instanceof ApiError && e.status === 401) && !(e && e.unlockCancelled)) renderHistoryError(e);
   }
 }
 
@@ -1884,9 +2431,11 @@ function disconnectSSE() {
 
 function connectSSE() {
   disconnectSSE();
-  if (!state.key || state.conn === "stopped") return;
+  if (state.conn === "stopped") return;
   const url = new URL("api/events", location.href);
-  url.searchParams.set("k", state.key);
+  // 新口径 /api/events 免密钥，永不带 k。仅旧守护进程（legacyAuth：只读路由也 401）
+  // 才回退 ?k= —— EventSource 无法设 Authorization 头；该 URL 只在内存，不进浏览历史。
+  if (state.legacyAuth && state.key) url.searchParams.set("k", state.key);
   let es;
   try {
     es = new EventSource(url);
@@ -1968,6 +2517,14 @@ function handleSSE(evt) {
     }
     return;
   }
+  if (evt.kind === "accounts") {
+    // daemon 的账号变更广播（导入写入 / 重扫）：账号列表走只读 state 重拉
+    if (evt.event === "import") {
+      toast(`账号导入已写入：新增 ${Number(evt.added) || 0} · 更新 ${Number(evt.updated) || 0}`);
+    }
+    loadState({ quiet: true });
+    return;
+  }
   if (evt.kind === "scheduler") {
     const legs = (evt.legs ?? []).map(legName).join(" + ");
     if (evt.event === "fire") {
@@ -2007,10 +2564,16 @@ async function loadState({ quiet = false } = {}) {
     if (state.conn !== "stopped") state.conn = "online";
     renderAll();
   } catch (e) {
-    if (e instanceof ApiError && e.status === 401) {
-      state.conn = "nokey";
+    if (e && e.unlockCancelled) {
+      // 只读 state 也要密钥 = 旧守护进程，且用户取消了输入：停在「需要密钥」，
+      // 点右上「解锁写操作」补 key 后会自动重跑 boot（新口径不会走到这里）
+      if (state.conn !== "stopped") state.conn = "nokey";
       renderTop();
-      promptKey(e.message);
+    } else if (e instanceof ApiError && e.status === 401) {
+      // 解锁后重试仍 401 = 密钥不对（旧守护进程）：不循环弹框
+      if (state.conn !== "stopped") state.conn = "nokey";
+      renderTop();
+      toast("读取状态需要密钥（守护进程为旧口径）且密钥不正确：点右上「解锁写操作」重新输入。", "warn", 9000);
     } else if (e.network) {
       if (state.conn !== "stopped") state.conn = "down";
       state.feed = "idle";
@@ -2045,7 +2608,6 @@ async function stopDaemon() {
 
 function wireStatic() {
   $("#themeBtn").addEventListener("click", cycleTheme);
-  $("#keyBtn").addEventListener("click", () => promptKey(""));
   $("#daemonStopBtn").addEventListener("click", stopDaemon);
   $("#daemonStartBtn").addEventListener("click", () => $("#cmdDialog").showModal());
   $("#cmdCopyBtn").addEventListener("click", async () => {
@@ -2053,11 +2615,34 @@ function wireStatic() {
     toast(ok ? "已复制：node daemon.mjs" : "复制失败，请手动选择文本复制。", ok ? "info" : "warn");
   });
 
+  // 「解锁写操作」按钮：未解锁 → 弹密钥框；已解锁 → 撤销（清 sessionStorage 回只读）
+  $("#unlockBtn").addEventListener("click", async (ev) => {
+    ev.currentTarget.blur();
+    if (state.key) {
+      state.key = "";
+      try {
+        sessionStorage.removeItem(SS_KEY);
+      } catch {}
+      renderTop();
+      toast("已撤销解锁：回到只读模式。写操作会再次要求密钥。");
+      return;
+    }
+    const ok = await promptKeyAsync("");
+    if (!ok) return; // 取消：保持只读
+    renderTop();
+    toast("已解锁写操作：密钥只存本标签页的 sessionStorage。");
+    // 旧守护进程场景：只读数据此前被密钥挡住 → 现在补跑启动链
+    if (state.conn === "nokey" || (!state.data && state.conn !== "stopped" && state.conn !== "down")) {
+      state.conn = "checking";
+      boot();
+    }
+  });
+
   $("#keyForm").addEventListener("submit", (ev) => {
     // method=dialog：submit 事件触发时 returnValue 可能尚未赋值（规范在事件后才写），
     // 以 submitter 的 value 为准，returnValue 兜底。
     const val = ev.submitter?.value || $("#keyDialog").returnValue || "";
-    if (val !== "save") return; // 取消 / ESC
+    if (val !== "save") return; // 取消 → close 事件里 settleUnlock(false)
     const v = $("#keyInput").value.trim();
     if (!v) {
       ev.preventDefault(); // 留在对话框里补输入
@@ -2068,14 +2653,14 @@ function wireStatic() {
     try {
       sessionStorage.setItem(SS_KEY, v);
     } catch {}
-    state.conn = "checking";
     $("#keyError").hidden = true;
-    boot();
+    renderTop();
+    // 唤醒等这个 key 的那一个调用（401 自动重试），或解锁按钮的 handler
+    settleUnlock(true);
   });
-  // 取消/ESC 后若无 key，仍保持在「需要密钥」态
-  $("#keyDialog").addEventListener("cancel", () => {
-    if (!state.key) renderTop();
-  });
+  // 对话框关闭（取消 / ESC / 保存后自动关）：未决的等待一律按 false 收尾。
+  // settleUnlock 幂等（保存路径已先 settle(true)），不会覆盖成功结果。
+  $("#keyDialog").addEventListener("close", () => settleUnlock(false));
 
   $("#selectAll").addEventListener("change", (ev) => {
     const elig = eligibleAccounts();
@@ -2090,6 +2675,13 @@ function wireStatic() {
   $("#btnAccept").addEventListener("click", acceptSelected);
   $("#btnClaim").addEventListener("click", claimSelected);
   $("#btnCheckin").addEventListener("click", checkinSelected);
+
+  // 账号导出 / 导入
+  $("#expBtn").addEventListener("click", (ev) => exportAccounts(ev.currentTarget));
+  $("#expSecrets").addEventListener("change", syncExportHints);
+  $("#impPreviewBtn").addEventListener("click", importPreview);
+  $("#impConfirmBtn").addEventListener("click", importConfirm);
+  wireImportFile();
 
   $("#schedEnabled").addEventListener("change", toggleScheduler);
   $("#saveHoursBtn").addEventListener("click", saveHours);
@@ -2110,7 +2702,8 @@ function wireStatic() {
 
 async function boot() {
   renderTop();
-  // hello 不需要密钥
+  // 首屏没有密钥门槛：hello / state / history / SSE 都是免密钥只读路由，直接渲染。
+  // 旧守护进程（只读也 401）会在 loadState 里自动弹一次解锁框，保存后原调用自动重试。
   try {
     state.hello = await api("api/hello");
   } catch (e) {
@@ -2129,14 +2722,14 @@ async function boot() {
       );
       return;
     }
+    if (e && e.unlockCancelled) {
+      state.conn = "nokey"; // 旧守护进程：用户取消了密钥输入
+      renderTop();
+      return;
+    }
+    // 其余错误（如密钥不对的 401）：继续读 state，让它把话说全
   }
-  if (!state.key) {
-    state.conn = "nokey";
-    renderTop();
-    promptKey("需要守护进程密钥才能读取状态（密钥见 state/daemon.json）。");
-    return;
-  }
-  state.conn = "checking";
+  if (state.conn !== "stopped") state.conn = "checking";
   await loadState();
   if (state.conn === "online") {
     connectSSE();
@@ -2148,6 +2741,7 @@ function init() {
   applyTheme();
   readKeyFromUrl();
   wireStatic();
+  syncExportHints(); // 「含凭据」默认勾上：警示/提示行按初始状态就位
   // batchStatus 保留换行
   $("#batchStatus").style.whiteSpace = "pre-wrap";
   boot();

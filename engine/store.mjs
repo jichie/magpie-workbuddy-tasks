@@ -6,6 +6,7 @@
 
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -51,7 +52,8 @@ export function tasksStateFile(cfg) {
 
 // ---- 账号读取 ------------------------------------------------------------------
 // acctKey 形如 "workbuddy" | "workbuddy#xxxxxxxx"（magpie/OpenCode 多账号键）。
-function providerOfKey(key) {
+// 导出供 accountio.mjs 复用（导入合并只认 provider "workbuddy" 的条目）。
+export function providerOfKey(key) {
   const base = String(key || "").split("#")[0];
   if (base === "workbuddy") return "workbuddy";
   if (base === "workbuddy-ai") return "workbuddy-ai";
@@ -127,6 +129,9 @@ export function loadAccounts(cfg) {
       enterpriseId: typeof entry.enterpriseId === "string" ? entry.enterpriseId.trim() : "",
       tokenType: typeof entry.tokenType === "string" ? entry.tokenType : "",
       source: typeof entry.source === "string" ? entry.source : isApiKey ? "key" : "oauth",
+      // JSON 导入来源标记（accountio 写入；易失：magpie 整体覆写会抹掉，
+      // 只作 /api/state 的 imported 展示，绝不参与任何逻辑判断 —— 契约 §9）
+      importedFrom: typeof entry.importedFrom === "string" ? entry.importedFrom : "",
       isApiKey,
       // tasksEnabled 来自本插件状态，不是 auth 字段；缺省 = 参与。
       tasksEnabled: enabledMap[key] !== false && enabledMap[uid] !== false,
@@ -210,4 +215,53 @@ export function saveAccountRefresh(cfg, acctKey, patch) {
   }
   raw[acctKey] = entry;
   writeJsonAtomic(file, raw);
+}
+
+// ---- 账号 JSON 导入/导出用的文件原语（engine/accountio.mjs 复用，契约 §9）----
+// 与 saveAccountRefresh 同一套纪律：坏 JSON 拒写、tmp + rename 原子落盘、mode 600、
+// 调用方负责在写之前把其它 provider 的条目原样放回文档里。
+
+// readAuthDocument(cfg) -> {ok:true, data, text} | {ok:false, error, missing?:true}
+// 只读不写：解析失败如实报告（daemon 对导入预览/确认都回 409 拒写）；
+// 文件不存在标 missing:true（导入空库是合法场景，调用方按 {} 处理）。
+export function readAuthDocument(cfg) {
+  const file = authFile(cfg);
+  let text;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch (err) {
+    return {
+      ok: false,
+      missing: err?.code === "ENOENT",
+      error: `读不到 ${file}：${String(err?.message || err)}`,
+    };
+  }
+  try {
+    const data = JSON.parse(text);
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      return { ok: false, error: "plugin-auth.json 顶层不是对象" };
+    }
+    return { ok: true, data, text };
+  } catch (err) {
+    return { ok: false, error: `plugin-auth.json 解析失败：${String(err?.message || err)}` };
+  }
+}
+
+// backupAuthFile(cfg, tag) -> 备份文件路径 | null（文件不存在时）
+// 逐字节复制当前凭据文件（copyFileSync），文件名 plugin-auth.json.bak-<tag>。
+export function backupAuthFile(cfg, tag) {
+  const file = authFile(cfg);
+  if (!existsSync(file)) return null;
+  const safeTag = String(tag || "").replace(/[^A-Za-z0-9_-]/g, "") || "manual";
+  const target = `${file}.bak-${safeTag}`;
+  copyFileSync(file, target);
+  return target;
+}
+
+// writeAuthDocument(cfg, data) -> 原子写入（tmp + rename、0600、无 tmp 残留）
+export function writeAuthDocument(cfg, data) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error("plugin-auth.json 顶层必须是对象，拒绝写入");
+  }
+  return writeJsonAtomic(authFile(cfg), data);
 }

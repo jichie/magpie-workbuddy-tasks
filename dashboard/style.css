@@ -637,6 +637,104 @@ details.adv[open] > summary { border-bottom: 1px solid var(--line); }
 }
 .pager .mono { color: var(--ink2); }
 
+/* ---- 账号导入 / 导出（契约 §9）-------------------------------------------------------
+   沿用既有 token：hairline 边框、平面卡、8px 圆角；警示只用 --warn，
+   次要信息用 --ink3；机器串（uid/key/文件名）一律 --font-mono。无新配色。 */
+
+.io-block + .io-block {
+  border-top: 1px solid var(--line);
+  margin-top: 16px;
+  padding-top: 14px;
+}
+.io-block-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+.io-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+.io-rowlabel { letter-spacing: .04em; }
+.io-hint { font-size: 11.5px; color: var(--ink3); }
+.io-warn { font-size: 12px; color: var(--warn); margin-top: 8px; }
+.io-warn[hidden], .io-hint[hidden] { display: none; }
+.io-note {
+  font-size: 12.5px;
+  color: var(--ink2);
+  line-height: 1.7;
+  margin-top: 6px;
+}
+.io-note strong { color: var(--ink); font-weight: 600; }
+.io-status {
+  font-size: 12.5px;
+  color: var(--ink2);
+  margin-top: 10px;
+  line-height: 1.7;
+  word-break: break-word;
+}
+.io-status:empty { display: none; }
+
+/* 文件选择：label 伪装成 btn-quiet（input 本体 hidden） */
+.io-file-label { display: inline-block; cursor: pointer; }
+.io-file-label:hover { background: var(--bg2); color: var(--ink); border-color: var(--ink3); }
+
+.io-textarea {
+  display: block;
+  width: 100%;
+  min-height: 110px;
+  resize: vertical;
+  margin-top: 8px;
+  line-height: 1.6;
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+}
+
+/* 导入预览 / 结果 */
+.imp-totals {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--bg2);
+  padding: 7px 12px;
+  margin-top: 10px;
+}
+.imp-group { margin-top: 10px; }
+.imp-group-title { margin-bottom: 3px; }
+.imp-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 12.5px;
+  color: var(--ink2);
+}
+.imp-row:last-child { border-bottom: none; }
+.imp-name { font-weight: 600; color: var(--ink); }
+.imp-uid { color: var(--ink3); word-break: break-all; }
+.imp-key { color: var(--ink); }
+.imp-expiry { color: var(--ink3); white-space: nowrap; }
+.imp-reason { flex: 1 1 220px; min-width: 0; word-break: break-word; }
+.imp-index { color: var(--warn); }
+/* skips 用 --ink3、rejects 用 --warn：低调区分，不用刺眼的红 */
+.imp-row-skip, .imp-row-skip .imp-name { color: var(--ink3); font-weight: 400; }
+.imp-row-reject { color: var(--warn); }
+.imp-row-reject .imp-reason { color: var(--warn); }
+.imp-hint { color: var(--ink3); word-break: break-all; }
+.imp-row-reject .imp-hint { color: inherit; opacity: .8; }
+.imp-line { font-size: 12.5px; color: var(--ink2); margin-top: 6px; word-break: break-word; }
+.imp-reload { margin-top: 10px; margin-bottom: 0; }
+
 /* ---- Toast ------------------------------------------------------------------------- */
 
 .toasts {
@@ -751,6 +849,12 @@ dialog::backdrop { background: rgba(0, 0, 0, .35); }
   .acct-meta { margin-left: 0; }
   .toasts { left: 12px; right: 12px; justify-items: stretch; }
   .toast { max-width: none; }
+
+  /* 导入 / 导出：窄屏下各行自然堆叠，textarea 保持全宽，预览行整行换行不破版 */
+  .io-row { gap: 8px; }
+  .io-textarea { min-height: 90px; }
+  .imp-row { gap: 4px 8px; }
+  .imp-reason { flex-basis: 100%; }
 }
 
 /* ---- 动效偏好 ------------------------------------------------------------------------------ */
