@@ -297,6 +297,11 @@ GET  /api/events                -> SSE：{kind:'job'|'step'|'log'|'scheduler', .
 
 SSE 事件是看板实时进度的唯一来源；断线时看板回退到 `GET /api/state` 轮询 3 s。
 
+缓存口径：静态资源与全部 API 响应一律 `Cache-Control: no-store`（局域网自建看板迭代频繁，
+「重载即最新版」是默认行为；刻意不发 `ETag`/`Last-Modified`，no-store 之下条件请求只增加新的
+失效模式）——唯一例外 `GET /api/events` 保持 `Cache-Control: no-cache`（no-store 的 SSE 长连接
+在部分代理下会断流）。取舍细节以 `daemon.mjs` 的 `json()`/`serveStatic` 注释为单一真相。
+
 ## 4. 生命周期（「跟随 magpie」+「插件管理里启停生效」）
 
 - `index.mjs` 被宿主加载时（= 插件已启用且 magpie 用到了它）：

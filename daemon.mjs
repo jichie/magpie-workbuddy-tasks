@@ -1207,9 +1207,20 @@ export async function startDaemon(opts = {}) {
   let whenStoppedResolve = null
   const whenStopped = new Promise((r) => (whenStoppedResolve = r))
 
+  // 统一 JSON 响应出口：全部 /api/* 路由（以及 serveStatic 里的 JSON 错误响应）都走这里。
+  // 缓存口径（单一真相）：一律 Cache-Control: no-store —— 这是局域网自建看板，文件小、
+  // 迭代频繁，最贵的错误是「浏览器拿着缓存里的旧 app.js，界面显示早已废弃的地址，
+  // 用户以为改了没生效」；no-store（而非 no-cache）保证重载即最新版，连磁盘缓存都不留。
+  // 刻意不加 ETag / Last-Modified / Expires：no-store 之下浏览器根本不存副本，
+  // 再引入条件请求只会增加 304 协商、缓存再验证等新的失效模式，纯属复杂度而没有收益。
+  // 唯一例外是 SSE（/api/events），它必须保持 no-cache 才能在各代理下不断流，见 handleApi。
   function json(res, status, body) {
     const text = JSON.stringify(body)
-    res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Content-Length": Buffer.byteLength(text) })
+    res.writeHead(status, {
+      "Content-Type": "application/json; charset=utf-8",
+      "Content-Length": Buffer.byteLength(text),
+      "Cache-Control": "no-store",
+    })
     res.end(text)
   }
 
@@ -1250,13 +1261,20 @@ export async function startDaemon(opts = {}) {
     }
     if (existsSync(full) && statSync(full).isFile()) {
       const body = readFileSync(full)
-      res.writeHead(200, { "Content-Type": MIME[extname(full).toLowerCase()] ?? "application/octet-stream", "Content-Length": body.length })
+      // no-store 与 json() 同一口径：看板静态文件（app.js/style.css）改一版就要让
+      // 「普通重载」拿到新版，绝不允许浏览器拿旧 JS 冒充新版（取舍见 json() 上方注释；
+      // 同理刻意不发 ETag/Last-Modified，不与 no-store 混用条件请求）。
+      res.writeHead(200, {
+        "Content-Type": MIME[extname(full).toLowerCase()] ?? "application/octet-stream",
+        "Content-Length": body.length,
+        "Cache-Control": "no-store",
+      })
       res.end(req.method === "HEAD" ? undefined : body)
       return
     }
     if (pathname === "/" || pathname === "/index.html") {
       const body = Buffer.from(fallbackPage())
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Content-Length": body.length })
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Content-Length": body.length, "Cache-Control": "no-store" })
       res.end(body)
       return
     }
@@ -1406,6 +1424,8 @@ export async function startDaemon(opts = {}) {
     }
 
     if (p === "/api/events") {
+      // SSE 是全站 no-store 口径的唯一例外：流式响应必须用 no-cache（允许经手但不落副本），
+      // 部分代理/中间层会把 no-store 的长连接直接断流；这里不走 json()，头自行写全。
       res.writeHead(200, {
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache",
