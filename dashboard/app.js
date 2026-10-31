@@ -4,10 +4,9 @@
 //   GET  /api/hello            -> {name, version, ready}
 //   GET  /api/state[?refresh=1|<uid>] -> {serveUrl, bindHost, port, reachableHint,
 //                                        accounts, intlSkipped, scheduler, job, stats, settings, notice?, engineErrors?}
-//        顶层 serveUrl = 守护进程算好的「用户可达地址」（Host 头 → MAGPIE_PUBLIC_URL
-//        → bindHost 取值链，绝不返回 0.0.0.0/::/*）——顶栏「看板地址」项显示/复制的
-//        唯一来源；bindHost/port/reachableHint 保留（通绑定的安全提示仍用 reachableHint），
-//        老后端缺 serveUrl 时回退 bindHost 拼地址 / 页面自身 origin，绝不报错（见 addrModel）
+//        看板地址块已按需求整块移除：页面不渲染地址块、不复制 serveUrl。
+//        接口里的 serveUrl/bindHost/port/reachableHint 保留（守护进程侧兼容），
+//        addrModel 纯函数仅为 tests-shell/serve-url.test.mjs 的形状校验而保留。
 //        accounts[] 只含国内版（provider === "workbuddy"）；国际版不再出现在列表里。
 //        intlSkipped = {count, note}：被忽略的国际版账号数量与说明（只给数字，绝不给账号内容）。
 //        scheduler.holds = [{uid, nickname, releasedAt(ISO)}] —— 真正的风控冷却（403/11140）名单
@@ -298,9 +297,15 @@ function applyTheme() {
   const root = document.documentElement;
   if (p === "auto") root.removeAttribute("data-theme");
   else root.setAttribute("data-theme", p);
+  const name = p === "auto" ? "跟随系统" : p === "dark" ? "深色" : "浅色";
+  const glyph = $("#themeGlyph");
+  const label = $("#themeLabel");
   const btn = $("#themeBtn");
+  if (glyph) glyph.textContent = p === "auto" ? "◐" : p === "dark" ? "☾" : "☀";
+  if (label) label.textContent = `主题：${name}`;
   if (btn) {
-    btn.textContent = p === "auto" ? "主题：跟随系统" : p === "dark" ? "主题：深色" : "主题：浅色";
+    btn.title = `主题：${name}（点击切换）`;
+    btn.setAttribute("aria-label", `切换主题，当前${name}`);
   }
 }
 function cycleTheme() {
@@ -343,18 +348,11 @@ async function copyText(text) {
 
 // ---- 顶栏渲染 -----------------------------------------------------------------------------
 
-// ---- 看板地址（消费 /api/state 顶层 serveUrl；bindHost/port/reachableHint 兜底） --------
-// serveUrl 是守护进程算好的「用户可达地址」（Host 头 → MAGPIE_PUBLIC_URL → bindHost
-// 取值链，CONTRACT §3；0.0.0.0 是监听值不是访问值，serveUrl 绝不含它）：
-//   served：serveUrl 存在且形状合法（http(s)://host[:port]/，无查询串/凭据）→
-//           直接显示/复制这一串；通绑定的安全提示仍按 reachableHint 给进 title。
-//   loopback / wildcard / fallback：老后端（缺 serveUrl）时的既有逻辑——
-//           reachableHint 为 "" → http://<bindHost>:<port>/；通绑定 → 占位地址 +
-//           hint（title）；字段全缺 → 回退页面自身 origin（看板由守护进程同源服务），
-//           再兜底默认端口 4390；绝不报错。
-// key 永不进地址 / 复制内容 / title：地址项只显示 http://host:port/ 路径。
-// 顶栏只留品牌/状态/操作；这里渲染的是顶栏下方的一行次要文字（地址 + 今日统计），
-// 完整安全口径只在页脚，地址行不再重复无鉴权说明。
+// ---- addrModel（兼容保留；页面不再渲染任何看板地址） ---------------------------------------
+// 看板地址块已整块移除：页面不显示地址、不提供复制按钮，也不把地址写进 title。
+// 这个纯函数保留下来只为 tests-shell/serve-url.test.mjs 继续校验 serveUrl 的形状
+// （http(s)://host[:port]/，绝不含 0.0.0.0/::/*）与老后端兜底逻辑。
+// 导出仅为 Node 下单元验证；浏览器里 <script type="module"> 不受影响。
 
 const DEFAULT_PORT = 4390;
 // serveUrl 形状防御：http(s) + 主机字面量（字母数字 . - _ []）+ 可选端口 + 结尾 /。
@@ -369,7 +367,6 @@ function hostForUrl(host) {
 }
 
 // 纯函数：/api/state payload → {mode, url, port, hint, bindHost, docker}。
-// 导出仅为 Node 下单元验证；浏览器里 <script type="module"> 不受影响。
 export function addrModel(d) {
   const rawPort = Number(d?.port);
   const port = Number.isFinite(rawPort) && rawPort > 0 ? rawPort : null;
@@ -377,12 +374,9 @@ export function addrModel(d) {
   const hint = typeof d?.reachableHint === "string" ? d.reachableHint.trim() : null;
   const served = typeof d?.serveUrl === "string" ? d.serveUrl.trim() : "";
   if (SERVE_URL_RE.test(served)) {
-    // 新后端：守护进程已按取值链给出可达地址，前端只做形状防御后直接采用。
     return { mode: "served", url: served, port, hint: hint || "", bindHost, docker: bindHost === "0.0.0.0" };
   }
   if (port == null || !bindHost || hint == null) {
-    // 老后端：字段缺失 → 用当前页面 origin（就是用户正在访问的真实地址），
-    // 非浏览器环境或 file:// 等再兜底默认端口，任何情况都不抛错。
     let url = "";
     try {
       if (typeof location !== "undefined" && (location.protocol === "http:" || location.protocol === "https:")) {
@@ -398,53 +392,10 @@ export function addrModel(d) {
       port,
       hint,
       bindHost,
-      docker: bindHost === "0.0.0.0", // docker inspect 模板只对 0.0.0.0 给
+      docker: bindHost === "0.0.0.0",
     };
   }
   return { mode: "loopback", url: `http://${hostForUrl(bindHost)}:${port}/`, port, hint: "", bindHost, docker: false };
-}
-
-function renderAddr() {
-  const box = $("#addrBox");
-  if (!box) return;
-  if (!state.data || state.conn !== "online") {
-    box.hidden = true;
-    box.replaceChildren();
-    return;
-  }
-  const m = addrModel(state.data);
-
-  const copyBtn = (text, label) =>
-    el("button", {
-      type: "button",
-      class: "mini-btn addr-copy",
-      text: "复制",
-      title: `复制${label}`,
-      "aria-label": `复制${label}`,
-      onclick: async (ev) => {
-        const ok = await copyText(text);
-        toast(ok ? `已复制：${text}` : "复制失败，请手动选择文本复制。", ok ? "info" : "warn", 6500);
-        ev.target.blur();
-      },
-    });
-
-  // 一行次要文字：地址 + 复制。通绑定的说明（含容器/SSH 提示，served/wildcard 都给）
-  // 进 title，不再堆第二/第三行；窄屏隐藏「看板地址」标签，只留 URL（省略号收口）+
-  // 复制按钮。served 模式显示的就是真实可达地址，占位地址写法已移除。
-  const hint = m.hint || m.docker
-    ? [m.hint, m.docker ? "容器内可用 docker inspect 查 IP；或 ssh -L 做端口映射" : ""]
-        .filter(Boolean)
-        .join(" · ")
-    : "";
-  const row = el(
-    "div",
-    { class: "addr-row", title: hint || null },
-    el("span", { class: "label", text: "看板地址" }),
-    el("code", { class: "addr-url", text: m.url }),
-    copyBtn(m.url, "看板地址"),
-  );
-  box.replaceChildren(row);
-  box.hidden = false;
 }
 
 function jobMentionsRisk(job) {
@@ -507,9 +458,6 @@ function renderTop() {
   if (state.hello) {
     sub.textContent = `看板 · v${state.hello.version}${state.hello.ready ? "" : " · 引擎未就绪"}`;
   }
-
-  renderAddr();
-  if (syncTopbarHeight) syncTopbarHeight();
 }
 
 // ---- 账号区 -------------------------------------------------------------------------------
@@ -858,7 +806,7 @@ function taskTable(a) {
     ),
   );
   const body = el("tbody", {}, tasks.map((t) => taskRow(a, t)));
-  const table = el("div", { class: "tbl-wrap" }, el("table", { class: "tbl" }, head, body));
+  const table = el("div", { class: "tbl-wrap" }, el("table", { class: "tbl tbl-tasks" }, head, body));
   if (!expired) return table;
   // 后端标记过期：数据仍展示（比空白有用），但明确说明陈旧并给只读刷新入口
   return el(
@@ -893,14 +841,6 @@ export function taskSummary(snap) {
     );
   }
   return `任务快照${snapExpired(snap) ? "（已过期）" : ""}：${parts.join(" · ")}`;
-}
-
-// 账号行上的快照时间：只给时间本身（列头/移动端标签已说明是「快照」）；
-// snapshot === null → 「无快照」；后端标记 expired → 「已过期 HH:MM:SS」。
-function snapLabel(snap) {
-  if (!snap) return "无快照";
-  const at = fmtTime(snap.updatedISO);
-  return snapExpired(snap) ? `已过期 ${at}` : at;
 }
 
 // 批量接取计划（规则 4）：codes 只取 canAccept === true 的项（判断只来自后端字段），
@@ -1096,21 +1036,48 @@ function accountRow(a) {
   });
 
   const st = accountBadge(a);
-  const statusInner = el(
-    "span",
-    { class: "acct-cell-inner" },
-    st.node,
-    el("span", { class: st.subWarn ? "acct-sub warn-text" : "acct-sub", text: st.sub }),
+  const statusCell = el(
+    "div",
+    { class: "acct-cell acct-status", dataset: { label: "凭据" } },
+    el(
+      "span",
+      { class: "cell-stack" },
+      st.node,
+      el("span", { class: st.subWarn ? "acct-note warn-text" : "acct-note", text: st.sub }),
+    ),
   );
 
   const c = snapCounts(a.snapshot);
-  const progInner = el(
-    "span",
-    { class: "acct-cell-inner" },
-    el("span", { class: "acct-prog-main", text: c ? `已领奖 ${c.claimed} / ${c.total}` : "—" }),
+  const claimedPct = c && c.total > 0 ? Math.round((c.claimed / c.total) * 100) : 0;
+  const progressCell = el(
+    "div",
+    {
+      class: "acct-cell acct-progress",
+      dataset: { label: "任务" },
+      title: isApiKey ? "API key 账号不参与任务，没有任务快照" : taskSummary(a.snapshot),
+    },
+    el("span", { class: "acct-prog-main", text: c ? `已领奖 ${c.claimed} / ${c.total}` : "无快照" }),
+    c
+      ? el(
+          "span",
+          {
+            class: "acct-bar",
+            role: "progressbar",
+            "aria-valuemin": "0",
+            "aria-valuemax": String(c.total),
+            "aria-valuenow": String(c.claimed),
+            "aria-label": `已领奖 ${c.claimed} / ${c.total}`,
+          },
+          el("span", { class: "acct-bar-fill", style: { width: `${claimedPct}%` } }),
+        )
+      : null,
     el("span", {
       class: "acct-prog-sub",
-      text: c ? `待接取 ${c.notAccepted} · 待领奖 ${c.pending}` : "无快照",
+      text: c
+        ? `待接取 ${c.notAccepted} · 待领奖 ${c.pending}`
+        : isApiKey
+          ? "不参与任务"
+          : "刷新快照后可查看",
     }),
   );
 
@@ -1118,12 +1085,11 @@ function accountRow(a) {
   const toggle = el(
     "label",
     {
-      class: `acct-toggle${isApiKey ? " is-disabled" : ""}`,
+      class: "switch-inline acct-toggle",
       title: isApiKey
         ? "API key 账号不参与任务（批量与排程都会跳过）"
         : "参与任务：关闭后该账号不进入批量操作与排程（POST /api/account/toggle，立即生效并持久化）",
     },
-    el("span", { text: toggling ? "提交中…" : "参与任务" }),
     el("input", {
       type: "checkbox",
       checked: isApiKey ? false : !!a.tasksEnabled,
@@ -1131,18 +1097,15 @@ function accountRow(a) {
       "aria-label": `账号 ${name} 参与任务`,
       onchange: (ev) => toggleTasksEnabled(uid, ev.target.checked),
     }),
+    el("span", { class: "switch-track", "aria-hidden": "true" }),
+    el("span", { class: "toggle-text", text: toggling ? "提交中…" : "参与任务" }),
   );
 
-  const sideInner = el(
-    "span",
-    { class: "acct-cell-inner" },
-    el("span", {
-      class: "acct-time",
-      text: snapLabel(a.snapshot),
-      title: a.snapshot ? `快照更新于 ${fmtDateTime(a.snapshot.updatedISO)}` : "还没有任务快照",
-    }),
+  const sideCell = el(
+    "div",
+    { class: "acct-cell acct-side", dataset: { label: "操作" } },
     isApiKey
-      ? null
+      ? el("span", { class: "muted", text: "—" })
       : el("button", {
           type: "button",
           class: "mini-btn",
@@ -1154,26 +1117,25 @@ function accountRow(a) {
   );
 
   const expired = snapExpired(a.snapshot);
+  const snapMetaText = a.snapshot
+    ? `${expired ? "已过期" : "快照"} · ${fmtTime(a.snapshot.updatedISO)}`
+    : "未读取";
   const tasks = el(
     "details",
     { class: "acct-tasks" },
     el(
       "summary",
       {
-        class: "acct-tasks-head fold-sum",
+        class: "acct-tasks-summary",
         title: a.snapshot ? taskSummary(a.snapshot) : "任务快照：无（点「刷新快照」读取）",
       },
       el("span", {
-        class: expired ? "acct-tasks-label fold-label warn-text" : "acct-tasks-label fold-label",
+        class: expired ? "acct-tasks-label warn-text" : "acct-tasks-label",
         text: snapBrief(a.snapshot),
       }),
+      el("span", { class: "acct-tasks-meta", text: snapMetaText }),
     ),
-    el(
-      "div",
-      { class: "acct-tasks-body" },
-      snapMetrics(a.snapshot),
-      taskTable(a),
-    ),
+    el("div", { class: "acct-tasks-body" }, snapMetrics(a.snapshot), taskTable(a)),
   );
   if (state.expanded.has(uid)) tasks.open = true;
   tasks.addEventListener("toggle", () => {
@@ -1194,22 +1156,10 @@ function accountRow(a) {
         el("span", { class: "acct-name", text: name, title: name }),
         el("span", { class: "acct-sub", text: metaText, title: metaText }),
       ),
-      el(
-        "div",
-        { class: "acct-cell acct-status", dataset: { label: "状态" } },
-        statusInner,
-      ),
-      el(
-        "div",
-        {
-          class: "acct-cell acct-prog",
-          dataset: { label: "任务进度" },
-          title: isApiKey ? "API key 账号不参与任务，没有任务快照" : taskSummary(a.snapshot),
-        },
-        progInner,
-      ),
+      statusCell,
+      progressCell,
       el("div", { class: "acct-cell acct-toggle-cell" }, toggle),
-      el("div", { class: "acct-cell acct-side", dataset: { label: "快照" } }, sideInner),
+      sideCell,
     ),
     tasks,
   );
@@ -1260,14 +1210,31 @@ function renderAccounts() {
   const accounts = state.data?.accounts ?? [];
   const head = $("#acctHead");
   if (head) head.hidden = accounts.length === 0;
+  const count = $("#acctCount");
+  if (count) {
+    const eligible = accounts.filter((a) => a.eligible).length;
+    count.textContent = accounts.length ? `${accounts.length} 个账号 · ${eligible} 个参与` : "暂无账号";
+  }
   renderIntlNote();
   if (!accounts.length) {
     box.append(
-      el("div", { class: "empty" },
-        el("strong", {}, "没有可读账号。"),
-        "请先在 magpie 里登录 WorkBuddy（国内版，OAuth 个人账号；API key 账号与企业账号不参与任务），然后点上方「重新扫描账号」。凭据文件：",
+      el(
+        "div",
+        { class: "empty" },
+        el("strong", {}, "还没有账号"),
+        "在 magpie 里登录 WorkBuddy 国内版后点「重新扫描」，或从另一台机器导出的账号 JSON 导入。凭据文件：",
         el("code", { text: "<magpie 配置目录>/plugin-auth.json" }),
         "。",
+        el(
+          "div",
+          {},
+          el("button", {
+            type: "button",
+            class: "ghost-btn",
+            text: "导入账号…",
+            onclick: () => setIoOpen(true, "import"),
+          }),
+        ),
       ),
     );
     updateSelectionUI();
@@ -1385,7 +1352,7 @@ function renderJob() {
     actions.append(
       el("button", {
         type: "button",
-        class: "btn-warn-quiet btn-quiet",
+        class: "ghost-btn ghost-danger",
         text: "停止当前任务",
         onclick: stopJob,
       }),
@@ -1422,7 +1389,7 @@ function renderJob() {
         { class: "tbl-wrap" },
         el(
           "table",
-          { class: "tbl" },
+          { class: "tbl tbl-steps" },
           el("thead", {},
             el("tr", {},
               el("th", { text: "账号" }),
@@ -2054,7 +2021,7 @@ function renderImportError(e, prefix) {
         el("p", {},
           el("button", {
             type: "button",
-            class: "btn-quiet",
+            class: "ghost-btn",
             text: "重新预览",
             onclick: () => importPreview(),
           }),
@@ -2075,6 +2042,62 @@ function renderImportError(e, prefix) {
     return;
   }
   setImpStatus(`${prefix}：${e?.message ?? e}`);
+}
+
+// ---- 导入 / 导出抽屉（已合并进账号卡片） ------------------------------------------------
+// 账号卡片右上角按钮控制 ioPanel 的开合；内部两个标签页共用同一套导出/导入逻辑，
+// 任何 DOM 文案都还是走 textContent，不新增注入面。
+
+const ioUi = { tab: "export" };
+
+function selectIoTab(tab, { focus = false } = {}) {
+  const want = tab === "import" ? "import" : "export";
+  ioUi.tab = want;
+  const isImport = want === "import";
+  const tabExport = $("#ioTabExport");
+  const tabImport = $("#ioTabImport");
+  const paneExport = $("#ioExportPane");
+  const paneImport = $("#ioImportPane");
+  if (!tabExport || !tabImport || !paneExport || !paneImport) return;
+  tabExport.classList.toggle("is-active", !isImport);
+  tabImport.classList.toggle("is-active", isImport);
+  tabExport.setAttribute("aria-selected", String(!isImport));
+  tabImport.setAttribute("aria-selected", String(isImport));
+  tabExport.tabIndex = isImport ? -1 : 0;
+  tabImport.tabIndex = isImport ? 0 : -1;
+  paneExport.hidden = isImport;
+  paneImport.hidden = !isImport;
+  if (focus) (isImport ? tabImport : tabExport).focus();
+}
+
+function setIoOpen(open, tab) {
+  const panel = $("#ioPanel");
+  const btn = $("#ioToggleBtn");
+  if (!panel || !btn) return;
+  panel.hidden = !open;
+  btn.setAttribute("aria-expanded", String(open));
+  btn.classList.toggle("is-open", open);
+  if (open && tab) selectIoTab(tab);
+  if (open) {
+    const active = ioUi.tab === "import" ? $("#impText") : $("#expBtn");
+    if (active) active.focus({ preventScroll: true });
+  }
+}
+
+function toggleIo() {
+  const panel = $("#ioPanel");
+  if (!panel) return;
+  setIoOpen(panel.hidden, ioUi.tab);
+}
+
+function wireIoTabs() {
+  const list = $(".tabs");
+  if (!list) return;
+  list.addEventListener("keydown", (ev) => {
+    if (ev.key !== "ArrowLeft" && ev.key !== "ArrowRight") return;
+    ev.preventDefault();
+    selectIoTab(ioUi.tab === "export" ? "import" : "export", { focus: true });
+  });
 }
 
 function wireImportFile() {
@@ -2336,7 +2359,7 @@ function renderHistory() {
   box.replaceChildren(
     el(
       "table",
-      { class: "tbl" },
+      { class: "tbl tbl-history" },
       el("thead", {},
         el("tr", {},
           el("th", { text: "时间" }),
@@ -2581,48 +2604,7 @@ async function stopDaemon() {
 
 // ---- 初始化 ------------------------------------------------------------------------------------
 
-// 账号表头 sticky 偏移：顶栏本身是 sticky 且会在窄屏换行，按它的实际高度写 --topbar-h，
-// 避免表头被顶栏盖住或悬在半空。ResizeObserver 管内容变化，resize 管视口变化；
-// renderTop 末尾再补一次（地址行首次出现时高度会跳变）。
-let syncTopbarHeight = null;
-let topbarObserver = null;
-let topbarTick = 0;
-
-function trackTopbarHeight() {
-  const bar = $(".topbar");
-  if (!bar) return;
-  let last = -1;
-  syncTopbarHeight = () => {
-    const h = Math.round(bar.getBoundingClientRect().height);
-    if (h === last) return;
-    last = h;
-    document.documentElement.style.setProperty("--topbar-h", `${h}px`);
-  };
-  syncTopbarHeight();
-  try {
-    if (typeof ResizeObserver !== "undefined") {
-      // 保留引用：不持有 observer 时它可能被回收，顶栏换行后偏移不会更新
-      topbarObserver = new ResizeObserver(syncTopbarHeight);
-      topbarObserver.observe(bar);
-    }
-  } catch {}
-  window.addEventListener("resize", syncTopbarHeight, { passive: true });
-  // 兜底：某些嵌入视图改视口时不发 resize；下一帧滚动时校正一次（值不变则零成本）
-  window.addEventListener(
-    "scroll",
-    () => {
-      if (topbarTick) return;
-      topbarTick = requestAnimationFrame(() => {
-        topbarTick = 0;
-        syncTopbarHeight();
-      });
-    },
-    { passive: true },
-  );
-}
-
 function wireStatic() {
-  trackTopbarHeight();
   $("#themeBtn").addEventListener("click", cycleTheme);
   $("#daemonStopBtn").addEventListener("click", stopDaemon);
   $("#daemonStartBtn").addEventListener("click", () => $("#cmdDialog").showModal());
@@ -2645,7 +2627,11 @@ function wireStatic() {
   $("#btnClaim").addEventListener("click", claimSelected);
   $("#btnCheckin").addEventListener("click", checkinSelected);
 
-  // 账号导出 / 导入
+  // 账号导出 / 导入（合并在账号卡片内的抽屉里）
+  $("#ioToggleBtn").addEventListener("click", toggleIo);
+  $("#ioTabExport").addEventListener("click", () => selectIoTab("export"));
+  $("#ioTabImport").addEventListener("click", () => selectIoTab("import"));
+  wireIoTabs();
   $("#expBtn").addEventListener("click", (ev) => exportAccounts(ev.currentTarget));
   $("#expSecrets").addEventListener("change", syncExportHints);
   $("#impPreviewBtn").addEventListener("click", importPreview);
@@ -2704,12 +2690,10 @@ function init() {
   applyTheme();
   wireStatic();
   syncExportHints(); // 「含凭据」默认勾上：警示/提示行按初始状态就位
-  // batchStatus 保留换行
-  $("#batchStatus").style.whiteSpace = "pre-wrap";
   boot();
 }
 
-// Node 下 import 本模块（单元验证 expiryInfo）时没有 document：跳过启动。
+// Node 下 import 本模块（tests-shell 校验 addrModel 等纯函数）时没有 document：跳过启动。
 // 浏览器行为不变。
 if (typeof document !== "undefined") {
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);

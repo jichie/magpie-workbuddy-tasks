@@ -73,7 +73,8 @@
             查容器 IP：<code>docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" magpie</code>；
             建隧道：<code>ssh -L &lt;port&gt;:&lt;容器IP&gt;:&lt;port&gt; &lt;user&gt;@&lt;NAS地址&gt;</code>，
             映射后仍可用 <code>http://127.0.0.1:&lt;port&gt;/</code> 打开。实际端口与绑定 host 由守护进程写在
-            <code>state/daemon.json</code>，看板顶栏「看板地址」会按真实绑定给出同一组提示。
+            <code>state/daemon.json</code>；看板页面不再显示访问地址，需要时直接看该文件里的
+            <code>host</code> 与 <code>port</code>。
             看板无鉴权：改绑 <code>0.0.0.0</code> 期间请用防火墙/隧道限制来源，不用时关闭端口转发。
           </p>
         </div>

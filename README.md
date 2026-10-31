@@ -78,7 +78,7 @@ magpie plugin add github:<owner>/magpie-workbuddy-tasks
 
 - **全部 API 与看板不需要任何密钥**（用户明确要求的免密钥口径）：读状态、启动/停止批量任务、改设置、单账号领奖/接取/签到、开关账号、导入确认写盘、含 token 的账号导出、关停守护进程——一律无需鉴权。
 - 看板默认 `http://127.0.0.1:4390/`。端口被占用时自动顺延（最多 +9，再不行用随机端口），**实际端口写在 `state/daemon.json` 的 `port` 里**（实际绑定的 host 也在同一文件的 `host` 里）。
-- `GET /api/state` 顶层带 `bindHost` / `port` / `reachableHint` 三个字段，供前端拼可点开的看板地址：绑定 `0.0.0.0`/`::` 时 `reachableHint` 明确提示「仅容器网桥/局域网可达，请用 SSH 隧道或局域网地址访问，切勿发布到公网」，否则为空串。
+- `GET /api/state` 顶层带 `bindHost` / `port` / `reachableHint` 三个字段（`serveUrl` 亦保留），供宿主、CLI 与其他集成拼可点开的看板地址；看板页面本身已移除地址块，不再显示/复制 serveUrl。绑定 `0.0.0.0`/`::` 时 `reachableHint` 明确提示「仅容器网桥/局域网可达，请用 SSH 隧道或局域网地址访问，切勿发布到公网」，否则为空串。
 - `state/daemon.json` 里仍有 `key` 字段（POSIX 上权限 600）——**仅为向后兼容保留**（旧版看板与宿主探测逻辑会读它），不是访问凭据，任何接口都不校验它。旧调用带 `Authorization: Bearer …` 或 `?k=…` 照常工作，新集成不必带。
 - **免密钥意味着**：凡能连上守护进程端口的人（或程序）都可以——
   - 用你已登录的 WorkBuddy 账号触发批量任务、领奖励、开关账号、改排程窗口；
