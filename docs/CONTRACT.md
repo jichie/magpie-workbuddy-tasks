@@ -34,7 +34,7 @@ magpie-workbuddy-tasks/
   dashboard/             # 独立看板前端（qwenwork 负责，风格对齐 magpie）
     index.html  app.js  style.css  vendor/
   page/                  # magpie 沙箱页（入口卡：状态 + 看板地址 + 跳转）
-    index.html  app.js  style.css  icon.svg
+    index.html  app.js  style.css  logo-mark.png
   tests/                 # bun test，fetch 全部 mock，不碰真实账号
   README.md  LICENSE  install.md
 ```
