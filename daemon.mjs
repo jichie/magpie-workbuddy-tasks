@@ -570,6 +570,20 @@ export async function startDaemon(opts = {}) {
 
   if (!existsSync(settingsFile)) saveSettings()
 
+  // ---- 全局节流器（铁律 4 的唯一归属，本进程仅此一个） -----------------------
+  // 所有打上游的路径共用它：job 腿（runner → engine/tasks|travel）、token 临期
+  // 刷新（runner._maybeRefresh → refreshAccount）、快照刷新（finalizeJob 之后与
+  // GET /api/state?refresh= → refreshSnapshots）、手动操作（/api/task/claim、
+  // /api/task/accept、/api/checkin → engineOpts()）。此前各路径各自维护节奏
+  // （固定 sleep + 各自的 engine ctx），等待窗一旦重叠就贴着发 —— e2e 抓到的
+  // 0ms 间隔正是 finalizeJob→refreshSnapshots 撞上手动 claim。spacer 记录
+  // 「上次上游调用放行时刻」并排队串行：并发入口后者等待，绝不在途并行。
+  // engine 缺 makeSpacer（老引擎/测试假引擎）时降级为 null，行为与旧版一致。
+  const upstreamSpacer =
+    typeof engine?.upstream?.makeSpacer === "function"
+      ? engine.upstream.makeSpacer({ now, sleep: sleepFn, gap: () => settings.gapMs })
+      : null
+
   // ---- runner（settings 就绪后再构造；ctx 只依赖契约 §2 + runner 的可选 opts） ----
   const runnerCtx = {
     cfgDir,
@@ -592,6 +606,9 @@ export async function startDaemon(opts = {}) {
     get gap() {
       return settings.gapMs
     },
+    // 铁律 4：全局节流器（上面创建的唯一实例）—— job 腿与 token 刷新的每一次
+    // 上游调用都经它排队对齐，与快照刷新/手动操作共用同一份「上次放行时刻」。
+    ...(upstreamSpacer ? { spacer: upstreamSpacer } : {}),
     // 看板的 host 覆盖（settings.host）透传给引擎 —— 空串 = 用 engine/upstream 默认
     get bases() {
       return { chat: settings.host.chat || "", bill: settings.host.bill || "", web: settings.host.web || "" }
@@ -663,13 +680,16 @@ export async function startDaemon(opts = {}) {
   }
 
   // 引擎调用的公共注入（契约 §2 的 opts 形状）：手动操作与快照刷新也必须走同一套
-  // fetch/时钟/bases —— 否则会绕开注入的 fetch 替身与防风控节奏。
+  // fetch/时钟/bases —— 否则会绕开注入的 fetch 替身与防风控节奏。spacer 同理：
+  // 这里是 daemon 内所有引擎调用的唯一 opts 工厂，全局节流器经它进入每一条
+  // 路径 —— 任何调用点新建 opts 都自动带上同一个 spacer，不存在「新 ctx 忘了对齐」。
   function engineOpts() {
     return {
       ...(opts.fetch ? { fetch: opts.fetch } : {}),
       now,
       sleep: sleepFn,
       gap: settings.gapMs,
+      ...(upstreamSpacer ? { spacer: upstreamSpacer } : {}),
       bases: { chat: settings.host.chat || "", bill: settings.host.bill || "", web: settings.host.web || "" },
       env: { WB_CONFIG_DIR: cfgDir, WB_STATE_DIR: stateDir },
     }

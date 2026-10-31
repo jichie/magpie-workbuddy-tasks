@@ -8,7 +8,7 @@
 1. **不碰对话链路**：本插件不声明 `workbuddy` / `workbuddy-ai` 这两个 provider id，不接管模型、不接管 loader/fetch。对话继续由 `@magpie-community/opencode-workbuddy-auth` 服务。
 2. **凭据不外泄**：access/refresh token 永不出现在任何 HTTP 响应、页面、日志里（只显示 `uid`、昵称、掩码）。
 3. **单一凭据血统**：刷新 token 后必须原子回写 `plugin-auth.json`，保证社区插件与我们用的是同一对 token，避免 refresh 轮换把对方踢下线。
-4. **限速不可省**：任何两次上游调用之间最少 1.0 s；账号之间 1.5 s（手动）/ 2–5 s 抖动（排程）。这是风控红线，不并行跑成长任务。
+4. **限速不可省**：任何两次上游调用之间最少 1.0 s；账号之间 1.5 s（手动）/ 2–5 s 抖动（排程）。这是风控红线，不并行跑成长任务。**全局节流器的唯一归属与并发策略**：daemon 进程创建唯一的 `engine/upstream.makeSpacer` 实例（gap 动态取 `settings.gapMs`），经 `engineOpts()` 与 runner ctx 注入**所有**打上游的路径——job 腿、token 临期刷新（`refreshAccount`）、快照刷新（`finalizeJob → refreshSnapshots` 与 `GET /api/state?refresh=`）、手动操作（claim/accept/checkin）；任何路径都不得新建 ctx 后绕开它直接打上游。spacer 记录「上次上游调用真正发出的时刻」，调用前先补足到 ≥gap（跨路径对齐，start-to-start 口径），并把并发入口**排队串行**（前一个调用完整结束后才放行下一个，绝不允许两个调用同时在途）。固定 sleep（腿间 gap、账号间隔、manualOp 的 1 s）保留作为节奏设计，但跨路径的正确性由 spacer 保证——各路径的等待窗重叠时后者等待，而不是贴着发。同一逻辑调用内的重试退避与主机回退同样算「两次上游调用」，间隔同样 ≥1.0 s。
 5. **纯 ESM、零运行时依赖**：只用 Bun/Node 内置（`node:fs`、`node:crypto`、`node:http`、`zlib`）。插件宿主里没有构建步骤。
 6. `index.mjs` **只导出一个函数**（magpie 会把入口文件里每个导出函数当插件跑）。辅助导出必须挂在 `export const _internal = {...}` 上。
 
@@ -78,6 +78,12 @@ callJSON(acct, kind, url, init, opts) -> {ok, status, code, data, msg, raw}
   // kind: 'chat'|'billing'|'web'；统一 {code,msg,data} 信封；code===0 为成功
   // 3 次线性退避重试；403/11140 → {restricted:true}（由 runner 记冷却）
   // chat 主机失败（TLS reset）→ 回退到 https://www.workbuddy.cn，X-Domain 不变
+  // 重试/回退也是「两次上游调用」：任意相邻两次 HTTP 尝试间隔 ≥ gap（铁律 4）
+makeSpacer({now, sleep, gap}) -> {run(fn), peekLast()}
+  // 跨路径全局节流器（铁律 4 的归属）：记录「上次调用放行时刻」，调用先补足
+  // ≥gap 并排队串行（前一个完整结束才放行下一个，绝不在途并行）。归属与注入
+  // 点见 §0.4 —— engine 不建进程级单例（各测试假时钟互不污染），不带 spacer
+  // 的调用行为与旧版完全一致
 growthBase() -> string      // 默认 https://copilot.tencent.com，可被 cfg/env 覆盖
 billBase()  -> "https://www.codebuddy.cn"
 webBase()   -> "https://www.workbuddy.cn"
@@ -133,7 +139,7 @@ class JobRunner {
 `Step = {uid, nickname, leg, state:'pending|running|ok|skip|fail', detail, credit, energy, at}`
 
 **时间必须可注入**：所有 sleep/now 走 `opts.sleep/opts.now`，测试里换成假时钟，保证「≥1 s 间隔」可断言、测试秒级完成。
-**fetch 同样可注入**：runner/daemon 全程把 `opts.fetch` 透传给 upstream（daemon 亦接受 `startDaemon({fetch})`，并注入到快照刷新、手动领奖/接取/签到等每一路引擎调用），测试以假 fetch 替换全部上游调用，零真实网络。跨腿/跨刷新的边界由 runner 在每条腿前补一拍 `gap`（腿内由 `makeCtx.breathe` 保证），使「任意两次上游调用 ≥1 s」在整条链路上成立。
+**fetch 同样可注入**：runner/daemon 全程把 `opts.fetch` 透传给 upstream（daemon 亦接受 `startDaemon({fetch})`，并注入到快照刷新、手动领奖/接取/签到等每一路引擎调用），测试以假 fetch 替换全部上游调用，零真实网络。「任意两次上游调用 ≥1 s」在整条链路上成立由两道机制共同保证：腿内由 `makeCtx.breathe`、跨腿由 runner 每腿前补一拍 `gap`；跨路径（job 腿 × 快照刷新 × 手动操作 × token 刷新）由 §0.4 的全局节流器 `makeSpacer` 排队对齐——e2e 曾抓到后者缺失时 0ms 间隔的偶发失败，回归钉死在 `tests/upstream-spacer.test.mjs` 与 `tests-e2e/boundary-throttle.test.mjs`。
 
 ## 3. daemon HTTP API（前端唯一依赖；全部 JSON；**免密钥**）
 
@@ -193,8 +199,10 @@ GET  /api/state                 -> {serveUrl, bindHost, port, reachableHint,
                                     // 切勿发布到公网」（lifecycle.bindHint 的同一句口径），否则为 ""。
                                     // 两个字段保留原语义（向后兼容），但不再是前端显示地址的来源。
                                     //
-                                    // serveUrl：看板顶栏「看板地址」显示/复制的访问地址，形如
+                                    // serveUrl：接口保留的访问地址，形如
                                     // http://192.0.2.10:4390/。0.0.0.0/:: 是监听值不是访问值，
+                                    // serveUrl 绝不返回它们。看板 UI 已整块移除地址块，
+                                    // 不再展示/复制 serveUrl；字段留给宿主、CLI 与其他集成使用。
                                     // 取值链按序取第一个可用项：
                                     //   ① 当前请求的 Host 头——用户实际用来访问的地址，最准确
                                     //     （显式端口进 URL；无显式端口 = 走 80/默认映射，URL 不带端口）

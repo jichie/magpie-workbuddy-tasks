@@ -1,5 +1,6 @@
 // upstream.mjs —— 上游调用的统一入口：信封、重试、退避、403/11140 限权、
-// chat 主机失联回退（CONTRACT §2）。
+// chat 主机失联回退（CONTRACT §2）；以及跨路径共用的全局节流器 makeSpacer
+//（铁律 4：任意两次上游调用 ≥1s、绝不在途并行）。
 //
 // 零真实网络：fetch 一律来自 opts.fetch ?? globalThis.fetch，测试注入假
 // responder。时钟同理：opts.now / opts.sleep，引擎逻辑里绝不直接摸
@@ -47,9 +48,62 @@ export function chatBase(opts = {}) {
   return fromOpts ? fromOpts.replace(/\/+$/, "") : growthBase(opts.env ?? globalThis.process?.env ?? {});
 }
 
+// ---- makeSpacer：跨路径共享的全局节流器（铁律 4 的归属，daemon 进程级唯一）--
+//
+// makeCtx 的 breathe 只对「同一个 ctx」负责：daemon 里快照刷新、手动操作、
+// token 刷新各自新建 opts/ctx（engineOpts() 每次都是新对象），彼此的节奏器
+// 互不知晓 —— 只要两个入口的等待窗重叠，两次上游调用就能贴着发出去（间隔 0ms，
+// 真实环境就是 403/11140 红线）。makeSpacer 记录「上一次上游调用真正发出的
+// 时刻」，任何带它的调用都必须：
+//   1. 排队串行：前一个调用完整结束（release）后才轮到下一个 —— 绝不允许两个
+//      调用同时在途（hub 口径：成长任务绝不并行）；
+//   2. 对齐：与上一次放行时刻间隔 ≥ gap（start-to-start 口径，与 e2e 的
+//      「任意两次上游调用间隔 ≥1000ms」断言一致）。
+// 归属与并发策略见 CONTRACT 铁律 4：由 daemon 创建唯一实例并注入所有上游路径
+// （engineOpts()/runnerCtx），engine 自身不建进程级单例 —— 各测试的假时钟
+// 互不污染；不带 spacer 的调用行为与旧版完全一致。
+// gap 可以是数字，也可以是函数（daemon 传 () => settings.gapMs，改设置即时生效）。
+export function makeSpacer(opts = {}) {
+  const now = opts.now ?? clock.now;
+  const sleep = opts.sleep ?? clock.sleep;
+  const gapOf =
+    typeof opts.gap === "function"
+      ? () => Math.max(0, Number(opts.gap()) || 0)
+      : () => Math.max(0, Number(opts.gap ?? DEFAULT_GAP_MS));
+  let last = null; // 上次放行（调用真正发出）时刻；null = 还没打过上游
+  let tail = Promise.resolve(); // FIFO 队尾：resolve 即前一个调用已完整结束
+  async function slot() {
+    const prev = tail;
+    let release;
+    tail = new Promise((r) => {
+      release = r;
+    });
+    await prev; // 排队：等前一个调用完整结束，绝不在途并行
+    if (last !== null) {
+      const wait = gapOf() - (now() - last);
+      if (wait > 0) await sleep(wait); // 与上一次放行时刻补足 ≥ gap
+    }
+    last = now();
+    return release;
+  }
+  return {
+    async run(fn) {
+      const release = await slot();
+      try {
+        return await fn();
+      } finally {
+        release();
+      }
+    },
+    peekLast: () => last, // 只读：测试与诊断用
+  };
+}
+
 // ---- makeCtx：一次流水线共享的时钟 + 节奏器 ----------------------------------
 // breathe(ms) 保证「自上一次 breathe 至少过了 ms 毫秒」（假时钟上就是把时钟
 // 拨过去），这是 ≥1 s 防风控间隔的实现载体：所有上游调用前都 breathe 一下。
+// opts.spacer（可选）是跨路径的全局节流器：带上它，本 ctx 的每次上游调用都会
+// 先经 spacer 排队对齐（见 makeSpacer）—— daemon 把同一个实例注入所有路径。
 export function makeCtx(opts = {}) {
   const now = opts.now ?? clock.now;
   const sleep = opts.sleep ?? clock.sleep;
@@ -59,6 +113,7 @@ export function makeCtx(opts = {}) {
     now,
     sleep,
     gap,
+    spacer: opts.spacer ?? null,
     signal: opts.signal ?? null,
     fetch: opts.fetch ?? globalThis.fetch,
     log: typeof opts.log === "function" ? opts.log : null,
@@ -142,13 +197,20 @@ async function attempt(fetchImpl, url, method, headers, body, signal) {
 //
 // - kind: 'chat' | 'billing' | 'web'（决定头族）
 // - init: {method, body}（body 已是字符串/undefined）
-// - opts: {fetch, now, sleep, signal, log, leg, env, base, bases, gap, __ctx}
+// - opts: {fetch, now, sleep, signal, log, leg, env, base, bases, gap, spacer, __ctx}
 // - 信封：{code, msg, data}，code===0 视为成功（2xx 且 code 0）
 // - 3 次线性退避重试，只重试「瞬时网络故障 / 5xx」（hub 的 _retryable 口径）
 // - HTTP 403 或信封 code 11140 → restricted:true，绝不重试（runner 记冷却）
 // - chat 主机网络级失败 → 最后用 https://www.workbuddy.cn 再试一次，X-Domain 不变
+// - opts.spacer（可选）：本次调用（含重试全程）先经全局节流器排队对齐 ——
+//   跨路径的 ≥gap 间隔与「绝不在途并行」由它保证（铁律 4）
 export async function callJSON(acct, kind, url, init = {}, opts = {}) {
   const ctx = ctxOf(opts);
+  if (ctx.spacer) return ctx.spacer.run(() => callJSONInto(acct, kind, url, init, opts, ctx));
+  return callJSONInto(acct, kind, url, init, opts, ctx);
+}
+
+async function callJSONInto(acct, kind, url, init = {}, opts = {}, ctx = ctxOf(opts)) {
   const fetchImpl = opts.fetch ?? ctx.fetch ?? globalThis.fetch;
   const sleep = opts.sleep ?? ctx.sleep;
   const method = String(init.method || "GET").toUpperCase();
@@ -160,9 +222,21 @@ export async function callJSON(acct, kind, url, init = {}, opts = {}) {
   let lastError = null;
   let lastStatus = 0;
   let lastText = "";
+  // 铁律 4 的「任意两次」也包括同一逻辑调用内的重试/回退：记录上一次 HTTP 尝试
+  // 真正发出的时刻，回退主机（以及任何缺退避的后续尝试）发之前补足 ≥ gap。
+  // （重试退避本身是 1s/2s，已满足；唯独第三次失败 → 主机回退这一脚此前是 0ms。）
+  const gapMs = Math.max(0, Number(opts.gap ?? ctx.gap ?? DEFAULT_GAP_MS));
+  let lastAttemptAt = 0;
+  const topUpGap = async () => {
+    const wait = gapMs - (ctx.now() - lastAttemptAt);
+    if (wait > 0) await sleep(wait);
+  };
 
   for (let i = 1; i <= 3; i++) {
+    if (i > 1) await topUpGap(); // 双保险：退避 sleep 之外再对齐一次（幂等）
+    lastAttemptAt = ctx.now();
     const r = await attempt(fetchImpl, url, method, headers, body, signal);
+    lastAttemptAt = ctx.now();
 
     if (r.kind === "error") {
       lastError = r.error;
@@ -236,6 +310,8 @@ export async function callJSON(acct, kind, url, init = {}, opts = {}) {
   if (lastError && kind === "chat") {
     const alt = fallbackUrl(url);
     if (alt !== url) {
+      await topUpGap(); // 铁律 4：回退尝试也是一次上游调用，与上一次尝试 ≥ gap
+      lastAttemptAt = ctx.now();
       step("retry", `${method} ${shortPath(url)} 主机失联，回退 ${CHAT_FALLBACK_BASE}`);
       const r = await attempt(fetchImpl, alt, method, headers, body, signal);
       if (r.kind === "http") {
@@ -282,7 +358,14 @@ export async function callJSON(acct, kind, url, init = {}, opts = {}) {
 // 头 X-Refresh-Token / X-Auth-Refresh-Source: workbuddy / X-Domain；响应
 // data.accessToken（可能嵌套 data.data），refreshToken 轮换时一并带回。
 // 调用方（runner）负责原子回写 plugin-auth.json（铁律 3：单一凭据血统）。
+// opts.spacer（可选）：刷新请求也是上游调用，同样先经全局节流器对齐 ——
+// 否则「临期刷新」会绕开铁律 4 贴着别的路径发出。
 export async function refreshAccount(acct, opts = {}) {
+  if (opts.spacer) return opts.spacer.run(() => refreshAccountInto(acct, opts));
+  return refreshAccountInto(acct, opts);
+}
+
+async function refreshAccountInto(acct, opts = {}) {
   const now = opts.now ?? clock.now;
   const fetchImpl = opts.fetch ?? globalThis.fetch;
   const step = stepOf(opts, acct);

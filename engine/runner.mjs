@@ -153,6 +153,9 @@ export class JobRunner {
       env: this.opts.env,
       base: this.opts.base,
       bases: this.opts.bases,
+      // 铁律 4：刷新请求也是上游调用 —— 带上全局节流器（daemon 注入的唯一
+      // 实例），与快照刷新/手动操作/job 腿共用同一份「上次放行时刻」。
+      ...(this.opts.spacer ? { spacer: this.opts.spacer } : {}),
       log: logFn,
       leg: "refresh",
     });
