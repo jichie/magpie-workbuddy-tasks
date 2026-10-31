@@ -69,7 +69,7 @@ test("fetchTasks：snake_case 上游 → 规范 camelCase Task（raw 非枚举�
   assert.equal(canvas.jumpUrl, "");
 
   const lib = tasks.find((t) => t.code === "Library_read");
-  assert.equal(lib.jumpUrl, "workbuddy://library", "DESKTOP_ONLY 任务的深链必须透出");
+  assert.equal(lib.jumpUrl, "workbuddy://library", "深链必须透出（看板展示用）");
   assert.equal(lib.unforgeable, false);
 });
 

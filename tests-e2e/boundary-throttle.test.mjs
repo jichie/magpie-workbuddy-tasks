@@ -242,7 +242,14 @@ test("跨边界 B：排程 tick（checkScheduler→startJob）与手动 claim �
 
   // 3. 红线：claim 与排程 job 的所有上游调用（travel 腿全程）两两间隔 ≥1000ms
   assertRedLine(from, calls.length, "B（排程 tick × 手动 claim）：");
-  assert.ok(calls[from].path === "/activity/growth/tasks/skill_1/claim", "窗口从 claim 开始");
+  // 窗口锚点：claim 或排程 job 的第一条调用。runner 的「每日活跃」（CONTRACT §7）
+  // 让排程 job 在腿之前多了一条计费域 /v2/report —— 它在 claim 还在 manualOp 的
+  // 1500ms 节奏睡眠里时就已进入 spacer 队列，FIFO 下可能先于 claim 放行；两种
+  // 次序都合法（spacer 保证串行 + ≥gap，红线断言在上面已经全窗校验过）。
+  assert.ok(
+    calls[from].path === "/activity/growth/tasks/skill_1/claim" || calls[from].path === "/v2/report",
+    `窗口从 claim 或排程 job 的每日活跃开始，实际：${calls[from].path}`,
+  );
 
   // 4. 排程 job 的 travel 腿真跑完了（traveling 状态 → 如实报告，腿本身 ok）
   const j = (await api.json(api.get(`/api/jobs/${job.id}`))).data;

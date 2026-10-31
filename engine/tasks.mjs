@@ -12,13 +12,18 @@ import {
   ACCEPT_CHUNK,
   CLAIM_POLL_ATTEMPTS,
   EXPERT_ID_POOL,
+  LIBRARY_DOC_URL,
+  LIBRARY_ELEMENT_ID,
+  LIBRARY_ELEMENT_NAME,
   NIGHT_TASK_CODES,
   PROGRESS_RISING_MS,
   REPORT_SETTLE_MS,
   TASK_SPECS,
   TEAM_ID_POOL,
+  WEB_UA,
   inNightWindow,
 } from "./constants.mjs";
+import { deriveId } from "./fingerprint.mjs";
 import { defaultNow } from "./identity.mjs";
 import { resolveTaskKind } from "./taskkind.mjs"; // 任务 → kind 解析（CONTRACT §2/§7，唯一判断源）
 import { runCatTravel } from "./travel.mjs"; // 循环引用（travel 需要 tasks 的流水线件）；ESM 函数声明提升下安全
@@ -193,6 +198,49 @@ export async function reportEvents(acct, events, opts = {}) {
   const res = await callJSON(
     acct, kind, base + "/v2/report",
     { method: "POST", body: JSON.stringify(events) },
+    opts,
+  );
+  return !!res.ok;
+}
+
+// reportLibraryEvent(acct, opts) -> boolean
+// 「浏览资料库」（Library_read）的点亮事件（wb_tasks.report_web_library 同源）：
+// 上游不认 chat 域的伪造事件，只认 web 端在资料库介绍文档页的一次元素点击
+//（web_element_click，CONTRACT §7）。事件走 **web 域** /v2/report，头族用
+// webHeaders 并覆盖三处：Referer=文档 URL、User-Agent=WEB_UA（与事件里的
+// userAgent 同值，冒充同一次浏览器会话）、X-User-Id=空串（web 端点击事件的
+// 真实形态 —— 身分靠 Authorization 与事件体内的 userId/machineId 携带）。
+export async function reportLibraryEvent(acct, opts = {}) {
+  const ctx = ctxOf(opts);
+  await ctx.breathe(); // 防风控：与上一次上游调用之间 ≥ gap
+  const uid = String(acct?.uid ?? "");
+  const now = Math.floor(ctx.now());
+  const event = {
+    eventCode: "web_element_click",
+    timestamp: now,
+    reportDelay: 0,
+    pageURL: LIBRARY_DOC_URL,
+    elementId: LIBRARY_ELEMENT_ID,
+    elementName: LIBRARY_ELEMENT_NAME,
+    os: "Win32",
+    arch: "",
+    osVersion: "10.0",
+    userAgent: WEB_UA,
+    machineId: deriveId(uid, "webmachine"), // wb_fingerprint：salt:uid 的 md5 派生
+    userId: uid,
+    userNickname: String(acct?.nickname ?? ""),
+  };
+  const res = await callJSON(
+    acct, "web", `${webUrl_()}/v2/report`,
+    {
+      method: "POST",
+      body: JSON.stringify([event]),
+      headers: {
+        Referer: LIBRARY_DOC_URL,
+        "User-Agent": WEB_UA,
+        "X-User-Id": "",
+      },
+    },
     opts,
   );
   return !!res.ok;
@@ -380,7 +428,13 @@ export async function progressTask(acct, t, logs, opts = {}) {
   // (eventCode, id) 去重，进度永远不动。
   const need = Math.max(1, tgt - cur);
   const kind = rk.kind;
-  logs.push(`正在点亮任务 [${name}] (需上报 ${need} 次)...`);
+  // 「浏览资料库」走 web 域的元素点击事件（CONTRACT §7），不是 chat 域的
+  // buildEvent 族 —— 日志也注明路径不同。
+  if (kind === "library") {
+    logs.push(`正在点亮任务 [${name}]（web 点击事件）(需上报 ${need} 次)...`);
+  } else {
+    logs.push(`正在点亮任务 [${name}] (需上报 ${need} 次)...`);
+  }
   let reportOk = true;
   let idPool = null;
   if (kind === "expert" || kind === "team") idPool = kind === "team" ? TEAM_ID_POOL : EXPERT_ID_POOL;
@@ -392,13 +446,20 @@ export async function progressTask(acct, t, logs, opts = {}) {
     fixedExpert = [rk.pinnedExpertId, rk.expertName || name];
   }
   for (let i = 0; i < need; i++) {
-    let expert = fixedExpert;
-    if (expert == null && idPool) {
-      const [pid, pnm] = idPool[(cur + i) % idPool.length];
-      expert = [pid, pnm];
+    let ok;
+    if (kind === "library") {
+      // 资料库：每次 need 循环发一条 web 点击事件（不走 buildEvent/专家池）
+      ok = await reportLibraryEvent(acct, opts);
+    } else {
+      let expert = fixedExpert;
+      if (expert == null && idPool) {
+        const [pid, pnm] = idPool[(cur + i) % idPool.length];
+        expert = [pid, pnm];
+      }
+      const ev = buildEvent(acct, kind, i, expert, { now: ctx.now });
+      ok = await reportEvents(acct, [ev], opts);
     }
-    const ev = buildEvent(acct, kind, i, expert, { now: ctx.now });
-    if (!(await reportEvents(acct, [ev], opts))) reportOk = false;
+    if (!ok) reportOk = false;
     if (i < need - 1) await ctx.breathe();
   }
   if (!reportOk) logs.push(`! 任务 [${name}] 部分事件上报失败 (上游拒绝), 继续尝试领奖`);

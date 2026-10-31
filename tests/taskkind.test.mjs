@@ -144,9 +144,9 @@ test("resolveTaskKind：canAccept/canLight 状态矩阵（六类任务 × 四种
       make: (status) => ({ code: "first_buddy", jumpUrl: "workbuddy://chat", acceptStatus: status, taskType: "auto" }),
       grid: [[false, true], [false, true], [false, false], [false, false]],
     },
-    "desktopOnly（Library_read）": {
+    "spec 单任务（Library_read，web 点击点亮）": {
       make: (status) => ({ code: "Library_read", jumpUrl: "workbuddy://library", acceptStatus: status, taskType: "single" }),
-      grid: [[true, false], [false, false], [false, false], [false, false]],
+      grid: [[true, false], [false, true], [false, false], [false, false]],
     },
     "unforgeable（wb_wechat）": {
       make: (status) => ({
@@ -180,9 +180,20 @@ test("resolveTaskKind：canAccept/canLight 状态矩阵（六类任务 × 四种
       assert.equal(rk.canLight, grid[i][1], `${label} @ ${status} canLight`);
     });
   }
-  // desktopOnly 标记本身与状态无关
+  // desktopOnly 标记本身与状态无关：只剩 RichMeow/Buddy 三兄弟
+  //（Library_read 已改走 web 点击事件点亮，不再属于 DESKTOP_ONLY —— 见
+  // engine/constants.DESKTOP_ONLY_TASKS 注释与 tests/library-webclick.test.mjs）
   assert.equal(resolveTaskKind({ code: "Buddy_App", jumpUrl: "workbuddy://home" }).desktopOnly, true);
+  assert.equal(resolveTaskKind({ code: "Buddy_App_QQ", jumpUrl: "workbuddy://home" }).desktopOnly, true);
   assert.equal(resolveTaskKind({ code: "RichMeow_Chat", jumpUrl: "" }).desktopOnly, true);
+  // Library_read：spec 命中即点亮路径 —— desktopOnly=false、accepted 可点亮
+  const lib = resolveTaskKind({ code: "Library_read", jumpUrl: "workbuddy://library", acceptStatus: "accepted", taskType: "single" });
+  assert.equal(lib.desktopOnly, false, "Library_read 不再是 desktop-only");
+  assert.equal(lib.source, "spec");
+  assert.equal(lib.kind, "library");
+  assert.equal(lib.lightable, true, "Library_read 的 kind 可自动化");
+  assert.equal(lib.canLight, true, "accepted 的 Library_read 可点亮");
+  assert.equal(lib.unforgeable, false);
   assert.equal(resolveTaskKind({ code: "Expert_Philanthropy" }).unforgeable, true, "公益捐赠沿用 unforgeable");
   assert.equal(resolveTaskKind({ code: "Expert_team_use_3", acceptStatus: "accepted" }).pinnedExpertId, "", "team 类走池子轮换，不钉 id");
   assert.equal(resolveTaskKind({ code: "expert_5", acceptStatus: "accepted" }).pinnedExpertId, "", "expert_5 走池子轮换，不钉 id");

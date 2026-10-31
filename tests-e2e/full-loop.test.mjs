@@ -388,10 +388,31 @@ test("主回路：job 完成，步骤/结算/日志/上游调用顺序全部对�
   );
   for (const s of job.steps) assert.equal(s.state, "ok", `${s.uid}/${s.leg}: ${s.detail}`);
 
-  // 结算：u-hh 成长 300+100+200+100+100+旅行20=820；u-oo 成长 100；共 920
+  // 结算：u-hh 成长 300+100+200+100+100+旅行20=820；u-oo 成长 100；共 920。
+  // tasksLit 5→4：每日活跃（CONTRACT §7，每个账号 job 开始前的固定动作）先发
+  // 一条 chat 事件把 u-hh 的 first_buddy 提前点亮成 completed，growth 腿直接
+  // 领奖（claimed 数不变、lit 少 1）。
   assert.equal(job.totals.credit, 920);
-  assert.equal(job.totals.tasksLit, 5);
+  assert.equal(job.totals.tasksLit, 4);
   assert.equal(job.totals.tasksClaimed, 6);
+
+  // 每日活跃：两账号各一条 chat 事件、打计费域、含 userId、先于成长腿任何调用。
+  // 计费域是唯一可靠的判别口径（腿内的 chat_5 点亮事件同为 chat_request_send，
+  // 但走 chat 域 copilot.tencent.com）。
+  const dailyCalls = stub.calls.filter((x) => x.host === "www.codebuddy.cn" && x.path === "/v2/report");
+  assert.equal(dailyCalls.length, 2, "两账号各一条每日活跃（计费域 /v2/report）");
+  const dailyReps = dailyCalls.map((x) => x.body?.[0]).filter(Boolean);
+  assert.equal(dailyReps.length, 2);
+  for (const ev of dailyReps) {
+    assert.equal(ev.eventCode, "chat_request_send", "每日活跃 = 一条 chat 事件");
+    assert.ok(ev.userId, "每日活跃事件含 userId");
+  }
+  assert.ok(
+    stub.calls.findIndex((x) => x.host === "www.codebuddy.cn" && x.path === "/v2/report") <
+      stub.calls.findIndex((x) => x.path === "/v2/activity/growth/tasks"),
+    "每日活跃先于成长腿的任何调用",
+  );
+  assert.ok(job.log.some((l) => l.includes("每日活跃：已上报")), "每日活跃日志");
 
   // 人读日志：批量接取、已接取 5 个、过期账号回写
   const logText = job.log.join("\n");
@@ -407,7 +428,10 @@ test("主回路：job 完成，步骤/结算/日志/上游调用顺序全部对�
   const firstAccept = idx((x) => x.path === "/v2/activity/growth/tasks/accept");
   const firstClaim = idx((x) => x.path.endsWith("/claim"));
   assert.ok(firstReport >= 0 && firstAccept > 0 && firstClaim >= 0);
-  assert.ok(firstReport < firstAccept, "auto 任务（first_buddy）先点亮再批量接取");
+  // 全链路第一条 /v2/report 是每日活跃（计费域 chat 事件）；它先点亮了
+  // first_buddy，growth 腿的领奖仍先于批量接取（first_buddy 是前置）
+  assert.equal(c[firstReport].host, "www.codebuddy.cn", "第一条上报即每日活跃（计费域）");
+  assert.ok(firstReport < firstAccept, "每日活跃/auto 点亮先于批量接取");
   assert.ok(firstClaim < firstAccept, "first_buddy 领奖先于批量接取（它是前置）");
   assert.equal(c[firstClaim].path, "/activity/growth/tasks/first_buddy/claim");
 

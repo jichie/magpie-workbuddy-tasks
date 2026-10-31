@@ -100,6 +100,7 @@ describe("路由登记表（单一真相：routeNeedsKey 恒 false / API_ROUTE_A
     const registered = API_ROUTE_AUTH.map((r) => `${r.method} ${r.path.split("?")[0]}`).sort()
     assert.deepEqual(registered, [
       "GET /api/accounts/export",
+      "GET /api/credits",
       "GET /api/events",
       "GET /api/hello",
       "GET /api/history",

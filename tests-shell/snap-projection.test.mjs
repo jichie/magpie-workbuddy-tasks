@@ -94,7 +94,7 @@ describe("P0-2：snapTask 投影（真实形态 19 项）", () => {
     const expected = {
       playbook_prompt: { desktopOnly: false, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "" },
       RichMeow_Chat: { desktopOnly: true, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "" },
-      Library_read: { desktopOnly: true, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "" },
+      Library_read: { desktopOnly: false, unforgeable: false, reason: "", canAccept: false, canLight: true, pinnedExpertId: "" },
       Expert_lighthouse: { desktopOnly: false, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "ex_2cvvUZQhDyeJ" },
       Hp_Appearance: { desktopOnly: false, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "" },
       Buddy_App: { desktopOnly: true, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "" },
@@ -176,12 +176,16 @@ describe("P0-2：snapTask 投影（真实形态 19 项）", () => {
     assert.equal(byCode.get("first_buddy").canLight, true, "auto 任务 not_accepted 即可点亮")
     assert.equal(byCode.get("first_buddy").canAccept, false, "auto 任务永不给接取结论")
 
-    // desktopOnly 三兄弟：就算 not_accepted 也只能接、不能点亮
-    for (const code of ["RichMeow_Chat", "Library_read", "Buddy_App"]) {
+    // desktopOnly 只剩两兄弟：就算 not_accepted 也只能接、不能点亮
+    for (const code of ["RichMeow_Chat", "Buddy_App"]) {
       const s = byCode.get(code)
       assert.equal(s.desktopOnly, true, `${code} desktopOnly 与状态无关`)
       assert.equal(s.canLight, false, `${code} 不可点亮（伪造事件不推进）`)
     }
+    // Library_read 已改走 web 点击事件点亮（引擎 reportLibraryEvent）：不再是
+    // desktop-only，accepted 状态即可点亮（真实形态 19 项里它就是 accepted）
+    assert.equal(byCode.get("Library_read").desktopOnly, false, "Library_read 不再是 desktop-only")
+    assert.equal(byCode.get("Library_read").canLight, true, "accepted 的 Library_read 可点亮")
     // wb_wechat：unforgeable 两头都封死
     assert.equal(byCode.get("wb_wechat_oa_subscribe_task").canAccept, false)
     assert.equal(byCode.get("wb_wechat_oa_subscribe_task").canLight, false)

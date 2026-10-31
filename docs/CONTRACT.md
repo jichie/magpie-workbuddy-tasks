@@ -28,6 +28,8 @@ magpie-workbuddy-tasks/
     taskkind.mjs         # 任务 → kind 解析（P0-1）：jump_url 派生专家 id、未收录标注、
                          # canAccept/canLight/pinnedExpertId 收敛结论（唯一判断源）
     travel.mjs           # 猫猫旅行闭环 + 夜猫子任务
+    daily.mjs            # 每日活跃上报（点亮成长中心连登；uid→北京日幂等）
+    credits.mjs          # 积分余额 + 套餐权益包明细（只读；fetchCredits）
     runner.mjs           # 跨账号批量编排、job 状态与日志、并发闸门
     schedule.mjs         # 小时窗口排程
     constants.mjs        # TASK_SPECS / 事件池 / 上游常量（唯一事实来源）
@@ -99,12 +101,66 @@ fetchTasks(acct) -> Task[]
   //          rewardCredit, rewardEnergy, unforgeable, reason, raw?(非枚举) }
 acceptTasks(acct, codes) -> {accepted[], already[], failed[]}   // 20 个一批
 reportEvents(acct, events) -> boolean
+reportLibraryEvent(acct) -> boolean
+  // 「浏览资料库」（Library_read，kind:"library"）的点亮事件：web_element_click
+  // 打 **web 域** /v2/report（webHeaders + 覆盖 Referer=资料库文档 URL、
+  // User-Agent=WEB_UA、X-User-Id=空串；Authorization 保留）。字段与头逐字见
+  // engine/tasks.mjs；callJSON 的 init.headers 支持**大小写敏感**合并自定义头，
+  // 唯 Authorization 不可被覆盖（凭据头，无论大小写怎么写都保留引擎的值）。
 claimTask(acct, code) -> {ok, credit, energy, via /*'chat'|'web'*/, reason}
 buildEvent(acct, kind, idx) -> object
 runGrowthTasks(acct, opts) -> GrowsResult
   // opts.codes?: string[] —— 任务级勾选（§3/§6/§7）：非空数组 = 只对选中任务
   // 接取/点亮/领奖；每次 fetchTasks 后都按选中集合过滤；缺失 code 警告跳过；
   // 未传/空数组 = 全部任务（旧行为）
+
+// daily.mjs
+beijingDayKey(nowMs) -> "YYYY-MM-DD"      // 北京日键（UTC+8；UTC 16:00 翻日）
+reportDailyActivity(acct, opts) -> {sent:true,key} | {sent:false,skipped:true,key}
+                                         // | {sent:false,error}   // 不抛
+  // 每个账号每个**北京日**一条 chat 事件（buildEvent "chat"），打**计费域**
+  // billBase()/v2/report（不是 chat 域！）—— 点亮成长中心连登。
+  // opts.sentMap: {uid:"YYYY-MM-DD"} 幂等账本（命中今天 → {sent:false,skipped:true}，
+  // 零上游调用）；成功才写 sentMap[uid]=key 并回调 opts.onSent?.(uid,key)；
+  // 失败/异常返回 {sent:false,error} 不抛（调用方记日志继续）。经 reportEvents
+  // → ctx.breathe/spacer，铁律 4 照常生效，绝不绕开。
+
+// credits.mjs —— 国内版「积分余额 + 套餐权益包明细」（只读，绝不发布 token）
+fetchCredits(acct, opts) -> {ok:true, credits} | {ok:false, error, needRelogin?}
+  // 三个 billing 上游（POST，billing 头族 + X-Client-Platform: web）：
+  //   {bill}/billing/meter/get-user-resource-summary        body "{}"
+  //   {bill}/billing/meter/get-user-resource-free-packages  body {PackageCodes,PageNumber:1,PageSize:200,Status:[0]}
+  //   {bill}/billing/meter/get-user-resource-paid-packages  body {同上, Status:[0,3], NeedRenewInfo:true}
+  // PackageCodes = summary data.Packages[].PackageCode 去重；free/paid 单个失败
+  // 忽略该来源（不整体失败）；summary 失败 → {ok:false,error}，401/403 或错误
+  // 文本含「登录/过期/token/Authorization」→ needRelogin:true。每次调用前
+  // ctx.breathe + callJSON 经全局 spacer（铁律 4），三次调用彼此 ≥1s。
+  // credits 形状（camelCase，数值 round 2 位）：
+  //   {remain, used, size, usedPercent/remainPercent（"x.x%"；size=0 → 0.0%/100.0%）,
+  //    isPaidUser（null=summary 没答，不要瞎判免费）,
+  //    tier {paid,package,packageCode,protectedPrice,trial}|null,
+  //    earliestExpiring {name,packageCode,remain,cycleEndTime,daysLeft}|null
+  //      （packages 里 remain>0 && !isExpired && daysLeft!=null，按 daysLeft 升序第一个）,
+  //    packages[{name,packageCode,productName,subProductName,grantReason,resourceId,
+  //              dealName,createTime,remain,used,size,unit,inUsage,autoRenew,
+  //              cycleStartTime,cycleEndTime,expireTime,noExpiry,daysLeft,isExpired,status}],
+  //    updatedAt（epoch ms）, updatedIso（北京 "YYYY-MM-DD HH:mm:ss"）}
+  // 解析规则（wb_accounts._parse_package_account 口径，字段名保持上游原样）：
+  //   free+paid 的 Account 按 AccountId 去重；size/remain/used 按
+  //   Precise→普通四级键名取值，缺的量用另两个补（size>0 且 used<=0 →
+  //   used=size-remain；size>0 且 remain<=0 → remain=size-used，下限 0）；
+  //   grantReason 取 AccountAttributes 里 Key==="grantReason" 的 Value；
+  //   包明细为空且 summary.Packages 有值时用 CycleTotal/Remain/UsedCapacity 汇总。
+  // 时区红线（与 daily.beijingDayKey 同源）：容器时区可能是 UTC —— naive 字符串
+  // 时间（CycleEndTime/ExpiredTime 一族）一律按北京时间（+08:00）解析成 epoch ms
+  // 再算 daysLeft（1 位小数；diff<0 → isExpired）；到期优先认 DeductionEndTime
+  //（epoch ms → 北京文本，免费包/体验版的 CycleEndTime 只是月度计费边界，能差
+  //  8 年）；diff > 730 天 → noExpiry=true（不参与倒计时）。epoch → 文本同样固定
+  // 北京时区，绝不用宿主本地时区。
+epochToBeijingText(ms) -> "YYYY-MM-DD HH:mm:ss"  // 北京时区文本
+beijingTextToMs(text) -> ms|null                 // naive 字符串按 +08:00 解析；解不出 null
+tierFromSummary(data) -> {paid,package,packageCode,protectedPrice,trial}|null
+                                                 // 无 IsPaidUser 字段 → null（「没答上来」绝不记成「免费」）
 
 // taskkind.mjs —— 任务 → kind 解析（fetchTasks 的 unforgeable/reason、流水线的
 // 接取/点亮决策、daemon.snapTask 的 6 个下发字段，全部出自这里的唯一判断源）
@@ -142,6 +198,11 @@ class JobRunner {
   current() -> Job|null     // 同一时刻只允许 1 个 job（全局闸门）
   holds() -> [{uid, releasedAt}] // 风控冷却（403/11140）中的账号；releasedAt = 解除时刻 epoch ms
                                  //（/api/state 的 scheduler.holds 数据源，daemon 负责拼昵称）
+  // 构造 opts 另认：dailySentMap（uid→北京日键的幂等账本，daemon 从
+  // state/daily-activity.json 读入同一份对象）与 onDailySent(uid,key)（成功落盘
+  // 回调）。每个账号开跑（任何腿）之前 runner 固定调一次 engine/daily.
+  // reportDailyActivity：跳过/失败只写一行 job.log（「每日活跃：已上报 /
+  // 今日已报过 / 上报失败：…」），绝不阻断腿、绝不 fail job。
 }
 ```
 
@@ -191,6 +252,10 @@ GET  /api/state                 -> {serveUrl, bindHost, port, reachableHint,
                                     // 国际版账号内容（uid/昵称/域名都不给）
                                     accounts:[{uid,nickname,masked,domain,expiresInMs,expiresInDays,tasksEnabled,
                                              imported,eligible,
+                                             credits,   // 该账号的积分缓存（state/credits.json 投影，
+                                                        // engine/credits.fetchCredits 的 credits 形状，
+                                                        // §2）；没拉过/缓存损坏 → null。只读投影：
+                                                        // /api/state 绝不为此打上游
                                              snapshot:{tasks:[{code,title,acceptStatus,progress:{current,target},
                                              rewardCredit,rewardEnergy,jumpUrl,taskType,
                                              desktopOnly,unforgeable,reason,canAccept,canLight,pinnedExpertId}],
@@ -239,9 +304,11 @@ GET  /api/state                 -> {serveUrl, bindHost, port, reachableHint,
                                     // 与 fetchTasks 的 unforgeable/reason、流水线决策同一判断源；
                                     // 前端据此渲染，不要再用 jumpUrl 非空猜「需桌面端完成」——
                                     // 真实数据 19 项全部有非空 jumpUrl）：
-                                    //   desktopOnly —— DESKTOP_ONLY_TASKS 命中（RichMeow_Chat/
-                                    //     Library_read/Buddy_App/Buddy_App_QQ 这类伪造事件不推进、
-                                    //     领奖必 400 的），与 jumpUrl 形状无关
+                                    //   desktopOnly —— DESKTOP_ONLY_TASKS 命中
+                                    //     （RichMeow_Chat/Buddy_App/Buddy_App_QQ 这类
+                                    //     伪造事件不推进、领奖必 400 的；Library_read
+                                    //     已改走 web 点击事件点亮，**不在**此列），
+                                    //     与 jumpUrl 形状无关
                                     //   unforgeable / reason —— 已有语义沿用（spec.unforgeable；
                                     //     未收录任务也是 unforgeable:true + reason:"未收录任务"）
                                     //   canAccept —— 现在就能进「接取」= not_accepted && 非 auto
@@ -311,6 +378,27 @@ POST /api/account/toggle        body {uid, tasksEnabled:bool} -> account 行（�
                                     // 400 缺 uid / tasksEnabled 非布尔，404 账号不存在；
                                     // 不挡运行中的 job（runner 启动时已定名单，只影响下一轮筛选）
 GET  /api/jobs/:id              -> Job
+GET  /api/credits?uid=<uid>&refresh=0|1
+                                    -> 200 {ok:true, uid, nickname, credits}
+                                    | 200 {ok:false, uid, nickname, error, needRelogin?, credits?旧缓存}
+                                    | 404 {error}   // uid 找不到 / API key / 企业号 / 已停用
+                                                    //（可参与口径与 eligibleAccounts 一致）
+                                    | 409 {error:"busy"}  // 要拉取时 job 在跑（或已在拉取中）
+                                    | 503 {error}   // 引擎不可用
+                                    // 国内版「积分余额 + 套餐权益包明细」（看板 剩余/总额 与明细
+                                    // 弹窗的数据源；engine/credits.fetchCredits，§2）。只读，
+                                    // 绝不发布 token。缓存：
+                                    //   · state/credits.json（{uid: credits}），启动读入，损坏/
+                                    //     非对象按 {}；成功拉取后原子写回（writeJson tmp+rename）；
+                                    //   · 缓存 < CREDITS_TTL_MS（10 分钟）且未要求 refresh → 直接
+                                    //     回缓存，一次上游都不发；
+                                    //   · 需要拉取时若 runner.current() 存在（job 在跑）→ 409 busy，
+                                    //     避免和 job 抢节流窗口；但「有缓存且未 refresh」时仍直接
+                                    //     回缓存（哪怕已过期）——展示优先，绝不硬闯；
+                                    //   · refresh=1/true/yes → 无视 TTL 强制拉取（busy 时仍 409）；
+                                    //   · 上游失败 → 200 {ok:false,...,needRelogin?}，旧缓存保留
+                                    //     （不清掉）并随响应一并带回（credits 字段，若有）；
+                                    //   · 拉取成功后广播 SSE {kind:"credits", uid}（可选，前端不依赖）。
 GET  /api/history?limit=200     -> 每次尝试一行（对齐 hub 的 /activity/history）
 GET  /api/events                -> SSE：{kind:'job'|'step'|'log'|'scheduler', ...}
 其余 GET /                      -> dashboard/index.html（静态，同源，无构建）
@@ -377,6 +465,16 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
   猫猫：`GET .../buddy/travel/status|config`、`POST .../buddy/travel/depart`（body `{location_id}`）、`POST .../buddy/travel/claim`。
 - 计费侧：`POST {bill}/billing/meter/claim-gift|claim-compensation`、`POST {bill}/v2/billing/meter/daily-checkin`、
   `POST {chat}/v2/billing/meter/checkin-activity-status`。
+- **积分余额（只读，engine/credits.mjs，wb_accounts._fetch_credits_cn_detailed 口径）**：
+  `POST {bill}/billing/meter/get-user-resource-summary`（body `"{}"`）、
+  `POST {bill}/billing/meter/get-user-resource-free-packages`（`{PackageCodes,PageNumber:1,PageSize:200,Status:[0]}`）、
+  `POST {bill}/billing/meter/get-user-resource-paid-packages`（`{同上, Status:[0,3], NeedRenewInfo:true}`）；
+  头族 = billing 头 + `X-Client-Platform: web`；PackageCodes 取 summary `data.Packages[].PackageCode`
+  去重，free/paid 单个失败忽略该来源。到期语义：优先认 `DeductionEndTime`（epoch ms，积分到这个点
+  不能再抵扣即作废；免费包/体验版的 `CycleEndTime` 只是每月计费边界，两者能差 8 年），>730 天按
+  「不过期」处理（上游拿远超真实周期的哨兵值表示永不过期）；**naive 字符串时间一律按北京时区
+  (+08:00) 解析**（容器时区可能是 UTC，绝不能当本地时间）。summary 无 `IsPaidUser` 字段时 tier=null，
+  绝不瞎判免费。
 - 刷新：`POST {chat} + engine/constants.REFRESH_PATH`，头 `X-Refresh-Token`、`X-Auth-Refresh-Source: workbuddy`、`X-Domain`；响应 `data.accessToken`(+轮换的 `data.refreshToken`)，可能嵌套 `data.data`。
 - 事件必须有 `userId`（缺了服务端 200 但静默丢弃）。
 - 进度只在**已接取**任务上累计；专家/团队事件按 `(eventCode,id)` 去重 → 必须轮换 id 池；
@@ -403,8 +501,33 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
   `redemption_status` 同层；data 顶层没有 days/streakDays 键）。连登为 0 是真实值
   （`streak.days` 与 `month_total_days` 是两个字段，前者才是连登天数）。
   daemon 快照读同一路径，不做多拼写回退链。
-- DESKTOP_ONLY 任务（`RichMeow_Chat`/`Library_read`/`Buddy_App`/`Buddy_App_QQ`）与 `unforgeable`
+- DESKTOP_ONLY 任务（`RichMeow_Chat`/`Buddy_App`/`Buddy_App_QQ`）与 `unforgeable`
   （`wb_wechat_oa_subscribe_task`/`Expert_Philanthropy`）不上报、接不上，只展示 `jump_url`。
+  **`Library_read` 不在此列**（2026-11 修正）：它由 web 端的一次元素点击事件点亮 ——
+  `engine/tasks.reportLibraryEvent` 向 **web 域** `webBase()/v2/report` 发一条
+  `web_element_click`（数组包一层），字段逐字为：
+  `{eventCode:"web_element_click", timestamp, reportDelay:0,
+    pageURL:"https://www.workbuddy.cn/space/d/o0KWYeynteVv06UnAZqIFm",
+    elementId:"library_doc_intro_click", elementName:"WorkBuddy资料库介绍",
+    os:"Win32", arch:"", osVersion:"10.0", userAgent:<WEB_UA>,
+    machineId:deriveId(uid,"webmachine"), userId:uid, userNickname:<昵称>}`；
+  头族用 `webHeaders(acct)` 并覆盖三处：`Referer`=该文档 URL、`User-Agent`=同一个
+  WEB_UA（与事件 userAgent 同值，冒充同一次浏览器会话）、`X-User-Id`=空串（web 端
+  点击事件的真实形态，身分靠 Authorization 与事件体携带）；`Authorization` 保留。
+  `callJSON` 的 `init.headers` 支持自定义头**大小写敏感**合并，唯 `Authorization`
+  无论大小写写法都不可被覆盖（凭据头红线）。流水线里 `kind==="library"` 走这条路
+  （每次 need 循环一条，日志「正在点亮任务 [浏览资料库]（web 点击事件）」），
+  进度/领奖与其它任务同一套轮询。
+- **每日活跃（点亮成长中心连登，engine/daily.mjs）**：每个账号每个**北京日**一条
+  `chat` 事件，打**计费域** `billBase()/v2/report`（不是 chat 域）。触发点是 runner
+  的每账号开跑之前（无论 job 跑哪些腿、也无论账号处于哪个 leg）；幂等键 =
+  `uid → 北京日键`（`beijingDayKey`，UTC+8，UTC 16:00 翻北京日），账本由 daemon
+  持久化在 `state/daily-activity.json`（`{uid:"YYYY-MM-DD"}`，启动读入、`onSent`
+  经 writeJson tmp+rename 原子写回；文件损坏/形状不对按空对象起步，不阻断启动，
+  顶多重发一条——上游按北京日幂等，无害）。成功才落账 + 回调 `onSent`；失败返回
+  `{sent:false,error}` 不抛，runner 记一行日志（「每日活跃：已上报 / 今日已报过 /
+  上报失败：…」）继续跑腿，绝不 fail job。上游调用经 `reportEvents` → 全局节流器，
+  铁律 4 照常生效。`/api/state` 不新增字段。
 - `first_buddy` 是 `task_type==='auto'`：不许进接取批次，必须先点亮+领奖，否则单任务接取报 `prerequisite not met`。
 - 领奖竞态：上报后等 1.5 s，轮询进度最多 6 次（在涨就再等 2.5 s），没到位就把领奖顺延到下一轮，绝不硬闯。
 - **任务级勾选（`runGrowthTasks` 的 `opts.codes`，§2/§3/§6）**：非空数组 = 只对选中的任务
@@ -452,6 +575,15 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
   丢弃 `hours.growth`、`/api/state` 的 hours/nextRuns 无 growth、tick 不触发 growth job、
   手动 `legs:["growth"]` 照常启动；
 - 去重：`expert_5` 五个事件用 5 个不同 id；
+- 资料库（Library_read）：reportLibraryEvent 的事件字段/头逐字断言（web 域、
+  Referer/UA/X-User-Id 覆盖、Authorization 保留）；callJSON 的 init.headers 合并
+  —— 大小写敏感覆盖、Authorization 不可被覆盖（精确大小写与小写两种写法都剥掉）；
+  流水线 0/1 → web 点击 → 进度 0→1 → 领奖；desktopOnly 投影只剩 RichMeow/Buddy
+  三条，Library_read desktopOnly=false、accepted 可点亮；
+- 每日活跃：北京日键 UTC+8 翻日；同一北京日第二次不重发（skipped）、跨日（注入
+  now）再发；失败不落账不回调不抛；请求打计费域 /v2/report 且事件含 userId；经
+  spacer；runner 每账号开跑前一次、失败不阻断腿；daemon 持久化
+  state/daily-activity.json 读写、损坏回空不阻断启动；
 - kind 解析（taskkind）：jump_url 派生专家 id（编码/裸/双重编码/解不出）、TASK_SPECS
   优先（Valorant 钉死 id 不被 jump_url 覆盖）、六类任务 × 四状态 canAccept/canLight
   矩阵、真实形态 19 项投影全表 + 批量接取 codes 与 canAccept 逐项一致（未收录绝不进

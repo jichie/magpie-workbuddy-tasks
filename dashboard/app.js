@@ -88,6 +88,8 @@ const state = {
   taskSel: {}, // 任务级勾选：{ [uid]: Set(code) }（内存；跨 renderAll/快照刷新保留）
   expanded: new Set(), // 展开任务表的 uid
   toggling: new Set(), // 「参与任务」开关正在请求中的 uid（期间禁用该行开关）
+  creditBusy: new Set(), // 积分查询正在请求中的 uid（期间按钮显示「查询中…」）
+  creditErrors: new Map(), // uid -> {error, needRelogin}（查询失败时只放进按钮 title）
   busy: false, // 批量操作进行中
   lastFinished: null, // 最近一个结束的 job（SSE 收尾广播）
   es: null,
@@ -1371,6 +1373,7 @@ function accountRow(a) {
       ),
       statusCell,
       progressCell,
+      creditsCell(a),
       el("div", { class: "acct-cell acct-toggle-cell" }, toggle),
       sideCell,
     ),
@@ -1461,6 +1464,681 @@ function renderAccounts() {
   // 重建 DOM 后把勾选控件同步回 state（表头全选/半选、已选计数）
   for (const a of accounts) updateTaskSelUI(a.uid);
   updateSelectionUI();
+}
+
+// ---- 积分（账号行余额列 + 明细弹窗） ------------------------------------------------
+// 数据面：
+//   GET /api/credits?uid=<uid>&refresh=0|1
+//     成功      -> {ok:true, uid, nickname, credits}
+//     上游失败  -> {ok:false, uid, nickname, error, needRelogin?}（HTTP 200）
+//     404       -> 未知账号
+//     409       -> {error:"busy"}（批量任务运行中）
+//   /api/state 的 accounts[].credits 是同一形状的缓存（对象或 null）。
+// credits 全部为 camelCase；数值一律先经 creditNum/parsePercent，缺字段不抛错。
+// 行内只做「余额 + 明细入口」；完整权益包表格、筛选、排序都在弹窗里。
+
+const SOON_DAYS = 7;
+const CREDITS_FILTERS = ["all", "remain", "soon", "dead"];
+const CREDITS_SORTS = ["expiry", "remain", "used", "size"];
+
+const creditCache = new Map(); // uid -> credits：跨 /api/state 轮询保留本地已查到的值
+const creditAutoTried = new Set(); // 自动查询过的 uid：失败后不再反复打上游
+const creditQueue = { list: [], active: 0, max: 2 }; // 页面加载后的自动查询最多 2 并发
+let lastBusyToastAt = 0;
+
+function creditNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+// 后端时间形如 "2026-11-04 00:22:56"（本地时间）；Safari 不认空格分隔，换成 T。
+function creditDate(v) {
+  if (v == null || v === "") return null;
+  let s = String(v).trim();
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(s)) s = s.replace(" ", "T");
+  const d = new Date(s);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function fmtMonthDay(v) {
+  const d = creditDate(v);
+  if (!d) return "";
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+function creditDaysLeft(daysLeft, dateStr) {
+  if (typeof daysLeft === "number" && Number.isFinite(daysLeft)) return daysLeft;
+  if (typeof daysLeft === "string" && daysLeft.trim() !== "" && Number.isFinite(Number(daysLeft))) {
+    return Number(daysLeft);
+  }
+  const d = creditDate(dateStr);
+  if (!d) return null;
+  return Math.ceil((d.getTime() - Date.now()) / DAY_MS);
+}
+
+function parsePercent(v) {
+  if (typeof v === "number" && Number.isFinite(v)) return Math.max(0, Math.min(100, v));
+  const m = String(v ?? "").match(/-?\d+(?:\.\d+)?/);
+  if (!m) return 0;
+  const n = Number(m[0]);
+  return Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : 0;
+}
+
+function fmtPctNum(n) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return "0%";
+  return `${Number.isInteger(x) ? x : x.toFixed(1)}%`;
+}
+
+function creditUsagePct(c) {
+  const raw = String(c?.usedPercent ?? "").trim();
+  if (raw !== "") return parsePercent(raw);
+  const size = creditNum(c?.size);
+  return size > 0 ? Math.max(0, Math.min(100, (creditNum(c?.used) / size) * 100)) : 0;
+}
+
+function creditUsageText(c) {
+  const raw = String(c?.usedPercent ?? "").trim();
+  if (/^-?\d+(?:\.\d+)?%$/.test(raw)) return raw;
+  return fmtPctNum(creditUsagePct(c));
+}
+
+function creditTierName(c) {
+  const pkg = String(c?.tier?.package ?? "").trim();
+  if (pkg) return pkg;
+  return c?.isPaidUser ? "付费用户" : "普通用户";
+}
+
+function creditsPkgExpired(p) {
+  if (!p || p.noExpiry) return false;
+  if (p.isExpired === true) return true;
+  const d = creditDate(p.expireTime || p.cycleEndTime);
+  return d ? d.getTime() <= Date.now() : false;
+}
+
+function creditPkgDaysLeft(p) {
+  return creditDaysLeft(p?.daysLeft, p?.expireTime || p?.cycleEndTime);
+}
+
+function creditPkgExpiryTs(p) {
+  if (p?.noExpiry) return Number.POSITIVE_INFINITY;
+  const d = creditDate(p?.expireTime || p?.cycleEndTime);
+  return d ? d.getTime() : Number.POSITIVE_INFINITY;
+}
+
+function creditPkgUsagePct(p) {
+  const size = creditNum(p?.size);
+  if (size <= 0) return null;
+  return Math.max(0, Math.min(100, (creditNum(p?.used) / size) * 100));
+}
+
+function creditBusyFor(uid) {
+  return state.creditBusy.has(uid) || creditQueue.list.includes(uid);
+}
+
+// 行内「N 天内到期」小徽章：只认 earliestExpiring.daysLeft（缺失时用到期日期算）；
+// ≤3 天 warn，4–7 天 quiet，>7 天不显示。
+function creditsSoonBadge(c) {
+  const ee = c?.earliestExpiring;
+  if (!ee) return null;
+  const days = creditDaysLeft(ee.daysLeft, ee.cycleEndTime || ee.expireTime);
+  if (days == null || days > SOON_DAYS) return null;
+  const n = Math.max(1, Math.ceil(days));
+  return el("span", {
+    class: `badge credits-soon ${n <= 3 ? "badge-warn" : "badge-quiet"}`,
+    text: `${n} 天内到期`,
+    title: ee.name
+      ? `${ee.name}：${String(ee.cycleEndTime || ee.expireTime || "").trim() || "到期时间未知"}`
+      : "最近将过期的权益包",
+  });
+}
+
+function creditsCellContent(a) {
+  const uid = String(a.uid ?? "");
+  const c = a.credits;
+  const busy = creditBusyFor(uid);
+  const err = state.creditErrors.get(uid);
+  if (!c || typeof c !== "object") {
+    const errText = err ? `${err.error}${err.needRelogin ? "（需要重新登录 WorkBuddy）" : ""}` : "";
+    return [
+      el("span", { class: "credits-main credits-main-empty", text: "未查询" }),
+      el("div", { class: "credits-actions" },
+        el("button", {
+          type: "button",
+          class: "mini-btn",
+          dataset: { creditsQuery: uid },
+          text: busy ? "查询中…" : "查询",
+          disabled: busy,
+          title: busy ? "正在查询积分…" : errText || "查询该账号的积分余额（只读）",
+          onclick: () => queryCredits(uid),
+        }),
+      ),
+    ];
+  }
+  const remain = creditNum(c.remain);
+  const size = creditNum(c.size);
+  const updated = String(c.updatedIso ?? "").trim();
+  return [
+    el("span", {
+      class: "credits-main",
+      title: `剩余 ${fmtNum(remain)} / 总额度 ${fmtNum(size)}${updated ? ` · 更新于 ${updated}` : ""}`,
+    },
+      el("b", { class: "credits-remain", text: fmtNum(remain) }),
+      el("span", { class: "credits-dim", text: " / " }),
+      el("span", { class: "credits-size", text: fmtNum(size) }),
+    ),
+    el("div", { class: "credits-actions" },
+      el("button", {
+        type: "button",
+        class: "mini-btn",
+        dataset: { creditsOpen: uid },
+        text: "明细",
+        title: `查看积分明细${updated ? `（数据更新于 ${updated}）` : ""}`,
+        onclick: () => openCreditsDialog(uid),
+      }),
+      creditsSoonBadge(c),
+    ),
+  ];
+}
+
+function creditsCell(a) {
+  const uid = String(a.uid ?? "");
+  return el(
+    "div",
+    { class: "acct-cell acct-credits", dataset: { label: "积分", creditsCell: uid } },
+    ...creditsCellContent(a),
+  );
+}
+
+// 只重绘积分列（不整页 renderAccounts），避免轮询/查询时打断任务勾选与展开状态。
+function updateCreditsCell(uid) {
+  const cell = $(`[data-credits-cell="${uid}"]`);
+  if (!cell) return;
+  const acct = accountByUid(uid);
+  if (!acct) return;
+  cell.replaceChildren(...creditsCellContent(acct));
+}
+
+function applyCredits(uid, credits, nickname) {
+  const acct = accountByUid(uid);
+  if (acct) {
+    acct.credits = credits;
+    if (nickname && !acct.nickname) acct.nickname = String(nickname);
+  }
+  if (credits && typeof credits === "object") creditCache.set(uid, credits);
+  state.creditErrors.delete(uid);
+  updateCreditsCell(uid);
+  if (creditsDialog.uid === uid && $("#creditsDialog")?.open) {
+    creditsDialog.credits = credits;
+    renderCreditsDialog();
+  }
+}
+
+// 统一把 HTTP 错误 / 200 里的 ok:false 转成可渲染的结果；绝不抛给调用方。
+async function requestCredits(uid, refresh = false) {
+  try {
+    const d = await api("api/credits", { params: { uid, refresh: refresh ? 1 : 0 } });
+    if (d && d.ok && d.credits && typeof d.credits === "object") {
+      return { ok: true, credits: d.credits, nickname: d.nickname };
+    }
+    if (d && d.ok === false) {
+      return {
+        ok: false,
+        kind: "upstream",
+        error: String(d.error || "上游查询失败"),
+        needRelogin: !!d.needRelogin,
+        nickname: d.nickname,
+      };
+    }
+    return { ok: false, kind: "bad", error: "返回数据不完整（缺少 credits）" };
+  } catch (e) {
+    if (e instanceof ApiError) {
+      if (e.status === 409) return { ok: false, kind: "busy", error: "批量任务运行中，稍后再查" };
+      if (e.status === 404) return { ok: false, kind: "notfound", error: "未知账号（可能已被移除）" };
+      return { ok: false, kind: "http", error: e.message || `HTTP ${e.status}` };
+    }
+    if (e && e.network) return { ok: false, kind: "network", error: "连不上守护进程" };
+    return { ok: false, kind: "error", error: String((e && e.message) || e) };
+  }
+}
+
+function toastCreditsBusy() {
+  const now = Date.now();
+  if (now - lastBusyToastAt < 6000) return; // 多个账号同时 409 时只提示一次
+  lastBusyToastAt = now;
+  toast("批量任务运行中，稍后再查", "warn", 6500);
+}
+
+// 行内查询：refresh=0（读缓存/只读查询），失败只写按钮 title，不弹错。
+async function loadCredits(uid, { refresh = false } = {}) {
+  if (state.creditBusy.has(uid)) return null;
+  state.creditBusy.add(uid);
+  updateCreditsCell(uid);
+  try {
+    const r = await requestCredits(uid, refresh);
+    if (r.ok) {
+      applyCredits(uid, r.credits, r.nickname);
+    } else {
+      state.creditErrors.set(uid, { error: r.error, needRelogin: !!r.needRelogin });
+      if (r.kind === "busy") toastCreditsBusy();
+    }
+    return r;
+  } finally {
+    state.creditBusy.delete(uid);
+    updateCreditsCell(uid);
+  }
+}
+
+function queryCredits(uid) {
+  const queued = creditQueue.list.indexOf(uid);
+  if (queued >= 0) creditQueue.list.splice(queued, 1);
+  if (state.creditBusy.has(uid)) return;
+  loadCredits(uid, { refresh: false });
+}
+
+// 页面加载后：对 credits === null 的可参与账号自动查一次（最多 2 并发）。
+// 失败不重试（creditAutoTried 记账），避免每次 /api/state 轮询都打上游。
+function autoFetchCredits() {
+  for (const a of eligibleAccounts()) {
+    const uid = String(a.uid ?? "");
+    if (!uid || a.credits != null) continue;
+    if (creditAutoTried.has(uid) || state.creditBusy.has(uid) || creditQueue.list.includes(uid)) continue;
+    creditAutoTried.add(uid);
+    creditQueue.list.push(uid);
+    updateCreditsCell(uid);
+  }
+  pumpCreditQueue();
+}
+
+function pumpCreditQueue() {
+  while (creditQueue.active < creditQueue.max && creditQueue.list.length) {
+    const uid = creditQueue.list.shift();
+    creditQueue.active++;
+    loadCredits(uid, { refresh: false }).finally(() => {
+      creditQueue.active--;
+      pumpCreditQueue();
+    });
+  }
+}
+
+// ---- 积分明细弹窗 ----------------------------------------------------------------
+
+const creditsDialog = {
+  uid: "",
+  nickname: "",
+  credits: null,
+  filter: "all",
+  sort: "expiry",
+  query: "",
+  loading: false,
+  error: "",
+  needRelogin: false,
+  req: 0, // 刷新序号：关闭/重新打开后让在途请求的结果失效
+};
+
+function creditsAllPackages() {
+  const list = creditsDialog.credits?.packages;
+  return Array.isArray(list) ? list : [];
+}
+
+function creditPkgMatchesFilter(p) {
+  const remain = creditNum(p?.remain);
+  const expired = creditsPkgExpired(p);
+  switch (creditsDialog.filter) {
+    case "remain":
+      return remain > 0;
+    case "soon": {
+      const days = creditPkgDaysLeft(p);
+      return !expired && remain > 0 && days != null && days <= SOON_DAYS;
+    }
+    case "dead":
+      return expired || remain <= 0;
+    default:
+      return true;
+  }
+}
+
+function creditPkgMatchesQuery(p, q) {
+  if (!q) return true;
+  const fields = [p?.name, p?.packageCode, p?.productName, p?.subProductName, p?.grantReason, p?.resourceId, p?.dealName];
+  return fields.some((x) => String(x ?? "").toLowerCase().includes(q));
+}
+
+function creditsFilteredPackages() {
+  const q = creditsDialog.query.trim().toLowerCase();
+  const rows = creditsAllPackages().filter((p) => creditPkgMatchesFilter(p) && creditPkgMatchesQuery(p, q));
+  if (creditsDialog.sort === "remain") rows.sort((a, b) => creditNum(b.remain) - creditNum(a.remain));
+  else if (creditsDialog.sort === "used") rows.sort((a, b) => creditNum(b.used) - creditNum(a.used));
+  else if (creditsDialog.sort === "size") rows.sort((a, b) => creditNum(b.size) - creditNum(a.size));
+  else {
+    rows.sort(
+      (a, b) =>
+        creditPkgExpiryTs(a) - creditPkgExpiryTs(b) ||
+        creditNum(b.remain) - creditNum(a.remain),
+    );
+  }
+  return rows;
+}
+
+function creditsPkgRow(p) {
+  const remain = creditNum(p?.remain);
+  const size = creditNum(p?.size);
+  const used = creditNum(p?.used);
+  const expired = creditsPkgExpired(p);
+  const days = creditPkgDaysLeft(p);
+
+  const name = String(p?.name ?? "").trim() || "（未命名套餐）";
+  const source = [p?.productName, p?.subProductName]
+    .map((x) => String(x ?? "").trim())
+    .filter((x) => x && x !== name);
+  const sourceText = [...new Set(source)].join(" · ");
+  const code = String(p?.packageCode ?? "").trim();
+  const grant = String(p?.grantReason ?? "").trim();
+
+  let expiryText;
+  let expiryCls;
+  if (p?.noExpiry) {
+    expiryText = "长期有效";
+    expiryCls = "badge-quiet";
+  } else if (expired) {
+    expiryText = "已过期";
+    expiryCls = "badge-warn";
+  } else if (days != null) {
+    const n = Math.max(0, Math.ceil(days));
+    expiryText = `剩 ${n} 天`;
+    expiryCls = n <= 3 ? "badge-warn" : n <= SOON_DAYS ? "badge-quiet" : "";
+  } else {
+    expiryText = "有效期未知";
+    expiryCls = "badge-quiet";
+  }
+
+  const expireTime = String(p?.expireTime ?? "").trim();
+  const createTime = String(p?.createTime ?? "").trim();
+  const pct = creditPkgUsagePct(p);
+
+  return el(
+    "tr",
+    {},
+    el("td", { dataset: { label: "套餐包" } },
+      el("span", {
+        class: "credits-pkg-main",
+        text: name,
+        title: String(p?.resourceId ?? "").trim() || undefined,
+      }),
+      sourceText ? el("span", { class: "credits-pkg-sub", text: sourceText }) : null,
+      code ? el("span", { class: "credits-pkg-sub", text: code }) : null,
+      grant ? el("span", { class: "credits-pkg-note", text: grant }) : null,
+    ),
+    el("td", { dataset: { label: "有效期" } },
+      el("span", { class: `badge ${expiryCls}`.trim(), text: expiryText }),
+      expireTime ? el("span", { class: "credits-exp-main", text: `到期 ${expireTime}` }) : null,
+      createTime ? el("span", { class: "credits-exp-sub", text: `创建 ${createTime}` }) : null,
+    ),
+    el("td", { class: "num", text: fmtNum(size) }),
+    el("td", { class: "num", text: fmtNum(used) }),
+    el("td", {
+      class: `num credits-remain-cell${remain <= 0 ? " credits-zero" : ""}`,
+      text: fmtNum(remain),
+    }),
+    el("td", { dataset: { label: "利用率" } },
+      pct == null
+        ? el("span", { class: "credits-mini-text", text: "—" })
+        : el("span", { class: "credits-mini" },
+            el("span", { class: "credits-mini-bar", "aria-hidden": "true" },
+              el("span", { class: "credits-mini-fill", style: { width: `${pct}%` } }),
+            ),
+            el("span", { class: "credits-mini-text", text: fmtPctNum(pct) }),
+          ),
+    ),
+  );
+}
+
+function renderCreditsPkgs() {
+  const tbody = $("#creditsPkgRows");
+  if (!tbody) return;
+  const rows = creditsFilteredPackages();
+  tbody.replaceChildren(...rows.map(creditsPkgRow));
+  const table = $("#creditsTable");
+  const empty = $("#creditsEmpty");
+  if (table) table.hidden = rows.length === 0;
+  if (empty) empty.hidden = rows.length !== 0;
+}
+
+function creditsMetricCard(label, value, sub, valueCls) {
+  return el("div", { class: "credits-metric" },
+    el("span", { class: "credits-metric-l", text: label }),
+    el("span", { class: valueCls ? `credits-metric-v ${valueCls}` : "credits-metric-v", text: String(value) }),
+    sub ? el("span", { class: "credits-metric-sub", text: sub }) : null,
+  );
+}
+
+function renderCreditsMetrics(c) {
+  const box = $("#creditsMetrics");
+  if (!box) return;
+  const cards = [
+    creditsMetricCard("剩余可用积分", fmtNum(creditNum(c.remain)), "当前可用", "is-remain"),
+    creditsMetricCard("已消耗积分", fmtNum(creditNum(c.used)), "累计消耗"),
+    creditsMetricCard("总额度容量", fmtNum(creditNum(c.size)), "全部权益包合计"),
+  ];
+  const ee = c.earliestExpiring;
+  if (!ee) {
+    cards.push(creditsMetricCard("最近将过期", "无", "没有即将到期的权益包", "is-muted"));
+  } else {
+    const days = creditDaysLeft(ee.daysLeft, ee.cycleEndTime || ee.expireTime);
+    const n = days == null ? null : Math.max(1, Math.ceil(days));
+    const date = fmtMonthDay(ee.cycleEndTime || ee.expireTime);
+    const sub = [date ? `${date} 到期` : "", `${fmtNum(creditNum(ee.remain))} 积分`].filter(Boolean).join(" · ");
+    cards.push(creditsMetricCard("最近将过期", n == null ? "即将到期" : `剩 ${n} 天`, sub));
+  }
+  box.replaceChildren(...cards);
+}
+
+function renderCreditsUsage(c) {
+  const box = $("#creditsUsage");
+  if (!box) return;
+  const pct = creditUsagePct(c);
+  const text = creditUsageText(c);
+  const updated = String(c.updatedIso ?? "").trim() || "—";
+  box.replaceChildren(
+    el("div", { class: "credits-usage-row" },
+      el("div", {
+        class: "credits-bar",
+        role: "progressbar",
+        "aria-valuemin": "0",
+        "aria-valuemax": "100",
+        "aria-valuenow": String(Math.round(pct)),
+        "aria-label": `额度利用率 ${text}`,
+        title: `已消耗 ${fmtNum(creditNum(c.used))} / 总额度 ${fmtNum(creditNum(c.size))}`,
+      },
+        el("span", { class: "credits-bar-fill", style: { width: `${pct}%` } }),
+      ),
+      el("div", { class: "credits-usage-meta" },
+        el("span", { class: "credits-usage-pct", text: `额度利用率: ${text}` }),
+        el("span", { text: `更新时间: ${updated}` }),
+      ),
+    ),
+  );
+}
+
+function renderCreditsStatus() {
+  const box = $("#creditsStatus");
+  if (!box) return;
+  let text = "";
+  let cls = "credits-status";
+  if (creditsDialog.error) {
+    text = creditsDialog.error;
+    if (creditsDialog.needRelogin) text += "（需要重新登录 WorkBuddy）";
+    if (creditsDialog.credits) text = `刷新失败，显示缓存数据：${text}`;
+    cls += " credits-status-error";
+  } else if (creditsDialog.loading) {
+    text = creditsDialog.credits ? "刷新中…" : "加载中…";
+    cls += " credits-status-loading";
+  }
+  box.className = cls;
+  box.textContent = text;
+  box.hidden = !text;
+}
+
+function syncCreditsControls() {
+  for (const b of $$("[data-credits-filter]")) {
+    const on = b.dataset.creditsFilter === creditsDialog.filter;
+    b.classList.toggle("is-active", on);
+    b.setAttribute("aria-pressed", on ? "true" : "false");
+  }
+  const search = $("#creditsSearch");
+  if (search) search.value = creditsDialog.query;
+  const sort = $("#creditsSort");
+  if (sort) sort.value = creditsDialog.sort;
+}
+
+function renderCreditsDialog() {
+  const dlg = $("#creditsDialog");
+  if (!dlg) return;
+  const acct = creditsDialog.uid ? accountByUid(creditsDialog.uid) : null;
+  const nick = creditsDialog.nickname || String(acct?.nickname ?? "") || creditsDialog.uid || "账号";
+  const c = creditsDialog.credits && typeof creditsDialog.credits === "object" ? creditsDialog.credits : null;
+
+  const title = $("#creditsTitle");
+  if (title) title.textContent = `${nick} · 积分明细`;
+
+  const badges = $("#creditsBadges");
+  if (badges) {
+    badges.replaceChildren(badge("国内版", "badge-quiet"));
+    if (c) {
+      const paid = !!c.isPaidUser || !!c.tier?.paid;
+      badges.append(badge(creditTierName(c), paid ? "badge-strong" : "badge-quiet"));
+    } else {
+      badges.append(badge("会员类型未知", "badge-quiet"));
+    }
+  }
+
+  renderCreditsStatus();
+
+  const has = !!c;
+  const metrics = $("#creditsMetrics");
+  const usage = $("#creditsUsage");
+  const filters = $("#creditsFilters");
+  const tableWrap = $("#creditsTableWrap");
+  if (metrics) metrics.hidden = !has;
+  if (usage) usage.hidden = !has;
+  if (filters) filters.hidden = !has;
+  if (tableWrap) tableWrap.hidden = !has;
+  if (has) {
+    renderCreditsMetrics(c);
+    renderCreditsUsage(c);
+    renderCreditsPkgs();
+  } else {
+    const tbody = $("#creditsPkgRows");
+    if (tbody) tbody.replaceChildren();
+  }
+
+  const refreshBtn = $("#creditsRefreshBtn");
+  if (refreshBtn) {
+    refreshBtn.disabled = creditsDialog.loading;
+    refreshBtn.textContent = creditsDialog.loading ? "刷新中…" : "刷新明细";
+  }
+}
+
+async function refreshCreditsInDialog() {
+  const uid = creditsDialog.uid;
+  if (!uid || creditsDialog.loading) return;
+  const req = ++creditsDialog.req;
+  creditsDialog.loading = true;
+  creditsDialog.error = "";
+  creditsDialog.needRelogin = false;
+  renderCreditsDialog();
+  const r = await requestCredits(uid, true);
+  // 请求期间弹窗已关闭/切换账号/发起了更新的一次刷新：丢弃本次结果。
+  if (creditsDialog.req !== req || creditsDialog.uid !== uid) return;
+  if (r.ok) applyCredits(uid, r.credits, r.nickname);
+  creditsDialog.loading = false;
+  if (r.ok) {
+    creditsDialog.credits = r.credits;
+    if (r.nickname) creditsDialog.nickname = String(r.nickname);
+    creditsDialog.error = "";
+    creditsDialog.needRelogin = false;
+  } else {
+    creditsDialog.error = r.error;
+    creditsDialog.needRelogin = !!r.needRelogin;
+    if (r.kind === "busy") toastCreditsBusy();
+  }
+  renderCreditsDialog();
+}
+
+function openCreditsDialog(uid) {
+  const acct = accountByUid(uid);
+  const dlg = $("#creditsDialog");
+  if (!acct || !dlg) return;
+  creditsDialog.uid = uid;
+  creditsDialog.nickname = String(acct.nickname || uid);
+  creditsDialog.credits =
+    acct.credits && typeof acct.credits === "object" ? acct.credits : creditCache.get(uid) ?? null;
+  creditsDialog.filter = "all";
+  creditsDialog.sort = "expiry";
+  creditsDialog.query = "";
+  creditsDialog.loading = false;
+  creditsDialog.error = "";
+  creditsDialog.needRelogin = false;
+  syncCreditsControls();
+  renderCreditsDialog();
+  if (!dlg.open) {
+    try {
+      dlg.showModal();
+    } catch {}
+  }
+  // 秒开后立刻 refresh=1 一次：缓存可能已被后端更新（与 hub 行为一致）。
+  refreshCreditsInDialog();
+}
+
+function closeCreditsDialog() {
+  const dlg = $("#creditsDialog");
+  creditsDialog.req++; // 关闭后在途刷新结果一律丢弃
+  if (dlg?.open) dlg.close();
+  creditsDialog.uid = "";
+  creditsDialog.loading = false;
+}
+
+function wireCreditsDialog() {
+  const dlg = $("#creditsDialog");
+  if (!dlg) return;
+  $("#creditsCloseBtn").addEventListener("click", closeCreditsDialog);
+  $("#creditsDoneBtn").addEventListener("click", closeCreditsDialog);
+  $("#creditsRefreshBtn").addEventListener("click", () => refreshCreditsInDialog());
+  for (const b of $$("[data-credits-filter]")) {
+    b.addEventListener("click", () => {
+      const f = b.dataset.creditsFilter;
+      if (!CREDITS_FILTERS.includes(f)) return;
+      creditsDialog.filter = f;
+      syncCreditsControls();
+      renderCreditsPkgs();
+    });
+  }
+  const search = $("#creditsSearch");
+  if (search) {
+    search.addEventListener("input", () => {
+      creditsDialog.query = search.value;
+      renderCreditsPkgs();
+    });
+  }
+  const sort = $("#creditsSort");
+  if (sort) {
+    sort.addEventListener("change", () => {
+      creditsDialog.sort = CREDITS_SORTS.includes(sort.value) ? sort.value : "expiry";
+      renderCreditsPkgs();
+    });
+  }
+  // 原生 close 事件是异步排队的：若已重新打开（快速切换账号），不要清掉新状态。
+  dlg.addEventListener("close", () => {
+    if (dlg.open) return;
+    creditsDialog.req++;
+    creditsDialog.uid = "";
+    creditsDialog.loading = false;
+  });
+  // 点遮罩关闭（内容在 .credits-body 里，点中 dialog 本身即遮罩区域）
+  dlg.addEventListener("click", (ev) => {
+    if (ev.target === dlg) closeCreditsDialog();
+  });
 }
 
 // 「批量接任务」按钮旁的常驻说明（规则 4）：勾选范围内有多少未接取项被引擎判定为
@@ -2862,8 +3540,17 @@ async function loadState({ quiet = false } = {}) {
   try {
     const d = await api("api/state");
     state.data = d;
+    // 老后端/后端并行实现期间 /api/state 可能暂时没带 credits：用本地已查到的值兜底，
+    // 避免 3s 轮询把刚查到的余额刷回「未查询」。
+    for (const a of Array.isArray(d?.accounts) ? d.accounts : []) {
+      if (a.credits == null) {
+        const cached = creditCache.get(String(a.uid ?? ""));
+        if (cached) a.credits = cached;
+      }
+    }
     if (state.conn !== "stopped") state.conn = "online";
     renderAll();
+    autoFetchCredits();
   } catch (e) {
     if (e && e.network) {
       if (state.conn !== "stopped") state.conn = "down";
@@ -2941,6 +3628,8 @@ function wireStatic() {
     state.history.page = 0;
     loadHistory();
   });
+
+  wireCreditsDialog();
 
   // 系统主题变化时（跟随系统模式下）刷新一次渲染即可（CSS 媒体查询自动换色）
   try {

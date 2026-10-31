@@ -57,9 +57,20 @@ test("runner：完整 job（两账号 × growth 腿），状态与结算", async
   }
   assert.deepEqual(done.uids ?? done.spec.uids, null);
   assert.equal(done.totals.credit, 1200);
-  assert.equal(done.totals.tasksLit, 4);
+  // 每日活跃（CONTRACT §7）在开跑前先发一条 chat 事件：litRules 里 chat_request_send
+  // 对应 first_buddy，两个账号的 first_buddy 被「每日活跃」提前点亮为 completed，
+  // growth 腿直接领奖（claimed 不变、lit 各少 1）—— 4 → 2 是预期移动，不是回归。
+  assert.equal(done.totals.tasksLit, 2);
   assert.equal(done.totals.tasksClaimed, 4);
   assert.ok(done.log.some((l) => l.includes("开始为账号")));
+  assert.ok(done.log.some((l) => l.includes("每日活跃：已上报")), done.log.join("\n"));
+  // 每日活跃打计费域且先于腿（每个账号 job 开始前的固定动作）
+  for (const be of [backendA, backendB]) {
+    const dailyCalls = be.calls.filter((c) => c.host === "www.codebuddy.cn" && c.path === "/v2/report");
+    assert.equal(dailyCalls.length, 1, "每账号一条每日活跃（同北京日首发）");
+    assert.equal(be.calls[0].path, "/v2/report", "腿的任何调用之前先发每日活跃");
+    assert.equal(be.calls[0].host, "www.codebuddy.cn");
+  }
   assert.equal(saved.length, 0, "token 未临期不刷新");
   // 两账号之间 1.5s（manual）
   const aSteps = done.steps.filter((s) => s.uid === "uid-A");

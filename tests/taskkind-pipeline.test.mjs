@@ -139,7 +139,7 @@ test("流水线：19 项真实形态 + 1 项未收录 —— 接取批次 codes 
     "wb_wechat_oa_subscribe_task", // unforgeable
     "brand_new_task", // 未收录且派生不出
     "first_buddy", // auto
-    "Library_read", // accepted（状态挡）
+    "Library_read", // accepted（状态挡；点亮走 web 点击，不走接取）
     "Buddy_App", // accepted（状态挡）
     "chat_5", // claimed（状态挡）
   ]) {
@@ -152,7 +152,7 @@ test("流水线：19 项真实形态 + 1 项未收录 —— 接取批次 codes 
   assert.ok(!backend.state.claims.includes("brand_new_task"));
   assert.ok(!backend.state.claims.includes("wb_wechat_oa_subscribe_task"));
 
-  // 点亮阶段上报的专家事件：5 个 id 全部钉对（Valorant 钉死常量 + 4 个派生），
+  // 点亮阶段上报的事件：5 个专家 id 全部钉对（Valorant 钉死常量 + 4 个派生），
   // 没有任何池子通用 id 混进来。
   const expertEvents = backend.state.reports.filter((e) => e.eventCode === "expert_actual_use");
   assert.deepEqual(
@@ -175,10 +175,19 @@ test("流水线：19 项真实形态 + 1 项未收录 —— 接取批次 codes 
     assert.equal(e.expertType, "agent");
     assert.ok(e.userId);
   }
-  // 未收录/桌面端/unforgeable/claimed 的任务零上报
+  // 未收录/unforgeable/claimed 的任务零上报；Library_read（accepted）改走 web
+  // 点击事件点亮（reportLibraryEvent），是 5 个专家事件之外唯一的一条 —— 详见
+  // tests/library-webclick.test.mjs 的逐字段断言。
   assert.equal(expertEvents.length, 5);
-  assert.equal(backend.state.reports.length, 5, "除 5 个专家事件外没有任何其它伪造事件");
-  // 没进度就不硬闯：领奖全部顺延
+  const libEvents = backend.state.reports.filter((e) => e.eventCode === "web_element_click");
+  assert.equal(libEvents.length, 1, "Library_read 恰好发一条 web 点击事件");
+  assert.equal(libEvents[0].elementId, "library_doc_intro_click");
+  assert.equal(backend.state.reports.length, 6, "除 5 个专家事件 + 1 条资料库 web 点击外没有其它伪造事件");
+  // Library_read 的事件打 web 域（www.workbuddy.cn/v2/report），不是 chat 域
+  const libReportCall = backend.calls.find((c) => c.path === "/v2/report" && String(c.body?.[0]?.eventCode) === "web_element_click");
+  assert.ok(libReportCall, "web 点击事件确有发出");
+  assert.equal(libReportCall.host, "www.workbuddy.cn", "Library_read 事件必须打 web 域");
+  // 没进度就不硬闯：领奖全部顺延（litRules 为空，web 点击也不推进）
   assert.equal(backend.state.claims.length, 0);
   assert.ok(text.includes("领奖顺延到下次运行"));
 });

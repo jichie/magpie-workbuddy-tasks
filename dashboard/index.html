@@ -150,6 +150,7 @@
           <span class="acct-cell head-label">账号</span>
           <span class="acct-cell head-label">凭据</span>
           <span class="acct-cell head-label">任务</span>
+          <span class="acct-cell head-label">积分</span>
           <span class="acct-cell head-label center">参与</span>
           <span class="acct-cell head-label right">操作</span>
         </div>
@@ -311,6 +312,74 @@
   </footer>
 
   <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+
+  <!-- 积分明细对话框：数据只来自 GET /api/credits（账号行「明细」打开时先渲染
+       /api/state 里的 credits 缓存，再自动 refresh=1 刷新一次）。
+       结构和 #cmdDialog 一样用原生 <dialog> + dialog::backdrop，暗色主题共用变量。 -->
+  <dialog id="creditsDialog" class="credits-dialog" aria-labelledby="creditsTitle">
+    <div class="credits-body">
+      <header class="credits-head">
+        <div class="credits-head-main">
+          <h2 class="dialog-title" id="creditsTitle">积分明细</h2>
+          <div class="credits-badges" id="creditsBadges"></div>
+        </div>
+        <button type="button" class="icon-btn credits-close" id="creditsCloseBtn" aria-label="关闭积分明细" title="关闭">×</button>
+      </header>
+
+      <div class="credits-scroll">
+        <p class="credits-status" id="creditsStatus" role="status" aria-live="polite" hidden></p>
+
+        <div class="credits-metrics" id="creditsMetrics" hidden></div>
+
+        <div class="credits-usage" id="creditsUsage" hidden></div>
+
+        <div class="credits-filters" id="creditsFilters" hidden>
+          <div class="credits-filter-row">
+            <div class="credits-filter-tabs" role="group" aria-label="套餐筛选">
+              <button type="button" class="credits-filter is-active" data-credits-filter="all" aria-pressed="true">全部</button>
+              <button type="button" class="credits-filter" data-credits-filter="remain" aria-pressed="false">有剩余</button>
+              <button type="button" class="credits-filter" data-credits-filter="soon" aria-pressed="false">即将到期</button>
+              <button type="button" class="credits-filter" data-credits-filter="dead" aria-pressed="false">已用完/过期</button>
+            </div>
+            <div class="credits-filter-tools">
+              <input class="input credits-search" id="creditsSearch" type="search"
+                placeholder="搜索包名 / 代码 / 来源 / resourceId" aria-label="搜索套餐包" autocomplete="off">
+              <select class="input credits-sort" id="creditsSort" aria-label="套餐排序">
+                <option value="expiry">最快到期优先</option>
+                <option value="remain">剩余额度最大</option>
+                <option value="used">已用额度最多</option>
+                <option value="size">总容量最大</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div class="credits-table-wrap" id="creditsTableWrap" hidden>
+          <table class="tbl credits-tbl" id="creditsTable">
+            <thead>
+              <tr>
+                <th>套餐包 / 来源与属性</th>
+                <th>到期倒计时 / 有效期</th>
+                <th class="num">总额度</th>
+                <th class="num">已用</th>
+                <th class="num">剩余可用</th>
+                <th>利用率</th>
+              </tr>
+            </thead>
+            <tbody id="creditsPkgRows"></tbody>
+          </table>
+          <p class="credits-empty" id="creditsEmpty" hidden>无符合条件的套餐权益包</p>
+        </div>
+      </div>
+
+      <footer class="credits-foot">
+        <div class="dialog-actions">
+          <button type="button" class="ghost-btn" id="creditsRefreshBtn">刷新明细</button>
+          <button type="button" class="btn" id="creditsDoneBtn">关闭</button>
+        </div>
+      </footer>
+    </div>
+  </dialog>
 
   <!-- 启动命令对话框 -->
   <dialog id="cmdDialog" aria-labelledby="cmdDlgTitle">

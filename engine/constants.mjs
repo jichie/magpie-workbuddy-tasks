@@ -104,14 +104,23 @@ export const TASK_SPECS = {
 
 // ---- 逆向修复常量（2026-09 实测校准）----------------------------------------
 // 这些任务上游只认桌面客户端的真实行为信号（jump_url 均为 workbuddy:// 深链，
-// 需要真实点击进入对应页面）。伪造 /v2/report 事件会被忽略或落到 heartbeat，
-// 进度永远是 0/1，claim 必然返回 400 "task not completed"。诚实地跳过并给出深链。
+// 需要真实点击进入对应页面）。伪造 chat 域 /v2/report 事件会被忽略或落到
+// heartbeat，进度永远是 0/1，claim 必然返回 400 "task not completed"。诚实地
+// 跳过并给出深链。
+// 注：Library_read 曾在此列（生产两账号长期「已接取 0/1」）——后经参考实现
+// 证实它可以由 web 端的一次元素点击事件点亮（web_element_click，见
+// tasks.reportLibraryEvent），已移出本表（TASK_SPECS 的 kind:"library" 接管）。
 export const DESKTOP_ONLY_TASKS = {
   RichMeow_Chat: "在桌面端发起 1 次对话",
-  Library_read: "在桌面端打开「资料库」并读完介绍文档",
   Buddy_App: "在桌面端左上角「发现应用」进入任意一个 Buddy 应用",
   Buddy_App_QQ: "在桌面端「发现应用」进入「企鹅教师助手」",
 };
+
+// Library_read（浏览资料库）的点亮事件（wb_tasks.report_web_library 同源）：
+// 打开资料库介绍文档后，web 端向 web 域 /v2/report 发一条 web_element_click。
+export const LIBRARY_DOC_URL = "https://www.workbuddy.cn/space/d/o0KWYeynteVv06UnAZqIFm";
+export const LIBRARY_ELEMENT_ID = "library_doc_intro_click";
+export const LIBRARY_ELEMENT_NAME = "WorkBuddy资料库介绍";
 
 // 夜猫子任务只在 23:00-08:00 上报才计数，且每天 1 次、累计 3 天。
 export const NIGHT_TASK_CODES = new Set(["black_cat"]);

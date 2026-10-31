@@ -146,6 +146,22 @@ export function headersFor(acct, kind, ids = {}, opts = {}) {
   return identity.chatHeaders(acct, ids, opts);
 }
 
+// mergeInitHeaders(base, extra)：把 init.headers 的自定义头按「大小写敏感覆盖」
+// 合并进 kind 决定的头族（web 点击事件等场景要改写 Referer / User-Agent /
+// X-User-Id）。唯一的例外是凭据头 Authorization：无论调用方用什么大小写写它，
+// 都会被剥掉、保留 base 里的 Bearer token —— 自定义头是引擎内部的构建细节，
+// 绝不能成为 token 被顶替/漏发的通道。
+function mergeInitHeaders(base, extra) {
+  if (!extra || typeof extra !== "object") return base;
+  const merged = { ...base };
+  for (const [k, v] of Object.entries(extra)) {
+    if (v === undefined || v === null) continue;
+    if (String(k).toLowerCase() === "authorization") continue; // 凭据头不可被覆盖
+    merged[String(k)] = String(v);
+  }
+  return merged;
+}
+
 // ---- 信封 --------------------------------------------------------------------
 function parseEnvelope(text) {
   let env = {};
@@ -196,7 +212,9 @@ async function attempt(fetchImpl, url, method, headers, body, signal) {
 // callJSON(acct, kind, url, init, opts) -> {ok, status, code, data, msg, raw, restricted?}
 //
 // - kind: 'chat' | 'billing' | 'web'（决定头族）
-// - init: {method, body}（body 已是字符串/undefined）
+// - init: {method, body, headers?, ids?}（body 已是字符串/undefined；headers 是
+//   可选的自定义头，按大小写敏感合并进 kind 头族 —— Authorization 除外，见
+//   mergeInitHeaders）
 // - opts: {fetch, now, sleep, signal, log, leg, env, base, bases, gap, spacer, __ctx}
 // - 信封：{code, msg, data}，code===0 视为成功（2xx 且 code 0）
 // - 3 次线性退避重试，只重试「瞬时网络故障 / 5xx」（hub 的 _retryable 口径）
@@ -215,7 +233,7 @@ async function callJSONInto(acct, kind, url, init = {}, opts = {}, ctx = ctxOf(o
   const sleep = opts.sleep ?? ctx.sleep;
   const method = String(init.method || "GET").toUpperCase();
   const step = stepOf(opts, acct);
-  const headers = headersFor(acct, kind, init.ids ?? {}, opts);
+  const headers = mergeInitHeaders(headersFor(acct, kind, init.ids ?? {}, opts), init.headers);
   const body = init.body === undefined ? undefined : String(init.body);
   const signal = opts.signal ?? ctx.signal ?? undefined;
 

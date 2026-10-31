@@ -77,6 +77,10 @@ const LEGS = ["growth", "travel", "night"]
 const LEG_NAMES = { growth: "成长任务", travel: "猫猫旅行", night: "夜猫子" }
 const HISTORY_CAP = 2000
 
+// 积分缓存的有效期（GET /api/credits，CONTRACT §3）：缓存年龄小于它且未要求
+// refresh 时直接返回缓存，绝不发上游。导出供测试对齐。
+export const CREDITS_TTL_MS = 10 * 60 * 1000
+
 // 排程小时窗口只认这两条腿（契约 §7/§8）：到点自动跑的都是无任务码、零写入
 // 风险的腿；growth 刻意不在排程里（engine/schedule.SCHEDULE_WINDOWS 同口径），
 // 只能手动发起（看板「立即运行」/ POST /api/run / 工具，可配合 codes 勾选）。
@@ -166,6 +170,7 @@ const API_ROUTE_AUTH = [
   { method: "GET", re: /^\/api\/hello$/, path: "/api/hello", note: "服务状态" },
   { method: "GET", re: /^\/api\/state$/, path: "/api/state", note: "看板状态快照" },
   { method: "GET", re: /^\/api\/history$/, path: "/api/history", note: "历史记录" },
+  { method: "GET", re: /^\/api\/credits$/, path: "/api/credits", note: "积分余额与套餐权益包明细（?uid=，?refresh=1 强制拉取）" },
   { method: "GET", re: /^\/api\/jobs\/[A-Za-z0-9_-]+$/, path: "/api/jobs/job-1", note: "job 查询" },
   { method: "GET", re: /^\/api\/events$/, path: "/api/events", note: "SSE 实时事件" },
   { method: "POST", re: /^\/api\/accounts$/, path: "/api/accounts", note: "重扫本地账号文件，无副作用" },
@@ -473,6 +478,7 @@ async function loadEngine(log) {
     ["runner", "./engine/runner.mjs"],
     ["tasks", "./engine/tasks.mjs"],
     ["upstream", "./engine/upstream.mjs"],
+    ["credits", "./engine/credits.mjs"],
   ]
   for (const [name, spec] of want) {
     try {
@@ -560,6 +566,13 @@ export async function startDaemon(opts = {}) {
   // 本插件经手 JSON 导入的 acctKey 台账（契约 §9）：magpie 整体覆写 plugin-auth.json
   // 会抹掉 importedFrom 标记，这份记录让 /api/state 的 imported 仍可用（尽力而为口径）
   const hubImportsFile = join(stateDir, "hub-imports.json")
+  // 每日活跃的幂等账本（CONTRACT §7）：uid -> 北京日键 "YYYY-MM-DD"。job 开始前
+  // runner 据此决定「每个账号每个北京日只发一条 chat 事件」，onSent 原子写回。
+  const dailyActivityFile = join(stateDir, "daily-activity.json")
+  // 积分缓存（CONTRACT §3 credits）：uid -> fetchCredits 的 credits 形状。启动
+  // 读入，损坏/非对象按 {}；成功拉取后原子写回（writeJson tmp+rename）。/api/state
+  // 与 /api/credits 的缓存命中路径只读这份缓存，绝不顺手打上游。
+  const creditsFile = join(stateDir, "credits.json")
 
   let settings = { ...DEFAULT_SETTINGS, ...readJson(settingsFile, {}) }
   // 安全默认（C1）：settings.json 缺失或损坏时 readJson 落 {}，scheduler 按
@@ -579,6 +592,14 @@ export async function startDaemon(opts = {}) {
   let tasksEnabledMap = readJson(accountsFile, {})
   let hubImports = readJson(hubImportsFile, {})
   if (!hubImports || typeof hubImports !== "object" || Array.isArray(hubImports)) hubImports = {}
+  // 每日活跃账本：文件损坏/形状不对一律按空对象起步（绝不阻断启动；顶多重发
+  // 一条每日活跃事件，上游按北京日幂等，无害）。
+  let dailyActivity = readJson(dailyActivityFile, {})
+  if (!dailyActivity || typeof dailyActivity !== "object" || Array.isArray(dailyActivity)) dailyActivity = {}
+  // 积分缓存：文件损坏/形状不对一律按空对象起步（绝不阻断启动；顶多下一次
+  // GET /api/credits 重新拉取）。
+  let creditsCache = readJson(creditsFile, {})
+  if (!creditsCache || typeof creditsCache !== "object" || Array.isArray(creditsCache)) creditsCache = {}
 
   function readSettings() {
     return JSON.parse(JSON.stringify(settings))
@@ -589,6 +610,8 @@ export async function startDaemon(opts = {}) {
   const saveFired = () => writeJson(firedFile, fired)
   const saveAccountsState = () => writeJson(accountsFile, tasksEnabledMap)
   const saveHubImports = () => writeJson(hubImportsFile, hubImports)
+  const saveDailyActivity = () => writeJson(dailyActivityFile, dailyActivity)
+  const saveCredits = () => writeJson(creditsFile, creditsCache)
 
   if (!existsSync(settingsFile)) saveSettings()
 
@@ -627,6 +650,15 @@ export async function startDaemon(opts = {}) {
     // settings 动态读取（getter：spread 进 legOpts 时取当前值，改设置对下一个 job 生效）
     get gap() {
       return settings.gapMs
+    },
+    // 每日活跃（CONTRACT §7）：幂等账本与落盘回调交给 runner —— runner 在每个
+    // 账号开跑前调 engine/daily.reportDailyActivity，成功经 onDailySent 原子写回
+    // state/daily-activity.json（writeJson 的 tmp+rename 原语），重启后同一天
+    // 不再重发。写盘失败只少一份持久化（顶多下次 job 重发一条，上游幂等）。
+    dailySentMap: dailyActivity,
+    onDailySent: (uid, key) => {
+      dailyActivity[uid] = key
+      saveDailyActivity()
     },
     // 铁律 4：全局节流器（上面创建的唯一实例）—— job 腿与 token 刷新的每一次
     // 上游调用都经它排队对齐，与快照刷新/手动操作共用同一份「上次放行时刻」。
@@ -1174,7 +1206,69 @@ export async function startDaemon(opts = {}) {
     return out
   }
 
+  // ---- 积分余额（GET /api/credits，CONTRACT §3）---------------------------
+  // engine/credits.fetchCredits 的只读封装 + state/credits.json 缓存。
+  // 节流：不用 manualOp 包裹（manualOp 的 409 口径太粗）——
+  //   · 缓存新鲜且未强制 refresh → 直接回缓存，一次上游都不发；
+  //   · 要拉取时 job 在跑（或已在拉取中）→ 409 busy，避免跟 job 抢节流窗口；
+  //     但「有缓存且未 refresh」时仍直接回缓存（哪怕已过期）——展示优先；
+  //   · 真拉取走 engineOpts()（唯一 spacer/fetch/gap），engine 内部每次调用前
+  //     breathe + 经全局节流器排队，≥1s 的铁律 4 照常成立。
+  let creditsBusy = false
+
+  async function fetchCreditsForUid(uid, force = false) {
+    // 可参与口径与 eligibleAccounts 一致：找不到 / API key / 企业号 / 已停用
+    // 一律 404（intl 账号在 accountByUid 里就已经是「找不到」）。
+    const acct = accountByUid(uid)
+    if (!acct || acct.isApiKey || acct.enterpriseId || acct.tasksEnabled === false) {
+      return { status: 404, body: { error: `找不到可参与任务的国内版账号：${uid}` } }
+    }
+    const nickname = acct.nickname || acct.accountId || uid
+    const cached = cachedCreditsOf(uid)
+    const fresh =
+      !!cached && Number(cached.updatedAt) > 0 && now() - Number(cached.updatedAt) < CREDITS_TTL_MS
+    if (cached && !force && fresh) {
+      return { status: 200, body: { ok: true, uid, nickname, credits: cached } }
+    }
+    if (runner?.current() || creditsBusy) {
+      if (cached && !force) return { status: 200, body: { ok: true, uid, nickname, credits: cached } }
+      return { status: 409, body: { error: "busy" } }
+    }
+    const fn = engine?.credits?.fetchCredits
+    if (typeof fn !== "function") {
+      return { status: 503, body: { error: engineErrorsText() } }
+    }
+    creditsBusy = true
+    try {
+      const r = await fn(acct, engineOpts())
+      if (r?.ok && r?.credits && typeof r.credits === "object") {
+        creditsCache[uid] = r.credits
+        saveCredits()
+        // 可选实时事件（前端不依赖；SSE 订阅方可以借此刷新积分卡片）
+        broadcast({ kind: "credits", uid })
+        return { status: 200, body: { ok: true, uid, nickname, credits: r.credits } }
+      }
+      // 上游失败：200 + ok:false，错误文本过 scrub；旧缓存原样保留并一并带回。
+      const body = { ok: false, uid, nickname, error: scrub(String(r?.error || r?.msg || "积分拉取失败")) }
+      if (r?.needRelogin) body.needRelogin = true
+      if (cached) body.credits = cached
+      return { status: 200, body }
+    } catch (e) {
+      const body = { ok: false, uid, nickname, error: shortErr(e) }
+      if (cached) body.credits = cached
+      return { status: 200, body }
+    } finally {
+      creditsBusy = false
+    }
+  }
+
   // ---- /api/state ----------------------------------------------------------
+
+  // 积分缓存的单条读取：形状不对（手改坏文件）视作没有，绝不下发垃圾。
+  function cachedCreditsOf(uid) {
+    const c = creditsCache[uid]
+    return c && typeof c === "object" && !Array.isArray(c) ? c : null
+  }
 
   function accountRow(a) {
     const exp = Number(a.expires) || 0
@@ -1198,6 +1292,9 @@ export async function startDaemon(opts = {}) {
       eligible:
         a.provider === "workbuddy" && !a.isApiKey && !a.enterpriseId && a.tasksEnabled !== false,
       snapshot: snap,
+      // 积分缓存只读投影（CONTRACT §3）：绝不在这里打上游 —— 看板渲染 剩余/总额
+      // 与明细弹窗的数据源；没拉过就是 null。
+      credits: cachedCreditsOf(a.uid),
     }
   }
 
@@ -1510,6 +1607,18 @@ export async function startDaemon(opts = {}) {
         await refreshSnapshots(uids, 12000)
       }
       json(res, 200, statePayload(req.headers?.host))
+      return
+    }
+
+    if (p === "/api/credits" && req.method === "GET") {
+      const uid = String(u.searchParams.get("uid") ?? "").trim()
+      if (!uid) {
+        json(res, 400, { error: "需要 uid" })
+        return
+      }
+      // refresh=1/true/yes：无视 TTL 强制拉取（job 在跑时仍 409，见 fetchCreditsForUid）
+      const r = await fetchCreditsForUid(uid, isTruthyParam(u.searchParams.get("refresh")))
+      json(res, r.status, r.body)
       return
     }
 

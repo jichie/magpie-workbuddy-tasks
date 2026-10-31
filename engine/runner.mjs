@@ -1,5 +1,7 @@
 // runner.mjs —— 跨账号批量编排：job 状态与日志、全局并发闸门、风控冷却
 //（holds）、token 临期刷新 + 原子回写（CONTRACT §2 runner 部分、铁律 3/4）。
+// 每个账号开跑之前先做一次「每日活跃」上报（engine/daily.mjs，点亮成长中心
+// 连登；幂等键 uid→北京日，失败只记日志不阻断腿）。
 //
 // 同一时刻只允许 1 个 job（current() 全局闸门；第二个 start() 抛 409）。
 // 账号与账号之间按 trigger 间隔（manual 1.5 s / schedule 2–5 s 抖动，见
@@ -8,6 +10,7 @@
 // growth 腿生效。stop() 只在步骤边界生效（abort 信号在腿/账号之间检查）。
 
 import { DEFAULT_GAP_MS, REFRESH_LEAD_MS, RESTRICTED_COOLDOWN_MS } from "./constants.mjs";
+import { reportDailyActivity } from "./daily.mjs"; // 每日活跃（点亮成长中心连登，CONTRACT §7）
 import { uuidHex } from "./fingerprint.mjs";
 import { accountGapMs } from "./schedule.mjs";
 import { eligibleAccounts } from "./store.mjs";
@@ -58,7 +61,7 @@ function normalizeSpec(spec = {}) {
 
 export class JobRunner {
   // opts: {accounts?, loadAccounts?, saveRefresh?, fetch?, now?, sleep?, rand?,
-  //        gap?, base?, bases?, env?}
+  //        gap?, base?, bases?, env?, spacer?, dailySentMap?, onDailySent?}
   constructor(opts = {}) {
     this.opts = opts;
     this.jobs = new Map();
@@ -66,6 +69,13 @@ export class JobRunner {
     this._ctrls = new Map();
     this._holds = new Map(); // uid -> 解除时刻 ms
     this._seq = 0;
+    // 每日活跃的幂等账本（uid -> 北京日键）：daemon 从 state/daily-activity.json
+    // 读入同一份对象并经 onDailySent 原子写回；未注入时用实例内存账本（同一
+    // runner 的多个 job 之间仍然幂等），跨进程重启的幂等由 daemon 负责。
+    this.dailySentMap =
+      opts.dailySentMap && typeof opts.dailySentMap === "object" && !Array.isArray(opts.dailySentMap)
+        ? opts.dailySentMap
+        : {};
   }
 
   _now() {
@@ -258,6 +268,38 @@ export class JobRunner {
       };
 
       await this._maybeRefresh(acct, job, logFn);
+
+      // 每日活跃（CONTRACT §7）：每个账号每个北京日一条 chat 事件（计费域），
+      // 点亮成长中心连登。无论本 job 跑哪些腿都先打这一条；跳过/失败只记日志，
+      // 绝不阻断后面的腿，更不让 job 失败。上游调用经 reportEvents → 全局节流器
+      //（spacer 注入见下），与腿内调用同一条红线。
+      {
+        const daily = await reportDailyActivity(acct, {
+          now: this.opts.now,
+          sleep: this.opts.sleep,
+          fetch: this.opts.fetch,
+          env: this.opts.env,
+          base: this.opts.base,
+          bases: this.opts.bases,
+          gap: this.opts.gap,
+          signal: ctrl.signal,
+          log: logFn,
+          leg: "daily",
+          // 铁律 4：每日活跃也是上游调用 —— 带上全局节流器（daemon 注入的
+          // 唯一实例），与 job 腿/刷新/快照/手动操作共用「上次放行时刻」。
+          ...(this.opts.spacer ? { spacer: this.opts.spacer } : {}),
+          // 幂等账本与落盘回调（daemon 注入；未注入时用实例内存账本）
+          sentMap: this.dailySentMap,
+          ...(typeof this.opts.onDailySent === "function" ? { onSent: this.opts.onDailySent } : {}),
+        });
+        if (daily.sent) {
+          job.log.push(`· [${acct.uid}] 每日活跃：已上报（${daily.key}）`);
+        } else if (daily.skipped) {
+          job.log.push(`· [${acct.uid}] 每日活跃：今日已报过（${daily.key}），跳过`);
+        } else {
+          job.log.push(`! [${acct.uid}] 每日活跃：上报失败：${daily.error || "未知原因"}（继续跑腿）`);
+        }
+      }
 
       for (const leg of job.spec.legs) {
         if (ctrl.signal.aborted) break;
