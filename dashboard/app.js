@@ -120,6 +120,27 @@ function el(tag, props, ...kids) {
   return node;
 }
 
+// SVG 版本：进度条用 <svg> + shape-rendering="crispEdges" 让边沿对齐设备像素，
+// 避免不同行的小数 y 坐标导致同一 4px 高度光栅化成 5/6 设备像素。
+function svgEl(tag, props, ...kids) {
+  const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  if (props) {
+    for (const [k, v] of Object.entries(props)) {
+      if (v == null || v === false) continue;
+      if (k === "class") node.setAttribute("class", v);
+      else if (k === "text") node.textContent = String(v);
+      else if (k === "style" && typeof v === "object") Object.assign(node.style, v);
+      else if (v === true) node.setAttribute(k, "");
+      else node.setAttribute(k, String(v));
+    }
+  }
+  for (const kid of kids.flat(Infinity)) {
+    if (kid == null || kid === false) continue;
+    node.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
+  }
+  return node;
+}
+
 // ---- 格式化 ---------------------------------------------------------------------
 
 function toDate(v) {
@@ -1229,8 +1250,8 @@ function accountRow(a) {
     },
     el("span", { class: "acct-prog-main", text: c ? `已领奖 ${c.claimed} / ${c.total}` : "无快照" }),
     c
-      ? el(
-          "span",
+      ? svgEl(
+          "svg",
           {
             class: "acct-bar",
             role: "progressbar",
@@ -1238,8 +1259,29 @@ function accountRow(a) {
             "aria-valuemax": String(c.total),
             "aria-valuenow": String(c.claimed),
             "aria-label": `已领奖 ${c.claimed} / ${c.total}`,
+            width: "100%",
+            height: "4",
+            "shape-rendering": "crispEdges",
           },
-          el("span", { class: "acct-bar-fill", style: { width: `${claimedPct}%` } }),
+          svgEl("rect", {
+            class: "acct-bar-track",
+            x: "0",
+            y: "0",
+            width: "100%",
+            height: "100%",
+            rx: "2",
+            ry: "2",
+          }),
+          svgEl("rect", {
+            class: "acct-bar-fill",
+            x: "0",
+            y: "0",
+            width: `${claimedPct}%`,
+            height: "100%",
+            rx: "2",
+            ry: "2",
+            style: { width: `${claimedPct}%` },
+          }),
         )
       : null,
     el("span", {

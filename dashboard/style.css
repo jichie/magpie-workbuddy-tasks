@@ -740,19 +740,22 @@ input[type="radio"] { accent-color: var(--accent); width: 14px; height: 14px; ma
   color: var(--ink);
   white-space: nowrap;
 }
+/* 进度条用 SVG + crispEdges 绘制，并提升为独立合成层：
+   避免 125%/150% 缩放下因所在行的小数 y 坐标，把 4px 高的填充
+   光栅化成 5/6 设备像素不一致。 */
 .acct-bar {
+  display: block;
   width: 100%;
   max-width: 190px;
   height: 4px;
-  border-radius: 999px;
-  background: var(--surface-3);
-  overflow: hidden;
+  overflow: visible;
+  background: none;
+  border-radius: 0;
+  backface-visibility: hidden;
 }
+.acct-bar-track { fill: var(--surface-3); }
 .acct-bar-fill {
-  display: block;
-  height: 100%;
-  border-radius: 999px;
-  background: var(--accent);
+  fill: var(--accent);
   transition: width .3s ease;
 }
 .acct-prog-sub { font-size: 11px; color: var(--ink-3); white-space: nowrap; }
