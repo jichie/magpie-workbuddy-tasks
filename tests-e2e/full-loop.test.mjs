@@ -523,7 +523,22 @@ test("/api/history 记录该轮；job 结束后自动快照回填 /api/state", a
   for (const t of snap.tasks) {
     assert.deepEqual(
       Object.keys(t).sort(),
-      ["acceptStatus", "code", "jumpUrl", "progress", "rewardCredit", "rewardEnergy", "taskType", "title"],
+      [
+        "acceptStatus",
+        "canAccept",
+        "canLight",
+        "code",
+        "desktopOnly",
+        "jumpUrl",
+        "pinnedExpertId",
+        "progress",
+        "reason",
+        "rewardCredit",
+        "rewardEnergy",
+        "taskType",
+        "title",
+        "unforgeable",
+      ],
     );
     assert.ok(typeof t.code === "string" && t.code.length > 0, `快照任务 code 非空（${t.title}）`);
     assert.ok(t.title.length > 0, "快照任务 title 非空");
@@ -533,10 +548,19 @@ test("/api/history 记录该轮；job 结束后自动快照回填 /api/state", a
     );
     assert.ok(Number.isFinite(t.rewardCredit) && t.rewardCredit > 0, "rewardCredit 非零数值");
     assert.ok(Number.isFinite(t.progress.current) && Number.isFinite(t.progress.target));
+    assert.equal(typeof t.desktopOnly, "boolean", "desktopOnly 是布尔（契约 §3）");
+    assert.equal(typeof t.canAccept, "boolean", "canAccept 是布尔（契约 §3）");
+    assert.equal(typeof t.canLight, "boolean", "canLight 是布尔（契约 §3）");
   }
   const richmeowSnap = snap.tasks.find((t) => t.title === "桌面对话事件链");
   assert.equal(richmeowSnap.jumpUrl, "workbuddy://chat", "DESKTOP_ONLY 深链必须透出");
   assert.equal(richmeowSnap.taskType, "single");
+  assert.equal(richmeowSnap.desktopOnly, true, "DESKTOP_ONLY 判断随投影下发（P0-2）");
+  assert.equal(richmeowSnap.canLight, false, "desktopOnly 不可点亮");
+  const wechatSnap = snap.tasks.find((t) => t.code === "wb_wechat_oa_subscribe_task");
+  assert.equal(wechatSnap.unforgeable, true, "unforgeable 语义沿用（公众号关注）");
+  assert.match(wechatSnap.reason, /微信/, "reason 随投影下发");
+  assert.equal(wechatSnap.canAccept, false, "unforgeable 不给接取结论");
   const fbSnap = snap.tasks.find((t) => t.code === "first_buddy");
   assert.equal(fbSnap.acceptStatus, "claimed", "auto 任务经整轮后应已领奖");
   assert.equal(fbSnap.taskType, "auto");

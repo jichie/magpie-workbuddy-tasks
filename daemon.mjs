@@ -41,6 +41,12 @@ import {
   stateDirFor,
   writeDaemonInfo,
 } from "./lifecycle.mjs"
+// 任务 → kind 解析（P0-1/P0-2）：snapTask 下发给前端的 6 个判断字段全部出自
+// engine 的这个唯一判断源（纯函数、零请求；与 engine/tasks.fetchTasks 同一口径，
+// 见 docs/CONTRACT.md §2/§3）。静态导入：taskkind.mjs 与 constants.mjs 一样是
+// 插件自带、无网络依赖的模块 —— 缺文件与 lifecycle.mjs 缺失同级（整个模块装不上），
+// 不属于 engine/* 的可选降级范畴。
+import { resolveTaskKind } from "./engine/taskkind.mjs"
 
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const VERSION = (() => {
@@ -114,6 +120,44 @@ function timingSafeEqual(a, b) {
 
 function shortErr(e) {
   return scrub(e?.message ?? String(e)).slice(0, 200)
+}
+
+// ---- 快照投影（导出供测试）-------------------------------------------------
+// engine/tasks.fetchTasks 返回的规范 Task（CONTRACT §2）到这里已经是 camelCase
+// —— 这里只做「取字段 + 数值化」，绝不再猜第二种键名拼写（否则上游改名时两种
+// 拼写会同时静默变空）。
+// P0-2：desktopOnly/unforgeable/reason/canAccept/canLight/pinnedExpertId 六个
+// 判断字段出自 engine/taskkind.resolveTaskKind（与 fetchTasks 的 unforgeable/
+// reason、流水线的接取/点亮决策同一判断源），前端据此渲染，不要再拿 jumpUrl
+// 形状自己猜（真实数据 19 项全部有非空 jumpUrl）。
+export function snapTask(t) {
+  const p = t?.progress ?? {}
+  const rk = resolveTaskKind(t)
+  return {
+    code: t?.code ?? "",
+    title: t?.title ?? "",
+    acceptStatus: t?.acceptStatus ?? "",
+    progress: { current: Number(p.current) || 0, target: Number(p.target) || 0 },
+    rewardCredit: Number(t?.rewardCredit) || 0,
+    rewardEnergy: Number(t?.rewardEnergy) || 0,
+    jumpUrl: t?.jumpUrl ?? "",
+    taskType: t?.taskType ?? "",
+    // 「需桌面端完成」（DESKTOP_ONLY_TASKS：伪造事件不推进、领奖必 400 的一族）
+    desktopOnly: rk.desktopOnly === true,
+    // 不可自动化 + 原因（spec.unforgeable 语义沿用；未收录任务也是
+    // unforgeable:true + reason:"未收录任务"）
+    unforgeable: rk.unforgeable === true,
+    reason: String(rk.reason ?? ""),
+    // 收敛结论：现在就能进「接取」（= not_accepted && 非 auto && !unforgeable，
+    // 与引擎 needsAccept 同口径）
+    canAccept: rk.canAccept === true,
+    // 收敛结论：引擎能/会用事件上报点亮（accepted，或 auto 的 not_accepted/
+    // accepted；desktopOnly / 未收录一律 false；夜间窗口不含在内）
+    canLight: rk.canLight === true,
+    // 非空 = 事件 id 钉死该专家（TASK_SPECS 钉死或 jump_url 派生）；
+    // 空串 = 不钉 id（expert/team 类走池子轮换，其它 kind 无专家 id）
+    pinnedExpertId: String(rk.pinnedExpertId ?? ""),
+  }
 }
 
 // ---- 启动参数 -----------------------------------------------------------
@@ -360,23 +404,6 @@ export async function startDaemon(opts = {}) {
   // ---- 快照（/api/state 的 tasks/energy/streak；只在闲时刷新，限流） ------
   let snapBusy = false
 
-  // 快照投影：engine/tasks.fetchTasks 返回的规范 Task（CONTRACT §2）到这里
-  // 已经是 camelCase —— 这里只做「取字段 + 数值化」，绝不再猜第二种键名拼写
-  //（否则上游改名时两种拼写会同时静默变空）。
-  function snapTask(t) {
-    const p = t?.progress ?? {}
-    return {
-      code: t?.code ?? "",
-      title: t?.title ?? "",
-      acceptStatus: t?.acceptStatus ?? "",
-      progress: { current: Number(p.current) || 0, target: Number(p.target) || 0 },
-      rewardCredit: Number(t?.rewardCredit) || 0,
-      rewardEnergy: Number(t?.rewardEnergy) || 0,
-      jumpUrl: t?.jumpUrl ?? "",
-      taskType: t?.taskType ?? "",
-    }
-  }
-
   async function refreshSnapshots(uids, budgetMs = 12000) {
     const fetchTasks = engine?.tasks?.fetchTasks
     if (typeof fetchTasks !== "function" || snapBusy) return
@@ -397,12 +424,16 @@ export async function startDaemon(opts = {}) {
           if (typeof up?.callJSON === "function" && typeof up?.growthBase === "function" && now() < deadline) {
             await sleepFn(1000) // 限速红线：两次上游调用 ≥1s
             const e = await up.callJSON(acct, "chat", `${up.growthBase()}/v2/activity/growth/energy`, {}, engineOpts())
-            // 字段口径与 engine/tasks.fetchEnergy 对齐：上游是 data.balance
-            if (e?.ok && e?.code === 0) energy = e.data?.energy ?? e.data?.balance ?? e.data?.value
+            // 字段口径与 engine/tasks.fetchEnergy 对齐（P1 实测 2026-10-31：上游
+            // 是 data.balance，data 里没有 energy/value 键）——只认这一种拼写，
+            // 不做多拼写回退链（契约 §3：daemon 只做投影，不猜第二种键名）。
+            if (e?.ok && e?.code === 0) energy = e.data?.balance ?? 0
             await sleepFn(1000)
             const s = await up.callJSON(acct, "chat", `${up.growthBase()}/activity/growth/streak`, {}, engineOpts())
-            // 字段口径与 engine/tasks.fetchGrowthSummary 对齐：data.streak.days
-            if (s?.ok && s?.code === 0) days = s.data?.days ?? s.data?.streakDays ?? s.data?.streak?.days
+            // 字段口径与 engine/tasks.fetchGrowthSummary 对齐（P1 实测 2026-10-31：
+            // data.streak.days；makeup_cards/redemption_status 同层）——data 顶层
+            // 没有 days/streakDays 键，绝不回退去猜。
+            if (s?.ok && s?.code === 0) days = s.data?.streak?.days ?? 0
           }
           snapshots[uid] = {
             tasks: (Array.isArray(tasks) ? tasks : []).map(snapTask),

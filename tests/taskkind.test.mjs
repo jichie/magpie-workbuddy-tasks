@@ -1,0 +1,238 @@
+// tests/taskkind.test.mjs —— 任务 → kind 解析层（P0-1）的单元与 fetchTasks 集成回归。
+//
+// 真实环境事实（2026-10-31 容器内只读实测，两账号一致）：
+//   - 上游每账号返回 19 项任务，其中 4 个 expert_use_* 不在 TASK_SPECS，reward
+//     50 积分 + 5 能量，jump_url 是 URL 编码的 deeplink，expertId 以 %3D 出现；
+//   - WorkBuddy_Valorant / Expert_lighthouse 的 jump_url 只有 workbuddy://expert
+//     （不含 expertId）→ 钉死常量仍是唯一来源；
+//   - not_accepted 任务的 progress 是 null。
+// 全程零真实网络（wbBackend 假后端）。
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+
+import { deriveExpertIdFromJumpUrl, expertNameFromTitle, resolveTaskKind } from "../engine/taskkind.mjs";
+import { fetchTasks } from "../engine/tasks.mjs";
+import { fakeClock, localTime, makeAcct, task, wbBackend } from "./helpers.mjs";
+
+// 真实 expert_use_* 的 jump_url 形态（URL 编码的 deeplink 查询串）。
+const jumpOf = (id) =>
+  `https://www.workbuddy.cn/work/launch/?deeplink=workbuddy%3A%2F%2Fexperts%3FexpertId%3D${id}&buddy_type=workbuddy`;
+
+test("deriveExpertIdFromJumpUrl：URL 编码的 deeplink 里解出真实专家 id", () => {
+  assert.equal(deriveExpertIdFromJumpUrl(jumpOf("ex_GDl31WahyIH0")), "ex_GDl31WahyIH0");
+  assert.equal(deriveExpertIdFromJumpUrl(jumpOf("ex_FbY5nlWTqDod")), "ex_FbY5nlWTqDod");
+  assert.equal(deriveExpertIdFromJumpUrl(jumpOf("ex_Weo3x2EZuSDm")), "ex_Weo3x2EZuSDm");
+  assert.equal(deriveExpertIdFromJumpUrl(jumpOf("ex_WZY136wV5aMt")), "ex_WZY136wV5aMt");
+  // 未编码的裸 deeplink 也认
+  assert.equal(deriveExpertIdFromJumpUrl("workbuddy://experts?expertId=ex_ABCdef123"), "ex_ABCdef123");
+  // 双重编码：解到不再变化为止
+  assert.equal(
+    deriveExpertIdFromJumpUrl(encodeURIComponent(jumpOf("ex_DoubleEnc0d"))),
+    "ex_DoubleEnc0d",
+  );
+  // 尾随参数截断正确
+  assert.equal(deriveExpertIdFromJumpUrl("workbuddy://experts?expertId=ex_X1&buddy_type=workbuddy"), "ex_X1");
+});
+
+test("deriveExpertIdFromJumpUrl：解不出的一律空串（宁可少接不错接）", () => {
+  assert.equal(deriveExpertIdFromJumpUrl(""), "");
+  assert.equal(deriveExpertIdFromJumpUrl(null), "");
+  assert.equal(deriveExpertIdFromJumpUrl("workbuddy://expert"), "", "lighthouse/Valorant 的深链不含 id");
+  assert.equal(deriveExpertIdFromJumpUrl("workbuddy://experts"), "");
+  assert.equal(deriveExpertIdFromJumpUrl("workbuddy://chat"), "");
+  assert.equal(deriveExpertIdFromJumpUrl("workbuddy://home?openBuddySwitcher=true"), "");
+  assert.equal(deriveExpertIdFromJumpUrl("https://www.workbuddy.cn/events/follow-guide/"), "");
+  // 只认 ex_ 前缀（团队 id / 随便什么值都不算专家 id）
+  assert.equal(deriveExpertIdFromJumpUrl("workbuddy://experts?expertId=CloudOpsTeam"), "");
+  assert.equal(deriveExpertIdFromJumpUrl("workbuddy://experts?expertId=ex_"), "");
+  assert.equal(deriveExpertIdFromJumpUrl("workbuddy://experts?expertid=ex_x"), "", "键名大小写敏感");
+  // 畸形编码不抛异常
+  assert.equal(deriveExpertIdFromJumpUrl("workbuddy://experts?expertId=ex_OK%ZZ"), "ex_OK");
+  assert.equal(deriveExpertIdFromJumpUrl("x".repeat(5000)), "");
+});
+
+test("expertNameFromTitle：任务标题里的「专家名」提取（事件 name/expertTitle 用）", () => {
+  assert.equal(expertNameFromTitle("体验「中国电商运营专家」"), "中国电商运营专家");
+  assert.equal(expertNameFromTitle("体验「直播电商教练」"), "直播电商教练");
+  assert.equal(expertNameFromTitle("没有引号的标题"), "没有引号的标题");
+  assert.equal(expertNameFromTitle(""), "");
+});
+
+test("resolveTaskKind：TASK_SPECS 命中优先 —— Valorant 的钉死 id 绝不被 jump_url 覆盖", () => {
+  const rk = resolveTaskKind({
+    code: "WorkBuddy_Valorant",
+    title: "体验「无畏契约拼豆专家」",
+    jumpUrl: jumpOf("ex_IMPOSTER"), // 恶意/脏数据：jump_url 里带别的 id
+    acceptStatus: "not_accepted",
+    taskType: "single",
+  });
+  assert.equal(rk.source, "spec");
+  assert.equal(rk.kind, "expert");
+  assert.equal(rk.pinnedExpertId, "ex_xQHHD1u5Jkua", "钉死常量是唯一来源（CONTRACT §7）");
+  assert.equal(rk.expertName, "无畏契约拼豆专家");
+  assert.equal(rk.unforgeable, false);
+  assert.equal(rk.desktopOnly, false);
+  assert.equal(rk.canAccept, true);
+  assert.equal(rk.canLight, false, "not_accepted 的 single 还不能点亮");
+});
+
+test("resolveTaskKind：lighthouse 的 jump_url 只有 workbuddy://expert —— 钉死常量兜底", () => {
+  const rk = resolveTaskKind({
+    code: "Expert_lighthouse",
+    title: "体验「腾讯轻量云」专家",
+    jumpUrl: "workbuddy://expert",
+    acceptStatus: "accepted",
+    taskType: "single",
+  });
+  assert.equal(rk.source, "spec");
+  assert.equal(rk.pinnedExpertId, "ex_2cvvUZQhDyeJ");
+  assert.equal(rk.canLight, true, "accepted 的 lighthouse 可点亮");
+});
+
+test("resolveTaskKind：未收录但 jump_url 派生得出 → expert 类、事件 id 钉在解析出的 id 上", () => {
+  const rk = resolveTaskKind({
+    code: "expert_use_maidehao",
+    title: "体验「中国电商运营专家」",
+    jumpUrl: jumpOf("ex_GDl31WahyIH0"),
+    acceptStatus: "accepted",
+    taskType: "single",
+  });
+  assert.equal(rk.source, "jump_url");
+  assert.equal(rk.kind, "expert", "expertType=agent（buildEvent expert 族）");
+  assert.equal(rk.spec, null);
+  assert.equal(rk.pinnedExpertId, "ex_GDl31WahyIH0");
+  assert.equal(rk.expertName, "中国电商运营专家");
+  assert.equal(rk.unforgeable, false);
+  assert.equal(rk.reason, "");
+  assert.equal(rk.desktopOnly, false);
+  assert.equal(rk.acceptible, true);
+  assert.equal(rk.lightable, true);
+  assert.equal(rk.canAccept, false, "accepted 后不再给接取结论");
+  assert.equal(rk.canLight, true);
+});
+
+test("resolveTaskKind：未收录且派生不出 → unforgeable + 未收录任务，绝不接取/点亮", () => {
+  for (const jumpUrl of ["", "workbuddy://something-new", "https://example.com/promo", jumpOf("CloudOpsTeam")]) {
+    const rk = resolveTaskKind({
+      code: "brand_new_task",
+      title: "未来新任务",
+      jumpUrl,
+      acceptStatus: "not_accepted",
+      taskType: "single",
+    });
+    assert.equal(rk.source, "none", `jumpUrl=${JSON.stringify(jumpUrl)}`);
+    assert.equal(rk.kind, null);
+    assert.equal(rk.unforgeable, true);
+    assert.equal(rk.reason, "未收录任务");
+    assert.equal(rk.acceptible, false);
+    assert.equal(rk.lightable, false);
+    assert.equal(rk.canAccept, false);
+    assert.equal(rk.canLight, false);
+    assert.equal(rk.pinnedExpertId, "");
+  }
+});
+
+test("resolveTaskKind：canAccept/canLight 状态矩阵（六类任务 × 四种上游状态）", () => {
+  const cases = {
+    // code, 构造参数, [not_accepted, accepted, completed, claimed] 的 [canAccept, canLight]
+    "普通 single（chat_5）": {
+      make: (status) => ({ code: "chat_5", jumpUrl: "workbuddy://chat", acceptStatus: status, taskType: "single" }),
+      grid: [[true, false], [false, true], [false, false], [false, false]],
+    },
+    "auto（first_buddy）": {
+      make: (status) => ({ code: "first_buddy", jumpUrl: "workbuddy://chat", acceptStatus: status, taskType: "auto" }),
+      grid: [[false, true], [false, true], [false, false], [false, false]],
+    },
+    "desktopOnly（Library_read）": {
+      make: (status) => ({ code: "Library_read", jumpUrl: "workbuddy://library", acceptStatus: status, taskType: "single" }),
+      grid: [[true, false], [false, false], [false, false], [false, false]],
+    },
+    "unforgeable（wb_wechat）": {
+      make: (status) => ({
+        code: "wb_wechat_oa_subscribe_task",
+        jumpUrl: "https://www.workbuddy.cn/events/follow-guide/",
+        acceptStatus: status,
+        taskType: "single",
+      }),
+      grid: [[false, false], [false, false], [false, false], [false, false]],
+    },
+    "派生 expert_use_*": {
+      make: (status) => ({
+        code: "expert_use_douyinyin",
+        title: "体验「抖音策略师」",
+        jumpUrl: jumpOf("ex_FbY5nlWTqDod"),
+        acceptStatus: status,
+        taskType: "single",
+      }),
+      grid: [[true, false], [false, true], [false, false], [false, false]],
+    },
+    "未收录（brand_new_task）": {
+      make: (status) => ({ code: "brand_new_task", jumpUrl: "workbuddy://future", acceptStatus: status, taskType: "single" }),
+      grid: [[false, false], [false, false], [false, false], [false, false]],
+    },
+  };
+  const statuses = ["not_accepted", "accepted", "completed", "claimed"];
+  for (const [label, { make, grid }] of Object.entries(cases)) {
+    statuses.forEach((status, i) => {
+      const rk = resolveTaskKind(make(status));
+      assert.equal(rk.canAccept, grid[i][0], `${label} @ ${status} canAccept`);
+      assert.equal(rk.canLight, grid[i][1], `${label} @ ${status} canLight`);
+    });
+  }
+  // desktopOnly 标记本身与状态无关
+  assert.equal(resolveTaskKind({ code: "Buddy_App", jumpUrl: "workbuddy://home" }).desktopOnly, true);
+  assert.equal(resolveTaskKind({ code: "RichMeow_Chat", jumpUrl: "" }).desktopOnly, true);
+  assert.equal(resolveTaskKind({ code: "Expert_Philanthropy" }).unforgeable, true, "公益捐赠沿用 unforgeable");
+  assert.equal(resolveTaskKind({ code: "Expert_team_use_3", acceptStatus: "accepted" }).pinnedExpertId, "", "team 类走池子轮换，不钉 id");
+  assert.equal(resolveTaskKind({ code: "expert_5", acceptStatus: "accepted" }).pinnedExpertId, "", "expert_5 走池子轮换，不钉 id");
+});
+
+test("fetchTasks：未收录/派生任务的 unforgeable+reason 落到规范 Task（needsAccept 的依据）", async () => {
+  const clock = fakeClock(localTime(2026, 10, 31, 10, 0));
+  const backend = wbBackend({
+    clock,
+    tasks: [
+      task("brand_new_task", { title: "未来新任务", jump_url: "workbuddy://future" }),
+      {
+        task_code: "expert_use_maidehao",
+        title: "体验「中国电商运营专家」",
+        jump_url: jumpOf("ex_GDl31WahyIH0"),
+        accept_status: "not_accepted",
+        task_type: "single",
+        reward_credit: 50,
+        reward_energy: 5,
+        progress: null, // 真实形态：not_accepted 的任务 progress 是 null
+      },
+      task("wb_wechat_oa_subscribe_task", { title: "关注官方公众号", jump_url: "https://www.workbuddy.cn/events/follow-guide/" }),
+    ],
+    litRules: {},
+  });
+  const tasks = await fetchTasks(makeAcct(), {
+    now: clock.now,
+    sleep: clock.sleep,
+    fetch: backend.fetchImpl,
+  });
+  assert.equal(tasks.length, 3);
+
+  const unknown = tasks.find((t) => t.code === "brand_new_task");
+  assert.equal(unknown.unforgeable, true, "未收录 → 引擎不接取（needsAccept 挡下）");
+  assert.equal(unknown.reason, "未收录任务");
+
+  const derived = tasks.find((t) => t.code === "expert_use_maidehao");
+  assert.equal(derived.unforgeable, false, "派生得出专家 id → 可接可点亮");
+  assert.equal(derived.reason, "");
+  assert.deepEqual(derived.progress, { current: 0, target: 1 }, "progress null → 归一为 0/1");
+  assert.equal(derived.rewardCredit, 50);
+  assert.equal(derived.rewardEnergy, 5);
+
+  const wechat = tasks.find((t) => t.code === "wb_wechat_oa_subscribe_task");
+  assert.equal(wechat.unforgeable, true, "spec.unforgeable 语义沿用");
+  assert.match(wechat.reason, /微信/);
+
+  // 规范 Task 的键集合不变（taskkind 只改 unforgeable/reason 的取值来源）
+  assert.deepEqual(Object.keys(unknown).sort(), [
+    "acceptStatus", "code", "description", "jumpUrl", "progress",
+    "reason", "rewardCredit", "rewardEnergy", "taskType", "title", "unforgeable",
+  ]);
+});

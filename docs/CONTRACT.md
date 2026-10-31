@@ -25,6 +25,8 @@ magpie-workbuddy-tasks/
     upstream.mjs         # call()：信封、重试、退避、403/11140、host 回退
     store.mjs            # plugin-auth.json 读写 + 本插件状态文件
     tasks.mjs            # 成长任务：列表/接取/上报/领奖 + run_growth_tasks 流水线
+    taskkind.mjs         # 任务 → kind 解析（P0-1）：jump_url 派生专家 id、未收录标注、
+                         # canAccept/canLight/pinnedExpertId 收敛结论（唯一判断源）
     travel.mjs           # 猫猫旅行闭环 + 夜猫子任务
     runner.mjs           # 跨账号批量编排、job 状态与日志、并发闸门
     schedule.mjs         # 小时窗口排程
@@ -88,6 +90,22 @@ reportEvents(acct, events) -> boolean
 claimTask(acct, code) -> {ok, credit, energy, via /*'chat'|'web'*/, reason}
 buildEvent(acct, kind, idx) -> object
 runGrowthTasks(acct, opts) -> GrowsResult
+
+// taskkind.mjs —— 任务 → kind 解析（fetchTasks 的 unforgeable/reason、流水线的
+// 接取/点亮决策、daemon.snapTask 的 6 个下发字段，全部出自这里的唯一判断源）
+resolveTaskKind(t) -> { source: "spec"|"jump_url"|"none", kind, spec,
+                        desktopOnly, desktopReason, unforgeable, reason,
+                        acceptible, lightable /*kind 级（不含状态）*/,
+                        canAccept, canLight /*收敛结论（含状态）*/,
+                        pinnedExpertId, expertName }
+  // 输入是规范 Task（容忍 raw 拼写）；只读 code/jumpUrl/acceptStatus/taskType/title
+  // 优先级：① TASK_SPECS 命中（钉死 id 不被 jump_url 覆盖）
+  //        ② 未命中但 jump_url 能解出 expertId=ex_… → expert 类可点亮，
+  //          事件 id 钉在解析出的 id 上（expertType=agent，沿用 expert_actual_use）
+  //        ③ 未命中且派生不出 → unforgeable:true + reason:"未收录任务"，
+  //          绝不进接取批次（防「接了一大堆却一项不亮、领奖报 task not completed」）
+deriveExpertIdFromJumpUrl(jumpUrl) -> string  // URL 解码后取 expertId=ex_…；解不出 ""
+expertNameFromTitle(title) -> string           // 任务标题「」内的专家名（事件展示字段）
   // opts: {gap=1000, claim=true, log(fn), sleep(fn), signal}
   // 阶段：auto 任务先做 → 批量接取+复查+二次补接 → 逐任务点亮(轮询进度) → 领奖
 
@@ -122,7 +140,9 @@ GET  /api/hello                 -> {name, version, ready}
 GET  /api/state                 -> {bindHost, port, reachableHint,
                                     accounts:[{uid,nickname,masked,domain,expiresInMs,expiresInDays,tasksEnabled,eligible,
                                              snapshot:{tasks:[{code,title,acceptStatus,progress:{current,target},
-                                             rewardCredit,rewardEnergy,jumpUrl,taskType}],energy,streak,days,updatedISO}}],
+                                             rewardCredit,rewardEnergy,jumpUrl,taskType,
+                                             desktopOnly,unforgeable,reason,canAccept,canLight,pinnedExpertId}],
+                                             energy,streak,days,updatedISO}}],
                                     scheduler:{enabled,nextRuns[[leg,hour]],lastCycle,
                                                holds:[{uid,nickname,releasedAt}]},
                                     job:Job|null, stats:{creditsToday,energyToday,runs},
@@ -137,6 +157,30 @@ GET  /api/state                 -> {bindHost, port, reachableHint,
                                     // 看板拿到后只存浏览器 sessionStorage，不得回显到 URL 或导出。
                                     // snapshot.tasks 的字段名 = §2 的规范 Task（daemon 只做投影，不猜第二种拼写）；
                                     // acceptStatus 是上游字符串状态（"not_accepted"|"accepted"|"completed"|"claimed"）
+                                    // P0-2 判断字段（六个都出自 engine/taskkind.resolveTaskKind，
+                                    // 与 fetchTasks 的 unforgeable/reason、流水线决策同一判断源；
+                                    // 前端据此渲染，不要再用 jumpUrl 非空猜「需桌面端完成」——
+                                    // 真实数据 19 项全部有非空 jumpUrl）：
+                                    //   desktopOnly —— DESKTOP_ONLY_TASKS 命中（RichMeow_Chat/
+                                    //     Library_read/Buddy_App/Buddy_App_QQ 这类伪造事件不推进、
+                                    //     领奖必 400 的），与 jumpUrl 形状无关
+                                    //   unforgeable / reason —— 已有语义沿用（spec.unforgeable；
+                                    //     未收录任务也是 unforgeable:true + reason:"未收录任务"）
+                                    //   canAccept —— 现在就能进「接取」= not_accepted && 非 auto
+                                    //     && !unforgeable（与引擎 needsAccept 同口径；desktopOnly
+                                    //     不挡接取，引擎会接但不点亮）
+                                    //   canLight —— 引擎能/会用事件点亮 = kind 可自动化 && 状态可
+                                    //     推进（accepted，或 auto 的 not_accepted/accepted）；
+                                    //     desktopOnly / 未收录一律 false；black_cat 的 23:00–08:00
+                                    //     夜间窗口是运行时判断，不含在内
+                                    //   pinnedExpertId —— 非空 = 事件 id 钉死该专家（TASK_SPECS 钉死
+                                    //     或 jump_url 派生）；空串 = 不钉 id（expert/team 类走池子
+                                    //     轮换，其它 kind 无专家 id）
+                                    // snapshot.energy / streak / days 的读径与 engine 同一口径
+                                    // （P1 实测 2026-10-31，两真实账号验证）：energy = data.balance
+                                    //（GET /v2/activity/growth/energy），streak/days = data.streak.days
+                                    //（GET /activity/growth/streak）；daemon 只认这一种拼写，
+                                    // 不做多拼写回退链。
                                     // scheduler.holds = 真正的风控冷却名单（403/11140），不是「没进 job 的账号」；
                                     // releasedAt 为 ISO 8601 字符串（epoch ms 由 runner.holds() 给出，这里转 ISO）
                                     // tasksEnabled 为生效值：accounts.json 显式条目 > engine/store 的
@@ -213,6 +257,28 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
 - 事件必须有 `userId`（缺了服务端 200 但静默丢弃）。
 - 进度只在**已接取**任务上累计；专家/团队事件按 `(eventCode,id)` 去重 → 必须轮换 id 池；
   `WorkBuddy_Valorant` 钉死真实 id `ex_xQHHD1u5Jkua`，`Expert_lighthouse` 钉 `ex_2cvvUZQhDyeJ`。
+- **未收录任务（P0-1）**：上游会返回 TASK_SPECS 之外的任务（2026-10-31 实测每账号
+  19 项里有 5 项不在 specs，其中 4 个 `expert_use_*` + 若干随版本漂移的 活动 任务）。
+  处理规则（engine/taskkind.resolveTaskKind，优先级从高到低）：
+  1. TASK_SPECS 命中 → 沿用 spec（`Expert_lighthouse`/`WorkBuddy_Valorant` 的 jump_url
+     只有 `workbuddy://expert`，不含 expertId —— 钉死常量仍是唯一来源，绝不被 jump_url 覆盖）；
+  2. 未命中但 `jump_url` 解出 `expertId=ex_…`（`expert_use_*` 一族：URL 编码的 deeplink
+     查询串里，如 `…launch/?deeplink=workbuddy%3A%2F%2Fexperts%3FexpertId%3Dex_GDl31WahyIH0
+     &buddy_type=workbuddy`）→ 视为 expert 类可点亮任务，**事件 id 必须钉在解析出的 id 上**
+     （上游按 `(eventCode,id)` 去重，池子里的通用 id 对它不推进进度 —— Valorant 同款坑），
+     `expertType` 用 `agent`，事件其余字段沿用 `expert_actual_use` 形状；专家名从任务
+     标题「」内提取（仅展示字段，进度只看 id）；
+  3. 未命中且派生不出 → `unforgeable:true` + `reason:"未收录任务"`：不接取、不上报、
+     不领奖，**绝不放进批量接取批次**（否则「接了一大堆却一项不亮、领奖报
+     task not completed」）；`desktopOnly`/`canAccept`/`canLight`/`pinnedExpertId`
+     随 daemon 投影下发给前端（§3）。
+- **连登/能量字段口径（P1，2026-10-31 两真实账号只读实测）**：
+  `GET /v2/activity/growth/energy` → `data.balance`（data 里另有 total_consumed/
+  total_earned，没有 energy/value 键）；
+  `GET /activity/growth/streak` → `data.streak.days`（`makeup_cards.balance`、
+  `redemption_status` 同层；data 顶层没有 days/streakDays 键）。连登为 0 是真实值
+  （`streak.days` 与 `month_total_days` 是两个字段，前者才是连登天数）。
+  daemon 快照读同一路径，不做多拼写回退链。
 - DESKTOP_ONLY 任务（`RichMeow_Chat`/`Library_read`/`Buddy_App`/`Buddy_App_QQ`）与 `unforgeable`
   （`wb_wechat_oa_subscribe_task`/`Expert_Philanthropy`）不上报、接不上，只展示 `jump_url`。
 - `first_buddy` 是 `task_type==='auto'`：不许进接取批次，必须先点亮+领奖，否则单任务接取报 `prerequisite not met`。
@@ -226,6 +292,10 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
 - 事件：每种 kind 的 `eventCode` 与必填字段逐个断言；`userId` 必在；
 - 流水线：假账号跑完整轮 → 断言「接取在未接之前」「领奖在进度到位之后」「两次上游调用间隔 ≥1000 ms」「DESKTOP_ONLY 被跳过」「auto 任务不进接取批次」；
 - 去重：`expert_5` 五个事件用 5 个不同 id；
+- kind 解析（taskkind）：jump_url 派生专家 id（编码/裸/双重编码/解不出）、TASK_SPECS
+  优先（Valorant 钉死 id 不被 jump_url 覆盖）、六类任务 × 四状态 canAccept/canLight
+  矩阵、真实形态 19 项投影全表 + 批量接取 codes 与 canAccept 逐项一致（未收录绝不进
+  批次）、快照 energy/streak 只认 data.balance / data.streak.days（毒键不误读）；
 - store：回写只改 access/refresh/expires，保留未知字段，产出合法 JSON 且权限 600；
 - runner：两个 `start()` → 第二个 409；`stop()` 能在步骤边界中止；
 - schedule：窗口判定（09:00/21:00 成长+旅行，01:00 夜猫，夜猫只认 23:00–08:00）。

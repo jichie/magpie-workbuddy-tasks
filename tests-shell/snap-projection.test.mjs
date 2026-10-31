@@ -1,0 +1,271 @@
+// tests-shell/snap-projection.test.mjs —— daemon 快照投影（P0-2）与快照字段
+// 口径（P1）的回归：
+//   1. 真实形态 19 项任务 → engine.fetchTasks → daemon.snapTask：desktopOnly /
+//      unforgeable / reason / canAccept / canLight / pinnedExpertId 全表钉死；
+//      前端从此不必拿 jumpUrl 形状自己猜（真实数据 19 项全部有非空 jumpUrl）。
+//   2. 接取后的中途状态：canLight 翻转、desktopOnly 仍为 false 不可点亮。
+//   3. refreshSnapshots 只认 data.balance / data.streak.days（P1 实测口径），
+//      上游数据里塞毒键（data.energy / data.days）也不会被误读。
+// 零真实网络：fetch 全部注入假后端 / 假引擎。
+
+import { test, describe } from "node:test"
+import assert from "node:assert/strict"
+import { mkdtempSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+
+import { snapTask, startDaemon } from "../daemon.mjs"
+import { fetchTasks } from "../engine/tasks.mjs"
+import { fakeClock, localTime, makeAcct, task, wbBackend } from "../tests/helpers.mjs"
+
+const jumpOf = (id) =>
+  `https://www.workbuddy.cn/work/launch/?deeplink=workbuddy%3A%2F%2Fexperts%3FexpertId%3D${id}&buddy_type=workbuddy`
+
+const derivedSeed = (code, title, id) => ({
+  task_code: code,
+  title,
+  description: "",
+  jump_url: jumpOf(id),
+  accept_status: "not_accepted",
+  task_type: "single",
+  reward_credit: 50,
+  reward_energy: 5,
+  progress: null, // 真实形态：not_accepted 的任务 progress 是 null
+})
+
+// 真实 19 项（与 tests/taskkind-pipeline.test.mjs 同一套种子：码/状态/奖励/深链
+// 形态来自容器内只读实测）。
+const REAL_19 = () => [
+  task("playbook_prompt", { title: "探索优秀灵感", status: "claimed", current: 1, target: 1, reward: 100, reward_energy: 5, jump_url: "workbuddy://playbook" }),
+  task("RichMeow_Chat", { title: "桌面端对话1次", status: "claimed", current: 1, target: 1, reward: 100, reward_energy: 5, jump_url: "workbuddy://chat" }),
+  task("Library_read", { title: "体验「资料库」", status: "accepted", current: 0, target: 1, reward: 100, reward_energy: 5, jump_url: "workbuddy://library" }),
+  task("Expert_lighthouse", { title: "体验「腾讯轻量云」专家", status: "claimed", current: 1, target: 1, reward: 100, reward_energy: 5, jump_url: "workbuddy://expert" }),
+  task("Hp_Appearance", { title: "体验「和平精英」主题", status: "claimed", current: 1, target: 1, reward: 100, reward_energy: 5, jump_url: "workbuddy://settings/appearance" }),
+  task("Buddy_App", { title: "体验 WorkBuddy 「发现应用」", status: "accepted", current: 0, target: 1, reward: 100, reward_energy: 5, jump_url: "workbuddy://home?openBuddySwitcher=true" }),
+  task("wb_wechat_oa_subscribe_task", { title: "关注「腾讯 WorkBuddy」官方公众号", status: "not_accepted", current: 0, target: 1, reward: 100, reward_energy: 5, jump_url: "https://www.workbuddy.cn/events/follow-guide/" }),
+  task("WorkBuddy_Valorant", { title: "体验「无畏契约拼豆专家」", status: "not_accepted", reward: 100, reward_energy: 5, jump_url: "workbuddy://expert" }),
+  derivedSeed("expert_use_maidehao", "体验「中国电商运营专家」", "ex_GDl31WahyIH0"),
+  derivedSeed("expert_use_douyinyin", "体验「抖音策略师」", "ex_FbY5nlWTqDod"),
+  derivedSeed("expert_use_shangjia_xuanchuan", "体验「商家宣传页与海报设计师」", "ex_Weo3x2EZuSDm"),
+  derivedSeed("expert_use_bowangwang", "体验「直播电商教练」", "ex_WZY136wV5aMt"),
+  task("Expert_team_use_3", { title: "召唤 3 次专家团", status: "claimed", current: 3, target: 3, reward: 100, reward_energy: 5, jump_url: "workbuddy://experts" }),
+  task("first_buddy", { title: "领取一只 Buddy", status: "claimed", current: 1, target: 1, reward: 300, reward_energy: 8, task_type: "auto", jump_url: "workbuddy://chat" }),
+  task("chat_5", { title: "和 AI 聊天 5 次", status: "claimed", current: 5, target: 5, reward: 100, reward_energy: 5, jump_url: "workbuddy://chat" }),
+  task("skill_1", { title: "尝鲜热门技能", status: "claimed", current: 1, target: 1, reward: 100, reward_energy: 5, jump_url: "workbuddy://skills" }),
+  task("expert_5", { title: "召唤 5 次专家", status: "claimed", current: 5, target: 5, reward: 100, reward_energy: 5, jump_url: "workbuddy://expert" }),
+  task("template_5", { title: "使用 5 个模板", status: "claimed", current: 5, target: 5, reward: 100, reward_energy: 5, jump_url: "workbuddy://templates" }),
+  task("automation_1", { title: "设置自动化任务", status: "claimed", current: 1, target: 1, reward: 100, reward_energy: 5, jump_url: "workbuddy://automation" }),
+]
+
+async function snapAll(seeds) {
+  const clock = fakeClock(localTime(2026, 10, 31, 10, 0))
+  const backend = wbBackend({ clock, tasks: seeds, litRules: {} })
+  const tasks = await fetchTasks(makeAcct(), { now: clock.now, sleep: clock.sleep, fetch: backend.fetchImpl })
+  return tasks.map(snapTask)
+}
+
+describe("P0-2：snapTask 投影（真实形态 19 项）", () => {
+  test("desktopOnly / unforgeable / reason / canAccept / canLight / pinnedExpertId 全表", async () => {
+    const snaps = await snapAll(REAL_19())
+    assert.equal(snaps.length, 19)
+
+    // 投影键集合逐字钉死（契约 §3）：8 个规范字段 + 6 个判断字段
+    for (const s of snaps) {
+      assert.deepEqual(Object.keys(s).sort(), [
+        "acceptStatus", "canAccept", "canLight", "code", "desktopOnly", "jumpUrl",
+        "pinnedExpertId", "progress", "reason", "rewardCredit", "rewardEnergy",
+        "taskType", "title", "unforgeable",
+      ])
+    }
+
+    // code → 判断字段全表（与引擎流水线的接取/点亮决策同源同值）
+    const expected = {
+      playbook_prompt: { desktopOnly: false, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "" },
+      RichMeow_Chat: { desktopOnly: true, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "" },
+      Library_read: { desktopOnly: true, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "" },
+      Expert_lighthouse: { desktopOnly: false, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "ex_2cvvUZQhDyeJ" },
+      Hp_Appearance: { desktopOnly: false, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "" },
+      Buddy_App: { desktopOnly: true, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "" },
+      wb_wechat_oa_subscribe_task: { desktopOnly: false, unforgeable: true, reason: "需在微信关注「腾讯 WorkBuddy」公众号满 24 小时", canAccept: false, canLight: false, pinnedExpertId: "" },
+      WorkBuddy_Valorant: { desktopOnly: false, unforgeable: false, reason: "", canAccept: true, canLight: false, pinnedExpertId: "ex_xQHHD1u5Jkua" },
+      expert_use_maidehao: { desktopOnly: false, unforgeable: false, reason: "", canAccept: true, canLight: false, pinnedExpertId: "ex_GDl31WahyIH0" },
+      expert_use_douyinyin: { desktopOnly: false, unforgeable: false, reason: "", canAccept: true, canLight: false, pinnedExpertId: "ex_FbY5nlWTqDod" },
+      expert_use_shangjia_xuanchuan: { desktopOnly: false, unforgeable: false, reason: "", canAccept: true, canLight: false, pinnedExpertId: "ex_Weo3x2EZuSDm" },
+      expert_use_bowangwang: { desktopOnly: false, unforgeable: false, reason: "", canAccept: true, canLight: false, pinnedExpertId: "ex_WZY136wV5aMt" },
+      Expert_team_use_3: { desktopOnly: false, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "" },
+      first_buddy: { desktopOnly: false, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "" },
+      chat_5: { desktopOnly: false, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "" },
+      skill_1: { desktopOnly: false, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "" },
+      expert_5: { desktopOnly: false, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "" },
+      template_5: { desktopOnly: false, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "" },
+      automation_1: { desktopOnly: false, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "" },
+    }
+    assert.deepEqual(new Set(snaps.map((s) => s.code)), new Set(Object.keys(expected)))
+    for (const s of snaps) {
+      assert.deepEqual(
+        {
+          desktopOnly: s.desktopOnly,
+          unforgeable: s.unforgeable,
+          reason: s.reason,
+          canAccept: s.canAccept,
+          canLight: s.canLight,
+          pinnedExpertId: s.pinnedExpertId,
+        },
+        expected[s.code],
+        `任务 ${s.code} 的判断字段与引擎结论不一致`,
+      )
+    }
+
+    // 收敛结论的「批量接取」投影：canAccept 集合 = 5 项（Valorant + 4 个 expert_use_*）
+    const canAccept = snaps.filter((s) => s.canAccept).map((s) => s.code)
+    assert.deepEqual(canAccept, [
+      "WorkBuddy_Valorant",
+      "expert_use_maidehao",
+      "expert_use_douyinyin",
+      "expert_use_shangjia_xuanchuan",
+      "expert_use_bowangwang",
+    ])
+
+    // 派生任务的奖励与深链如实透出（+50 积分 +5 能量）
+    const maidehao = snaps.find((s) => s.code === "expert_use_maidehao")
+    assert.equal(maidehao.rewardCredit, 50)
+    assert.equal(maidehao.rewardEnergy, 5)
+    assert.equal(maidehao.jumpUrl, jumpOf("ex_GDl31WahyIH0"))
+    assert.deepEqual(maidehao.progress, { current: 0, target: 1 }, "progress null → 归一 0/1")
+  })
+
+  test("中途状态（接取后）：canLight 翻转；desktopOnly 依旧不可点亮", async () => {
+    const seeds = REAL_19().map((t) => {
+      const flip = {
+        WorkBuddy_Valorant: "accepted",
+        expert_use_maidehao: "accepted",
+        expert_use_douyinyin: "accepted",
+        expert_use_shangjia_xuanchuan: "accepted",
+        expert_use_bowangwang: "accepted",
+        chat_5: "accepted",
+        first_buddy: "not_accepted", // auto：未接取也可点亮
+      }[t.task_code]
+      return flip ? { ...t, accept_status: flip } : t
+    })
+    const snaps = await snapAll(seeds)
+    const byCode = new Map(snaps.map((s) => [s.code, s]))
+
+    for (const code of [
+      "WorkBuddy_Valorant",
+      "expert_use_maidehao",
+      "expert_use_douyinyin",
+      "expert_use_shangjia_xuanchuan",
+      "expert_use_bowangwang",
+      "chat_5",
+    ]) {
+      assert.equal(byCode.get(code).canLight, true, `${code} accepted → 可点亮`)
+      assert.equal(byCode.get(code).canAccept, false)
+    }
+    assert.equal(byCode.get("first_buddy").canLight, true, "auto 任务 not_accepted 即可点亮")
+    assert.equal(byCode.get("first_buddy").canAccept, false, "auto 任务永不给接取结论")
+
+    // desktopOnly 三兄弟：就算 not_accepted 也只能接、不能点亮
+    for (const code of ["RichMeow_Chat", "Library_read", "Buddy_App"]) {
+      const s = byCode.get(code)
+      assert.equal(s.desktopOnly, true, `${code} desktopOnly 与状态无关`)
+      assert.equal(s.canLight, false, `${code} 不可点亮（伪造事件不推进）`)
+    }
+    // wb_wechat：unforgeable 两头都封死
+    assert.equal(byCode.get("wb_wechat_oa_subscribe_task").canAccept, false)
+    assert.equal(byCode.get("wb_wechat_oa_subscribe_task").canLight, false)
+    // 钉死 id 与状态无关地透出
+    assert.equal(byCode.get("Expert_lighthouse").pinnedExpertId, "ex_2cvvUZQhDyeJ")
+    assert.equal(byCode.get("WorkBuddy_Valorant").pinnedExpertId, "ex_xQHHD1u5Jkua")
+  })
+})
+
+// ---- P1：refreshSnapshots 只认 data.balance / data.streak.days ---------------
+
+function engineWithPoisonedUpstream() {
+  const tasks = [
+    { code: "chat_5", title: "和 AI 聊天 5 次", acceptStatus: "accepted", progress: { current: 3, target: 5 }, rewardCredit: 100, rewardEnergy: 5, jumpUrl: "workbuddy://chat" },
+  ]
+  return {
+    store: {
+      readMagpieConfigDir: () => null,
+      loadAccounts: () => [
+        {
+          key: "workbuddy", provider: "workbuddy", uid: "u1", nickname: "阿猫",
+          access: "a", refresh: "r", expires: Date.now() + 86400000,
+          domain: "", isApiKey: false, enterpriseId: "",
+        },
+      ],
+      eligibleAccounts: (accounts) =>
+        accounts.filter((a) => a.provider === "workbuddy" && !a.isApiKey && !a.enterpriseId && a.tasksEnabled !== false),
+    },
+    runner: {
+      JobRunner: class JobRunner {
+        constructor(ctx) {
+          this.ctx = ctx
+        }
+        start() {
+          throw new Error("not used")
+        }
+        get() {
+          return null
+        }
+        current() {
+          return null
+        }
+        holds() {
+          return []
+        }
+      },
+    },
+    tasks: {
+      fetchTasks: async () => tasks.map((t) => ({ ...t })),
+    },
+    upstream: {
+      growthBase: () => "https://copilot.tencent.com",
+      billBase: () => "https://www.codebuddy.cn",
+      webBase: () => "https://www.workbuddy.cn",
+      // 毒键：data.energy / data.value / data.days / data.streakDays 都存在但
+      // 数值是错的 —— daemon 若做「多拼写回退链」就会读错，这里钉死单一读径。
+      callJSON: async (_acct, _kind, url) => {
+        if (String(url).endsWith("/v2/activity/growth/energy")) {
+          return { ok: true, status: 200, code: 0, msg: "", data: { balance: 42, energy: 999, value: 777 } }
+        }
+        if (String(url).endsWith("/activity/growth/streak")) {
+          return { ok: true, status: 200, code: 0, msg: "", data: { days: 99, streakDays: 88, streak: { days: 7 } } }
+        }
+        return { ok: true, status: 200, code: 0, msg: "", data: {} }
+      },
+    },
+    errors: [],
+    ok: true,
+  }
+}
+
+describe("P1：快照 energy/streak 单一字段口径", () => {
+  test("?refresh=1 只读 data.balance 与 data.streak.days（毒键不误读）", async () => {
+    const h = await startDaemon({
+      key: "test-key-snap-projection",
+      port: 0,
+      stateDir: mkdtempSync(join(tmpdir(), "wb-tasks-snap-")), // 独立临时 state，测完随系统清理
+      engine: engineWithPoisonedUpstream(),
+      noTimers: true,
+      skipExistingCheck: true,
+      sleep: async () => {}, // 快照限速 sleep 不真等
+    })
+    try {
+      const res = await fetch(`http://127.0.0.1:${h.port}/api/state?refresh=1`, {
+        headers: { authorization: "Bearer test-key-snap-projection" },
+      })
+      assert.equal(res.status, 200)
+      const st = await res.json()
+      const snap = st.accounts[0].snapshot
+      assert.equal(snap.energy, 42, "energy = data.balance（P1 实测口径），不是 data.energy/value")
+      assert.equal(snap.streak, 7, "streak = data.streak.days（P1 实测口径），不是 data.days/streakDays")
+      assert.equal(snap.days, 7)
+      assert.equal(snap.tasks.length, 1)
+      assert.equal(snap.tasks[0].canLight, true, "投影判断字段照常下发")
+    } finally {
+      await h.stop()
+    }
+  })
+})

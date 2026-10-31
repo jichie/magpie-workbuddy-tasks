@@ -399,20 +399,56 @@ describe("快照投影 · 参与任务开关 · 风控冷却", () => {
       const tasks = st.accounts[0].snapshot.tasks
       assert.equal(tasks.length, 2)
       for (const t of tasks) {
-        // 规范拼写逐字断言；daemon 绝不再读第二种键名（snake_case/camel 混猜）
+        // 规范拼写逐字断言；daemon 绝不再读第二种键名（snake_case/camel 混猜）。
+        // P0-2：六个判断字段（desktopOnly/unforgeable/reason/canAccept/canLight/
+        // pinnedExpertId）随投影一并下发（契约 §3）。
         assert.deepEqual(
           Object.keys(t).sort(),
-          ["acceptStatus", "code", "jumpUrl", "progress", "rewardCredit", "rewardEnergy", "taskType", "title"],
+          [
+            "acceptStatus",
+            "canAccept",
+            "canLight",
+            "code",
+            "desktopOnly",
+            "jumpUrl",
+            "pinnedExpertId",
+            "progress",
+            "reason",
+            "rewardCredit",
+            "rewardEnergy",
+            "taskType",
+            "title",
+            "unforgeable",
+          ],
         )
         assert.ok(t.code.length > 0, "code 非空")
         assert.ok(t.title.length > 0, "title 非空")
         assert.equal(typeof t.acceptStatus, "string", "acceptStatus 是上游字符串状态")
         assert.ok(Number.isInteger(t.rewardCredit) && t.rewardCredit > 0, "rewardCredit 非 0")
         assert.deepEqual(t.progress, { current: t.progress.current, target: t.progress.target })
+        assert.equal(typeof t.desktopOnly, "boolean", "desktopOnly 是布尔")
+        assert.equal(typeof t.unforgeable, "boolean", "unforgeable 是布尔")
+        assert.equal(typeof t.reason, "string", "reason 是字符串")
+        assert.equal(typeof t.canAccept, "boolean", "canAccept 是布尔")
+        assert.equal(typeof t.canLight, "boolean", "canLight 是布尔")
+        assert.equal(typeof t.pinnedExpertId, "string", "pinnedExpertId 是字符串")
       }
       const rich = tasks.find((t) => t.title === "富猫聊天")
       assert.equal(rich.jumpUrl, "https://example.com/go", "jumpUrl 必须透出（否则看板没法展示深链）")
       assert.equal(rich.acceptStatus, "not_accepted")
+      // P0-2：引擎判断随投影下发 —— RichMeow_Chat 是 DESKTOP_ONLY：desktopOnly
+      // 与 jumpUrl 形状无关（这里 jumpUrl 是 https URL，仍判桌面端专属）；
+      // canAccept 只看 not_accepted/非 auto/非 unforgeable（引擎确实会接它），
+      // canLight 必须为 false（伪造事件不推进）。
+      assert.equal(rich.desktopOnly, true)
+      assert.equal(rich.unforgeable, false)
+      assert.equal(rich.canAccept, true)
+      assert.equal(rich.canLight, false)
+      assert.equal(rich.pinnedExpertId, "")
+      const fb = tasks.find((t) => t.code === "first_buddy")
+      assert.equal(fb.desktopOnly, false)
+      assert.equal(fb.canAccept, false, "claimed 的 auto 任务不可再接取")
+      assert.equal(fb.canLight, false, "claimed 的任务无可点亮")
     } finally {
       await h.stop()
     }

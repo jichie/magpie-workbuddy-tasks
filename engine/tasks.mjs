@@ -11,7 +11,6 @@
 import {
   ACCEPT_CHUNK,
   CLAIM_POLL_ATTEMPTS,
-  DESKTOP_ONLY_TASKS,
   EXPERT_ID_POOL,
   NIGHT_TASK_CODES,
   PROGRESS_RISING_MS,
@@ -21,6 +20,7 @@ import {
   inNightWindow,
 } from "./constants.mjs";
 import { defaultNow } from "./identity.mjs";
+import { resolveTaskKind } from "./taskkind.mjs"; // 任务 → kind 解析（CONTRACT §2/§7，唯一判断源）
 import { runCatTravel } from "./travel.mjs"; // 循环引用（travel 需要 tasks 的流水线件）；ESM 函数声明提升下安全
 import {
   billBase as _billBase,
@@ -47,7 +47,8 @@ export async function fetchTasks(acct, opts = {}) {
   const tasks = [];
   for (const t of rawTasks) {
     const code = t.task_code || "";
-    const spec = TASK_SPECS[code] ?? {};
+    // Object.hasOwn：上游若回 "constructor" 这类键名，不许吃到原型链上的东西
+    const spec = code && Object.hasOwn(TASK_SPECS, code) ? TASK_SPECS[code] : {};
     const prog = t.progress ?? {};
     const task = {
       code,
@@ -62,9 +63,15 @@ export async function fetchTasks(acct, opts = {}) {
       },
       rewardCredit: t.reward_credit || spec.reward || 0,
       rewardEnergy: t.reward_energy ?? 0,
-      unforgeable: !!spec.unforgeable,
-      reason: spec.reason || "",
+      unforgeable: false,
+      reason: "",
     };
+    // kind 解析（CONTRACT §2/§7）：TASK_SPECS 命中沿用 spec 语义；未收录但
+    // jump_url 能解出 expertId=ex_… 的按 expert 类点亮；都否则 unforgeable+
+    // 「未收录任务」—— needsAccept 据此把它们挡在接取批次之外。
+    const rk = resolveTaskKind(task);
+    task.unforgeable = rk.unforgeable;
+    task.reason = rk.reason;
     // raw 挂成非枚举：不进 JSON.stringify / Object.keys，但调试时拿得到上游原文
     Object.defineProperty(task, "raw", { value: t, enumerable: false });
     tasks.push(task);
@@ -307,11 +314,20 @@ export async function progressTask(acct, t, logs, opts = {}) {
   const ctx = ctxOf(opts);
   const claim = opts.claim !== false;
   const code = t.code;
-  const spec = TASK_SPECS[code];
+  const rk = resolveTaskKind(t);
+  const spec = rk.spec;
+  const name = spec?.name || t.title || code;
 
-  if (!spec || spec.unforgeable) {
-    if (spec && spec.reason) {
-      logs.push(`⏭ 任务 [${spec.name || code}] 需真实操作完成: ${spec.reason}, 跳过`);
+  // 未收录任务（TASK_SPECS 没有、jump_url 也派生不出专家 id）：引擎没有任何
+  // 合法的事件构造方式 —— 不接取、不上报、不领奖，诚实标注（P0-1）。
+  if (rk.source === "none") {
+    logs.push(`⏭ 任务 [${name}] ${rk.reason || "未收录任务"}: 引擎没有该任务的事件构造方式, 跳过接取/上报/领奖`);
+    return { credit: 0, energy: 0, lit: 0, claimed: 0 };
+  }
+
+  if (rk.unforgeable) {
+    if (rk.reason) {
+      logs.push(`⏭ 任务 [${name}] 需真实操作完成: ${rk.reason}, 跳过`);
     }
     return { credit: 0, energy: 0, lit: 0, claimed: 0 };
   }
@@ -326,49 +342,55 @@ export async function progressTask(acct, t, logs, opts = {}) {
   // 先结算，不能因为「只能靠真实操作」就直接跳过丢掉奖励。
   if (status === "completed" || cur >= tgt) {
     if (!claim) {
-      logs.push(`⏸ 任务 [${spec.name}] 已达成，等待手动领取`);
+      logs.push(`⏸ 任务 [${name}] 已达成，等待手动领取`);
       return { credit: 0, energy: 0, lit: 0, claimed: 0 };
     }
     const res = await claimTask(acct, code, opts);
     if (res.ok) {
       const cr = res.credit ?? 0;
-      logs.push(`✓ 任务 [${spec.name}] 领奖成功: +${cr} 积分`);
+      logs.push(`✓ 任务 [${name}] 领奖成功: +${cr} 积分`);
       await ctx.breathe();
       return { credit: cr, energy: res.energy ?? 0, lit: 0, claimed: 1 };
     }
-    logs.push(`! 任务 [${spec.name}] 领奖失败: ${res.reason || "未知原因"}`);
+    logs.push(`! 任务 [${name}] 领奖失败: ${res.reason || "未知原因"}`);
     await ctx.breathe();
     return { credit: 0, energy: 0, lit: 0, claimed: 0, ...(res.restricted ? { restricted: true } : {}) };
   }
 
   // 只认桌面端真实行为的任务：伪造事件不会推进进度，诚实跳过并给出深链。
-  if (DESKTOP_ONLY_TASKS[code]) {
+  if (rk.desktopOnly) {
     const jump = t.jumpUrl || "workbuddy://chat";
-    logs.push(`⏭ 任务 [${spec.name}] 需真实操作完成: ${DESKTOP_ONLY_TASKS[code]} (深链 ${jump}), 跳过事件伪造`);
+    logs.push(`⏭ 任务 [${name}] 需真实操作完成: ${rk.desktopReason || "需在桌面端完成"} (深链 ${jump}), 跳过事件伪造`);
     return { credit: 0, energy: 0, lit: 0, claimed: 0 };
   }
 
   // 夜猫子任务只在 23:00-08:00 计数（每日 01:00 调度器也会自动执行）
   if (NIGHT_TASK_CODES.has(code) && !inNightWindow(ctx.now())) {
-    logs.push(`🌙 任务 [${spec.name}] 仅 23:00-08:00 上报计数, 当前不在窗口, 跳过 (每日 01:00 调度器自动执行, 累计 3 天)`);
+    logs.push(`🌙 任务 [${name}] 仅 23:00-08:00 上报计数, 当前不在窗口, 跳过 (每日 01:00 调度器自动执行, 累计 3 天)`);
     return { credit: 0, energy: 0, lit: 0, claimed: 0 };
   }
 
   if (status === "not_accepted" && t.taskType !== "auto") {
     // 接取没成功就上报是白费功夫：上游只对已接取的任务累计进度。
-    logs.push(`⏭ 任务 [${spec.name}] 仍未接取, 跳过 (先解决接取失败)`);
+    logs.push(`⏭ 任务 [${name}] 仍未接取, 跳过 (先解决接取失败)`);
     return { credit: 0, energy: 0, lit: 0, claimed: 0 };
   }
 
   // 需点亮上报 —— 专家/团队事件必须使用互不相同的 id，否则上游按
   // (eventCode, id) 去重，进度永远不动。
   const need = Math.max(1, tgt - cur);
-  const kind = spec.kind;
-  logs.push(`正在点亮任务 [${spec.name}] (需上报 ${need} 次)...`);
+  const kind = rk.kind;
+  logs.push(`正在点亮任务 [${name}] (需上报 ${need} 次)...`);
   let reportOk = true;
   let idPool = null;
   if (kind === "expert" || kind === "team") idPool = kind === "team" ? TEAM_ID_POOL : EXPERT_ID_POOL;
-  const fixedExpert = spec.expert ?? null;
+  let fixedExpert = spec?.expert ?? null;
+  if (!fixedExpert && rk.pinnedExpertId) {
+    // 钉死/派生专家 id（CONTRACT §7）：lighthouse 的常量钉死与 expert_use_*
+    // 从 jump_url 解出的 id 都走这里 —— 上游按 (eventCode,id) 去重，池子里的
+    // 通用 id 对这类任务不推进进度。
+    fixedExpert = [rk.pinnedExpertId, rk.expertName || name];
+  }
   for (let i = 0; i < need; i++) {
     let expert = fixedExpert;
     if (expert == null && idPool) {
@@ -379,7 +401,7 @@ export async function progressTask(acct, t, logs, opts = {}) {
     if (!(await reportEvents(acct, [ev], opts))) reportOk = false;
     if (i < need - 1) await ctx.breathe();
   }
-  if (!reportOk) logs.push(`! 任务 [${spec.name}] 部分事件上报失败 (上游拒绝), 继续尝试领奖`);
+  if (!reportOk) logs.push(`! 任务 [${name}] 部分事件上报失败 (上游拒绝), 继续尝试领奖`);
   await ctx.breathe(REPORT_SETTLE_MS);
 
   // 等上游把进度落账再领奖。进度通常 1-3 秒就可见，因此先快查几次；只有
@@ -400,25 +422,25 @@ export async function progressTask(acct, t, logs, opts = {}) {
     else break;
   }
   if (prog < tgt) {
-    logs.push(`? 任务 [${spec.name}] 已上报但进度 ${prog}/${tgt} 未达成, 领奖顺延到下次运行`);
+    logs.push(`? 任务 [${name}] 已上报但进度 ${prog}/${tgt} 未达成, 领奖顺延到下次运行`);
     await ctx.breathe();
     return { credit: 0, energy: 0, lit: 0, claimed: 0 };
   }
 
   // 领奖
   if (!claim) {
-    logs.push(`⏸ 任务 [${spec.name}] 已点亮，等待手动领取`);
+    logs.push(`⏸ 任务 [${name}] 已点亮，等待手动领取`);
     await ctx.breathe();
     return { credit: 0, energy: 0, lit: 1, claimed: 0 };
   }
   const res = await claimTask(acct, code, opts);
   if (res.ok) {
     const cr = res.credit ?? 0;
-    logs.push(`✓ 任务 [${spec.name}] 点亮并领奖成功: +${cr} 积分`);
+    logs.push(`✓ 任务 [${name}] 点亮并领奖成功: +${cr} 积分`);
     await ctx.breathe();
     return { credit: cr, energy: res.energy ?? 0, lit: 1, claimed: 1 };
   }
-  logs.push(`! 任务 [${spec.name}] 进度已达 ${prog}/${tgt} 但领奖失败: ${res.reason || "未知原因"}`);
+  logs.push(`! 任务 [${name}] 进度已达 ${prog}/${tgt} 但领奖失败: ${res.reason || "未知原因"}`);
   await ctx.breathe();
   return { credit: 0, energy: 0, lit: 1, claimed: 0, ...(res.restricted ? { restricted: true } : {}) };
 }
