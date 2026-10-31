@@ -3,24 +3,27 @@
 // 这个模块只导出一个插件函数（magpie 会把入口文件里每个导出函数都当插件跑），
 // 可测试的辅助全部挂在 export const _internal 上（契约 §0.6）。
 //
-// 它做三件事：
-//   1. 声明 provider「workbuddy-tasks」——models: {}，不服务任何对话模型；
-//      对话链路继续由 @magpie-community/opencode-workbuddy-auth（workbuddy /
-//      workbuddy-ai）负责，本插件绝不碰那两个 id（契约 §0.1）。
-//   2. auth.usage：显示「可参与任务的账号数 / 今日积分·能量」，数据来自守护进程。
-//      auth.checkin 故意不实现——社区插件已负责每日签到（契约 §5）。
-//   3. tool 钩子：五个工具（契约 §6），全部只走守护进程的 HTTP API，
+// 它做两件事：
+//   1. tool 钩子：五个工具（契约 §6），全部只走守护进程的 HTTP API，
 //      单次执行 ≤55 s，长活一律 fire-and-poll。
+//   2. 生命周期（契约 §4）：被宿主加载时读 state/control.json 的 desired，
+//      非 off 则 ensureDaemon()（健康则复用，不健康才 spawn detached 守护进程），
+//      并注册退出钩子——若守护进程是本会话拉起的，退场时通知它退出。
 //
-// 生命周期（契约 §4）：被宿主加载时读 state/control.json 的 desired，
-// 非 off 则 ensureDaemon()（健康则复用，不健康才 spawn detached 守护进程），
-// 并注册退出钩子——若守护进程是本会话拉起的，退场时通知它退出。
+// 本插件**不声明 provider**（没有 auth / config 钩子，契约 §5）：早先版本声明过
+// 一个无模型的 provider「workbuddy-tasks」，只为给 magpie 一个加载理由；但它让
+// magpie 在供应商卡里显示「未登录」+ 登录按钮——用户既不需要也无法为它登录
+// （任务凭据永远共享读 magpie 已登录的 workbuddy 账号），纯造成困惑。去掉之后
+// 供应商列表不再出现本插件，对话链路照旧全权归社区插件（契约 §0.1 的两个 id
+// 我们本来就不碰）。
+// 加载取舍：插件仍有 package.json 的 magpie.page，且不是「只有页面」的插件——
+// tool 钩子在，magpie 照样会为工具启动插件宿主并调用本入口，ensureDaemon 因此
+// 照常运行；页面入口卡也照常出现。
 
 import { dirname } from "node:path"
 import { fileURLToPath } from "node:url"
 import {
   DEFAULT_PORT,
-  PROVIDER_ID,
   bindHint,
   daemonKey,
   ensureDaemon,
@@ -53,7 +56,7 @@ function hereDir() {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const short = (e) => String(e?.message ?? e).slice(0, 180)
 
-// ---- 守护进程 HTTP 客户端（工具与 usage 共用） -----------------------------
+// ---- 守护进程 HTTP 客户端（工具共用） --------------------------------------
 
 function makeDaemonClient(getInfo) {
   async function call(method, path, body, timeoutMs = 10000, extraSignal = null) {
@@ -206,36 +209,9 @@ export const WorkBuddyTasksPlugin = async (input, options) => {
     return null
   })
 
-  // ---- auth.usage：账号数 / 今日积分·能量（契约 §5） ----
-  async function usage() {
-    try {
-      const r = await client.call("GET", "/api/state", undefined, 8000)
-      if (!r.ok || !r.data) return { error: `守护进程返回异常（HTTP ${r.status}）`, windows: [] }
-      const s = r.data
-      const count = (s.accounts ?? []).filter((a) => a.tasksEnabled).length
-      const st = s.stats ?? {}
-      return {
-        plan: "WorkBuddy 任务",
-        user: `${count} 个账号参与任务`,
-        windows: [
-          {
-            name: "今日任务",
-            display: `${st.creditsToday ?? 0} 积分 · ${st.energyToday ?? 0} 能量（${st.runs ?? 0} 轮）`,
-            aside: true, // 只展示，不参与路由权衡
-          },
-        ],
-      }
-    } catch (e) {
-      if (e?.code === "WB_NO_DAEMON") {
-        return { error: `任务守护进程未运行：${e.message}`, windows: [] }
-      }
-      return { error: `连不上任务守护进程：${short(e)}`, windows: [] }
-    }
-  }
-
   // ---- tool 钩子（契约 §6） ----
   // SDK（@opencode-ai/plugin）由 magpie 的插件宿主提供；拿不到时跳过工具注册，
-  // provider 与 usage 照常工作，不让整个插件加载失败。
+  // 生命周期照常工作（入口被调用时 ensureDaemon 已经跑过），不让整个插件加载失败。
   let toolHook = undefined
   try {
     const sdk = await import("@opencode-ai/plugin")
@@ -275,17 +251,21 @@ export const WorkBuddyTasksPlugin = async (input, options) => {
         // 启动批量任务：立即返回 job id，不等待（55 s 装不下一轮批量）
         [`${TOOL_PREFIX}_run`]: runTool({
           description:
-            "启动一轮 WorkBuddy 任务（成长任务/猫猫旅行/夜猫子），立即返回 job id，不等待完成。用 workbuddy_tasks_wait 轮询进度。同一时刻只能跑一个批量任务。",
+            "启动一轮 WorkBuddy 任务（成长任务/猫猫旅行/夜猫子），立即返回 job id，不等待完成。用 workbuddy_tasks_wait 轮询进度。同一时刻只能跑一个批量任务。可用 codes 只勾选部分成长任务。",
           args: {
             uids: optArr().describe("要跑的账号 uid 列表；不填 = 全部可参与账号"),
             legs: optArr().describe("任务腿：growth（成长）、travel（猫猫旅行）、night（夜猫子）；不填 = 设置里的默认"),
             claim: optBool().describe("完成后自动领奖，默认跟随设置"),
+            codes: optArr().describe(
+              "任务 code 列表（workbuddy_tasks_list 里可以看到）；growth 腿只对这些任务接取/点亮/领奖，对所有选中账号生效；不填 = 全部任务",
+            ),
           },
           run: async (args, ctx) => {
             const body = {}
             if (Array.isArray(args?.uids)) body.uids = args.uids
             if (Array.isArray(args?.legs)) body.legs = args.legs
             if (args?.claim !== undefined) body.claim = !!args.claim
+            if (Array.isArray(args?.codes)) body.codes = args.codes // 任务级勾选（CONTRACT §3）；daemon 归一化
             const r = await client.call("POST", "/api/run", body, 15000, ctx?.abort)
             if (r.status === 409) {
               const cur = await client.call("GET", "/api/state", undefined, 8000, ctx?.abort).catch(() => null)
@@ -374,45 +354,16 @@ export const WorkBuddyTasksPlugin = async (input, options) => {
         }),
       }
     } else {
-      log("未找到 @opencode-ai/plugin 的 tool 导出，工具未注册（provider 与用量不受影响）")
+      log("未找到 @opencode-ai/plugin 的 tool 导出，工具未注册（守护进程生命周期不受影响）")
     }
   } catch (e) {
     log(`加载 @opencode-ai/plugin 失败，工具未注册：${short(e)}`)
   }
 
-  const hooks = {
-    // 声明 provider：只为让 magpie 有理由加载我们；models: {} = 不服务对话
-    config: async (cfg) => {
-      cfg.provider ??= {}
-      cfg.provider[PROVIDER_ID] ??= {
-        name: "WorkBuddy 任务",
-        npm: "@ai-sdk/openai-compatible",
-        api: "https://copilot.tencent.com",
-        models: {}, // 铁律 §0.1：不碰对话链路
-      }
-    },
-    auth: {
-      provider: PROVIDER_ID,
-      methods: [
-        {
-          type: "api",
-          label: "（无需填写）复用 magpie 已登录的 WorkBuddy 账号",
-          placeholder: "直接留空即可",
-          async authorize() {
-            // 不收任何秘密：凭据永远来自 magpie 已登录的 workbuddy 账号（共享读 plugin-auth.json）
-            return { type: "success", key: "shared", metadata: { note: "凭据取自 magpie 的 workbuddy 账号" } }
-          },
-        },
-      ],
-      // 本 provider 永远不该被拿来发对话请求；给个空 loader 兜底
-      async loader() {
-        return { baseURL: "", apiKey: "" }
-      },
-      // magpie 专属钩子：参与账号数 / 今日积分·能量
-      usage,
-      // auth.checkin 故意不实现：官方社区插件已负责每日签到，别抢（契约 §5）
-    },
-  }
+  // 本插件只声明 tool 钩子（契约 §5：不声明 provider，避免 magpie 在供应商卡里
+  // 显示「未登录」与无意义的登录按钮；magpie.page + tool 已足够让 magpie 加载
+  // 本插件并启动插件宿主——入口函数被执行时 ensureDaemon 生命周期照常运转）。
+  const hooks = {}
   if (toolHook) hooks.tool = toolHook
 
   return hooks
@@ -436,7 +387,6 @@ async function sleepUntil(ms, signal) {
 // ---- 可测试的辅助（magpie 只把导出的“函数”当插件，_internal 是对象，安全） ----
 
 export const _internal = {
-  PROVIDER_ID,
   DEFAULT_PORT,
   VERSION,
   TOOL_PREFIX,

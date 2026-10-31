@@ -4,7 +4,8 @@
 // 同一时刻只允许 1 个 job（current() 全局闸门；第二个 start() 抛 409）。
 // 账号与账号之间按 trigger 间隔（manual 1.5 s / schedule 2–5 s 抖动，见
 // schedule.accountGapMs）；腿的顺序固定 growth → travel → night，spec.legs
-// 是这个顺序的子集。stop() 只在步骤边界生效（abort 信号在腿/账号之间检查）。
+// 是这个顺序的子集。spec.taskCodes（{uid: string[]} | null，任务级勾选）只在
+// growth 腿生效。stop() 只在步骤边界生效（abort 信号在腿/账号之间检查）。
 
 import { DEFAULT_GAP_MS, REFRESH_LEAD_MS, RESTRICTED_COOLDOWN_MS } from "./constants.mjs";
 import { uuidHex } from "./fingerprint.mjs";
@@ -16,6 +17,30 @@ import { clock, refreshAccount } from "./upstream.mjs";
 
 const LEG_ORDER = ["growth", "travel", "night"];
 
+// 任务级勾选（CONTRACT §2/§3）每个账号清单的上限与 daemon.startJob 同款。
+const TASK_CODES_CAP = 500;
+
+// normalizeTaskCodes(spec.taskCodes) -> {uid: string[]} | null
+// 只认「uid → 非空字符串数组」的普通对象：值清洗（去重、只留非空字符串、上限
+// 500）、空清单/非法值丢弃；清洗后没有任何非空清单 → null（= 全部任务）。
+// daemon.startJob 已把 /api/run 的两种 body 形状（数组 / 按 uid 对象）归一成
+// 这一种再传进来；这里再防御一遍，直接构造 JobRunner 的调用方（测试/嵌入）
+// 传脏数据也不会把勾选语义带歪。
+function normalizeTaskCodes(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const out = {};
+  for (const [uid, codes] of Object.entries(raw)) {
+    if (!uid || !Array.isArray(codes)) continue;
+    const list = [];
+    for (const c of codes) {
+      if (typeof c === "string" && c.trim() && !list.includes(c.trim())) list.push(c.trim());
+      if (list.length >= TASK_CODES_CAP) break;
+    }
+    if (list.length) out[String(uid)] = list;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 function normalizeSpec(spec = {}) {
   const legs = (Array.isArray(spec.legs) && spec.legs.length ? spec.legs : [...LEG_ORDER])
     .filter((l) => LEG_ORDER.includes(l))
@@ -25,6 +50,9 @@ function normalizeSpec(spec = {}) {
     legs: legs.length ? legs : [...LEG_ORDER],
     claim: spec.claim !== false,
     trigger: spec.trigger === "schedule" ? "schedule" : "manual",
+    // 任务级勾选（CONTRACT §3）：{uid: string[]} | null；growth 腿据此只处理
+    // 选中任务，travel/night 腿没有任务码，不受影响。
+    taskCodes: normalizeTaskCodes(spec.taskCodes),
   };
 }
 
@@ -245,6 +273,11 @@ export class JobRunner {
             log: logFn,
             claim: job.spec.claim,
             signal: ctrl.signal,
+            // 任务级勾选（CONTRACT §3）：growth 腿把该账号的选中清单作为
+            // opts.codes 传给 runGrowthTasks；未勾选（taskCodes=null）、该账号
+            // 不在映射里或清单为空 → undefined = 全部任务（旧行为）。travel/
+            // night 腿没有任务码，不传。
+            ...(leg === "growth" && job.spec.taskCodes ? { codes: job.spec.taskCodes[acct.uid] } : {}),
           };
           if (leg === "growth") res = await runGrowthTasks(acct, legOpts);
           else if (leg === "travel") res = await runCatTravel(acct, legOpts);

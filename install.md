@@ -42,13 +42,13 @@ magpie plugin add github:<owner>/<repo>
 > 在群晖 Docker（x86_64，magpie v0.1.1876）实测：冷缓存首次解析 **45.5 s**，热缓存 **23 ms**；
 > 本插件自身的 `import index.mjs` 仅 12 ms、工厂函数仅 4 ms（守护进程已在跑的复用路径），都不是瓶颈。
 > 第一次 add 超时后，Bun 的拉取仍在后台完成并写入缓存，**再 add 一次（或在插件管理里停用→启用一次）即可
-> 正常加载**（provider `workbuddy-tasks` + 5 个工具全部注册成功）。全新环境还可能先下载插件运行用的
+> 正常加载**（5 个工具全部注册成功）。全新环境还可能先下载插件运行用的
 > Bun 本体（实测一次 ~60 s，且 GitHub 下载偶发失败需重试），同样只需一次。
 
 然后在 magpie 应用里打开「**插件管理**」，**启用**本插件（安装后若未自动启用）。启用后：
 
 - 侧栏「插件」分组出现「**WorkBuddy 任务**」入口卡；
-- 「供应商」里出现 `WorkBuddy 任务`（`workbuddy-tasks`，0 个模型——这是正常的，它不服务对话，**不要**给它发对话请求，也不要纠结给它「登录」：若 magpie 要求为它添加账号，**直接留空确认**即可，任务凭据始终来自 magpie 已登录的 workbuddy 账号）。
+- **「供应商」里不会出现本插件**——本插件不声明 provider，没有「登录/添加账号」一说：任务凭据始终来自 magpie 已登录的 workbuddy 账号，本插件不收任何密钥。旧版本在供应商里的「WorkBuddy 任务」（显示「未登录」）升级后消失，这是预期行为；也不要给它曾经的占位账号发对话。
 
 ### 重载语义（重要）
 
@@ -92,7 +92,7 @@ sb=$(mktemp -d)
 m() { env HOME=$sb XDG_CONFIG_HOME=$sb/.config XDG_CACHE_HOME=$sb/.cache MAGPIE_ADDR=127.0.0.1:3499 magpie "$@" ; }
 
 m plugin add ./magpie-workbuddy-tasks
-m plugin --json                     # 方式、账号、模型（空）、加载错误
+m plugin --json                     # 方式、工具、加载错误（本插件不声明 provider：无账号、无模型）
 ```
 
 跑测试套件（不需要 magpie，零真实网络——fetch 与时钟全部注入）：

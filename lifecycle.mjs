@@ -20,7 +20,6 @@ import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
 export const PLUGIN_NAME = "workbuddy-tasks"
-export const PROVIDER_ID = "workbuddy-tasks"
 export const DEFAULT_PORT = 4390
 const SPAWN_BUDGET_MS = 8000
 

@@ -32,6 +32,6 @@
       "titles": { "zh": "WorkBuddy 任务" }
     },
     "permissions": [],
-    "options": { "dashboardUrl": "http://127.0.0.1:4390", "listenAddress": "" }
+    "options": { "dashboardUrl": "", "listenAddress": "" }
   }
 }

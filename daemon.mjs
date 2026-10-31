@@ -77,14 +77,33 @@ const LEGS = ["growth", "travel", "night"]
 const LEG_NAMES = { growth: "成长任务", travel: "猫猫旅行", night: "夜猫子" }
 const HISTORY_CAP = 2000
 
+// 排程小时窗口只认这两条腿（契约 §7/§8）：到点自动跑的都是无任务码、零写入
+// 风险的腿；growth 刻意不在排程里（engine/schedule.SCHEDULE_WINDOWS 同口径），
+// 只能手动发起（看板「立即运行」/ POST /api/run / 工具，可配合 codes 勾选）。
+// 手动运行不受此限制——LEGS 仍含 growth，settings.legs 默认也仍含 growth。
+const SCHEDULE_HOURS_LEGS = ["travel", "night"]
+
 const DEFAULT_SETTINGS = {
   scheduler: false, // 小时窗口排程总开关：默认停用，须由用户在看板里显式点一次「启用排程」才生效
   claim: true, // 完成后自动领奖
-  legs: ["growth", "travel"], // 手动运行未指定 legs 时的默认腿
+  legs: ["growth", "travel"], // 手动运行未指定 legs 时的默认腿（growth 仍可手动勾选）
   gapMs: 1500, // 账号之间的基础间隔（手动）；排程时 runner 另加 2–5s 抖动
   jitterMs: [2000, 5000], // 排程运行的账号间抖动（交给 runner，见契约 §0.4）
-  hours: { growth: [9, 21], travel: [9, 21], night: [1] }, // 本地小时窗口
+  hours: { travel: [9, 21], night: [1] }, // 本地小时窗口（只有 travel|night，growth 无窗口）
   host: { chat: "", bill: "", web: "" }, // 留空 = 用 engine/upstream 的默认
+}
+
+// normalizeScheduleHours(raw) -> {travel:number[], night:number[]}（导出供测试）
+// 键限制为 travel|night（growth/未知键丢弃），每条腿只留 0–23 的整数并去重升序。
+// 输入不是对象时返回空腿表（调用方先与 DEFAULT_SETTINGS.hours 合并，缺键由此兜底）。
+export function normalizeScheduleHours(raw) {
+  const src = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}
+  const out = {}
+  for (const leg of SCHEDULE_HOURS_LEGS) {
+    const hs = Array.isArray(src[leg]) ? src[leg] : []
+    out[leg] = [...new Set(hs.map(Number).filter((h) => Number.isFinite(h) && h >= 0 && h <= 23 && Number.isInteger(h)))].sort((a, b) => a - b)
+  }
+  return out
 }
 
 // ---- 小工具 ------------------------------------------------------------
@@ -549,7 +568,10 @@ export async function startDaemon(opts = {}) {
   // 只有 POST /api/settings（校验 boolean）或看板开关能显式打开。
   settings.scheduler = settings.scheduler === true
   settings.claim = settings.claim === true
-  settings.hours = { ...DEFAULT_SETTINGS.hours, ...(settings.hours ?? {}) }
+  // 排程小时窗口只认 travel|night（本版起 growth 不再由排程触发）：旧
+  // settings.json 里的 hours.growth 在这里丢弃，未知键一律不收，缺的键补默认。
+  // （growth 仍可手动跑：settings.legs / POST /api/run 的 legs 不受影响。）
+  settings.hours = normalizeScheduleHours({ ...DEFAULT_SETTINGS.hours, ...(settings.hours ?? {}) })
   settings.host = { ...DEFAULT_SETTINGS.host, ...(settings.host ?? {}) }
   let snapshots = readJson(snapshotsFile, {})
   let history = Array.isArray(readJson(historyFile, [])) ? readJson(historyFile, []) : []
@@ -972,6 +994,46 @@ export async function startDaemon(opts = {}) {
 
   // ---- job 控制 -----------------------------------------------------------
 
+  // 任务级勾选（CONTRACT §3）：/api/run body.codes 的两种形状 → runner 的
+  // taskCodes（{uid: string[]} | null）。
+  //   - 不传 / 空 / 非法类型 → null（全部任务，兼容现状；非法输入绝不 500）
+  //   - 数组 → 对 job 内每个选中账号都只做这些 code
+  //   - 对象 → 按 uid 归一；未出现的 uid 或空数组 = 该账号全部任务；
+  //     不在选中名单里的 uid 丢弃（runner 不会跑它们）
+  // 每个 uid 的清单：去重、只留非空字符串、上限 TASK_CODES_CAP。
+  const TASK_CODES_CAP = 500
+
+  function cleanCodeList(value) {
+    const out = []
+    if (!Array.isArray(value)) return out
+    for (const c of value) {
+      if (typeof c !== "string") continue
+      const t = c.trim()
+      if (t && !out.includes(t)) out.push(t)
+      if (out.length >= TASK_CODES_CAP) break
+    }
+    return out
+  }
+
+  function normalizeRunCodes(codes, uids) {
+    if (Array.isArray(codes)) {
+      const list = cleanCodeList(codes)
+      if (!list.length) return null
+      const map = {}
+      for (const uid of uids) map[uid] = [...list]
+      return map
+    }
+    if (codes && typeof codes === "object") {
+      const map = {}
+      for (const uid of uids) {
+        const list = cleanCodeList(codes[uid])
+        if (list.length) map[uid] = list
+      }
+      return Object.keys(map).length ? map : null
+    }
+    return null
+  }
+
   function startJob(spec = {}) {
     if (!runner) {
       const err = new Error(engineErrorsText())
@@ -998,6 +1060,9 @@ export async function startDaemon(opts = {}) {
       trigger: spec.trigger === "schedule" ? "schedule" : "manual",
       gapMs: settings.gapMs,
       jitterMs: Array.isArray(spec.jitterMs) ? spec.jitterMs : settings.jitterMs,
+      // 任务级勾选（CONTRACT §3）：body.codes 的两种形状在这里归一成
+      // {uid: string[]} | null；growth 腿在 runner 里据此只处理选中任务。
+      taskCodes: normalizeRunCodes(spec.codes, uids),
     })
     if (job?.id) pendingJobId = job.id
     return job
@@ -1553,11 +1618,15 @@ export async function startDaemon(opts = {}) {
         const [a, b] = body.jitterMs.map(Number)
         if (Number.isFinite(a) && Number.isFinite(b)) settings.jitterMs = [Math.max(0, a), Math.max(a, b)]
       }
-      if (body.hours && typeof body.hours === "object") {
-        for (const leg of LEGS) {
-          const hs = body.hours[leg]
-          if (Array.isArray(hs)) settings.hours[leg] = hs.map(Number).filter((h) => Number.isFinite(h) && h >= 0 && h <= 23)
+      // 排程小时窗口只收 travel|night（growth 不再由排程触发，写进来也丢弃）。
+      // 非数组值沿用旧行为「忽略该键」；数组值统一走 normalizeScheduleHours 的
+      // 同款校验：0–23 整数、去重升序。
+      if (body.hours && typeof body.hours === "object" && !Array.isArray(body.hours)) {
+        const merged = { ...settings.hours }
+        for (const leg of SCHEDULE_HOURS_LEGS) {
+          if (Array.isArray(body.hours[leg])) merged[leg] = body.hours[leg]
         }
+        settings.hours = normalizeScheduleHours(merged)
       }
       if (body.host && typeof body.host === "object") {
         for (const k of ["chat", "bill", "web"]) {

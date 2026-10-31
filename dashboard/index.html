@@ -158,9 +158,10 @@
       <p class="acct-intl" id="intlNote" hidden></p>
 
       <div class="batchbar">
+        <!-- 任务腿勾选是唯一选择源：初始勾选由 app.js 按 settings.legs 回写，HTML 里不写死 checked。 -->
         <fieldset class="segments" id="legsBox">
           <legend class="sr-only">任务腿</legend>
-          <label class="segment"><input type="checkbox" class="leg-check" value="growth" checked><span>成长任务</span></label>
+          <label class="segment"><input type="checkbox" class="leg-check" value="growth"><span>成长任务</span></label>
           <label class="segment"><input type="checkbox" class="leg-check" value="travel"><span>猫猫旅行</span></label>
           <label class="segment"><input type="checkbox" class="leg-check" value="night"><span>夜猫子</span></label>
         </fieldset>
@@ -175,6 +176,8 @@
         <div class="batch-actions">
           <div class="batch-hints">
             <span class="sel-count" id="selCount">已选 0 个账号</span>
+            <!-- 任务级勾选的全局汇总：有勾选时显示「已选 N 项任务」 -->
+            <span class="task-sel-summary" id="taskSelSummary" hidden></span>
             <!-- 批量接取只提交后端判定 canAccept 的任务；不可自动接取的项数在这里说明，
                  而不是静默少接（数字来自 snapshot.tasks[].canAccept，见 app.js acceptPlan）。 -->
             <span class="accept-note" id="acceptNote" hidden></span>
@@ -221,16 +224,11 @@
             </span>
           </label>
 
-          <div class="hours" role="group" aria-label="各腿小时窗口">
-            <div class="hour-row">
-              <span class="field-label">成长任务</span>
-              <input class="input input-mono" id="hoursGrowth" inputmode="numeric" placeholder="9,21" aria-label="成长任务小时窗口">
-              <span class="hint">逗号分隔的本地小时（0–23）</span>
-            </div>
+          <div class="hours" role="group" aria-label="排程小时窗口">
             <div class="hour-row">
               <span class="field-label">猫猫旅行</span>
               <input class="input input-mono" id="hoursTravel" inputmode="numeric" placeholder="9,21" aria-label="猫猫旅行小时窗口">
-              <span class="hint">默认 09:00 与 21:00</span>
+              <span class="hint">逗号分隔的本地小时（0–23）；默认 09:00 与 21:00</span>
             </div>
             <div class="hour-row">
               <span class="field-label">夜猫子</span>
@@ -238,6 +236,7 @@
               <span class="hint">默认 01:00；上游只在 23:00–08:00 计数</span>
             </div>
           </div>
+          <p class="hint hours-note">默认旅行 09:00 与 21:00；夜猫子 01:00（上游只在 23:00–08:00 计数）</p>
           <div class="form-actions">
             <button type="button" class="ghost-btn" id="saveHoursBtn">保存窗口</button>
           </div>
@@ -256,15 +255,9 @@
           <details class="adv">
             <summary>
               <span>运行默认</span>
-              <small>任务腿 · 领奖模式 · 账号间隔 · 上游主机</small>
+              <small>领奖模式 · 账号间隔 · 上游主机</small>
             </summary>
             <div class="adv-body">
-              <div class="adv-row">
-                <span class="field-label">默认任务腿</span>
-                <label class="check"><input type="checkbox" class="defleg-check" value="growth"> 成长任务</label>
-                <label class="check"><input type="checkbox" class="defleg-check" value="travel"> 猫猫旅行</label>
-                <label class="check"><input type="checkbox" class="defleg-check" value="night"> 夜猫子</label>
-              </div>
               <div class="adv-row">
                 <label class="check"><input type="checkbox" id="defClaim"> 完成后自动领奖（手动运行的默认模式）</label>
               </div>
@@ -277,6 +270,7 @@
               <div class="adv-row">
                 <button type="button" class="ghost-btn" id="saveDefaultsBtn">保存默认</button>
               </div>
+              <p class="hint">任务腿 = 本次运行（在顶部勾选）；点「保存默认」把当前选择存为默认（工具 / 排程 / 未指定腿时使用）。</p>
               <div>
                 <p class="section-label">上游主机（生效值，只读）</p>
                 <div class="hosts" id="hostsBox"></div>

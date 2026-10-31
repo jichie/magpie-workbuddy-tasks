@@ -12,12 +12,14 @@ import {
 } from "../engine/schedule.mjs";
 import { fakeClock, localTime } from "./helpers.mjs";
 
-test("窗口表：09:00/21:00 成长+旅行，01:00 夜猫", () => {
-  assert.deepEqual(legsForHour(9), ["growth", "travel"]);
-  assert.deepEqual(legsForHour(21), ["growth", "travel"]);
+test("窗口表：09:00/21:00 猫猫旅行，01:00 夜猫；growth 不在任何窗口", () => {
+  assert.deepEqual(legsForHour(9), ["travel"]);
+  assert.deepEqual(legsForHour(21), ["travel"]);
   assert.deepEqual(legsForHour(1), ["night"]);
   assert.deepEqual(legsForHour(12), []);
   assert.deepEqual(SCHEDULE_WINDOWS.map((w) => w.hour).sort((a, b) => a - b), [1, 9, 21]);
+  // 排程刻意不触发成长任务（只能手动跑）：全表展开也不该出现 growth
+  for (let h = 0; h < 24; h++) assert.ok(!legsForHour(h).includes("growth"), `小时 ${h} 不该有 growth`);
 });
 
 test("windowsAt：命中当前本地小时的窗口", () => {
@@ -27,16 +29,17 @@ test("windowsAt：命中当前本地小时的窗口", () => {
 });
 
 test("nextRuns：严格未来、按时间排序、格式 [leg, hour]", () => {
-  // 本地 10:00 → 下一个窗口是 21:00（growth, travel），再下一天 01:00（night）、09:00…
+  // 本地 10:00 → 下一个窗口是 21:00（travel），再下一天 01:00（night）、09:00…
   const now = localTime(2026, 9, 15, 10, 0);
   const runs = nextRuns(now, 5);
   assert.deepEqual(runs, [
-    ["growth", 21], ["travel", 21],
-    ["night", 1], ["growth", 9], ["travel", 9],
+    ["travel", 21],
+    ["night", 1], ["travel", 9],
+    ["travel", 21], ["night", 1],
   ]);
   // 恰好在 09:00:00 整点 → 09:00 视为已过（严格未来）
   const now2 = localTime(2026, 9, 15, 9, 0);
-  assert.deepEqual(nextRuns(now2, 2), [["growth", 21], ["travel", 21]]);
+  assert.deepEqual(nextRuns(now2, 2), [["travel", 21], ["night", 1]]);
 });
 
 test("dueWindows：(prev, now] 之间到点的窗口，每个日期+小时只报一次", () => {
@@ -44,8 +47,8 @@ test("dueWindows：(prev, now] 之间到点的窗口，每个日期+小时只报
   const now = localTime(2026, 9, 15, 9, 30);
   const due = dueWindows(prev, now);
   assert.deepEqual(due.map((w) => w.hour), [21, 1, 9]);
-  assert.deepEqual(due[0].legs, ["growth", "travel"]);
-  assert.deepEqual(due[2].legs, ["growth", "travel"]);
+  assert.deepEqual(due[0].legs, ["travel"]);
+  assert.deepEqual(due[2].legs, ["travel"]);
   // 重复扫描不重复报
   assert.deepEqual(dueWindows(now, localTime(2026, 9, 15, 10, 0)), []);
   // prev >= now → 空

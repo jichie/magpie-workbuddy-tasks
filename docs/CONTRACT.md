@@ -17,7 +17,7 @@
 ```
 magpie-workbuddy-tasks/
   package.json
-  index.mjs              # 插件入口：provider 声明 + tool 钩子 + 守护进程生命周期
+  index.mjs              # 插件入口：tool 钩子 + 守护进程生命周期（不声明 provider，§5）
   daemon.mjs             # 常驻 Bun 进程：HTTP 看板 + /api + 排程 + 任务执行
   engine/
     fingerprint.mjs      # derive_id 等设备指纹派生
@@ -102,6 +102,9 @@ reportEvents(acct, events) -> boolean
 claimTask(acct, code) -> {ok, credit, energy, via /*'chat'|'web'*/, reason}
 buildEvent(acct, kind, idx) -> object
 runGrowthTasks(acct, opts) -> GrowsResult
+  // opts.codes?: string[] —— 任务级勾选（§3/§6/§7）：非空数组 = 只对选中任务
+  // 接取/点亮/领奖；每次 fetchTasks 后都按选中集合过滤；缺失 code 警告跳过；
+  // 未传/空数组 = 全部任务（旧行为）
 
 // taskkind.mjs —— 任务 → kind 解析（fetchTasks 的 unforgeable/reason、流水线的
 // 接取/点亮决策、daemon.snapTask 的 6 个下发字段，全部出自这里的唯一判断源）
@@ -127,7 +130,13 @@ runNightTask(acct, opts) -> NightResult       // black_cat，23:00–08:00
 
 // runner.mjs
 class JobRunner {
-  start(spec) -> job        // spec: {uids[], legs:['growth','travel','night'], claim, trigger:'manual'|'schedule'}
+  start(spec) -> job        // spec: {uids[], legs:['growth','travel','night'], claim,
+                            //       trigger:'manual'|'schedule',
+                            //       taskCodes:{uid:string[]}|null}  // 任务级勾选（§3）：
+                            //       growth 腿把 taskCodes[uid] 作为 opts.codes 传给
+                            //       runGrowthTasks；null/缺 uid/空清单 = 全部任务。
+                            //       归一化在两处设防：daemon.startJob（API 边界，§3）
+                            //       与 runner.normalizeSpec（直接构造 runner 的调用方）
   get(id) -> Job            // Job: {id, state:'queued|running|done|error', startedAt, endedAt,
                             //       totals:{credit,energy,tasksLit,tasksClaimed}, steps:Step[], log:string[]}
   current() -> Job|null     // 同一时刻只允许 1 个 job（全局闸门）
@@ -191,7 +200,10 @@ GET  /api/state                 -> {serveUrl, bindHost, port, reachableHint,
                                     scheduler:{enabled,nextRuns[[leg,hour]],lastCycle,
                                                holds:[{uid,nickname,releasedAt}]},
                                     job:Job|null, stats:{creditsToday,energyToday,runs},
-                                    settings:{claim,legs,gapMs,hours:{...},host:{chat,bill,web}}}
+                                    settings:{claim,legs,gapMs,hours:{travel,night},host:{chat,bill,web}}}
+                                    // hours 只有 travel|night 两个键（排程不再触发 growth，§7/§8）；
+                                    // 旧 settings.json 里的 hours.growth 在读取时丢弃。legs
+                                    // （手动默认腿）仍可含 growth。
                                     // bindHost/port/reachableHint：守护进程真实绑定的 host 与端口
                                     // （host 来自 daemon.json，由 daemon 心跳写入；port 为实际绑定端口，
                                     // 被占用顺延后可能与配置值不同）。bindHost 为 0.0.0.0/:: 时
@@ -266,7 +278,16 @@ GET  /api/state                 -> {serveUrl, bindHost, port, reachableHint,
                                     // expiresInDays = ceil 口径的天数（Math.max(0,…)），token 还剩
                                     // 2 小时时会显示 1 —— 区分「不足一天」必须用 expiresInMs。
                                     // 两者在 expires 未知（=0）时均为 null。
-POST /api/run                   body {uids?:string[], legs?:string[], claim?:bool} -> {job:Job} | 409 {error:"busy"}
+POST /api/run                   body {uids?:string[], legs?:string[], claim?:bool,
+                                      codes?: string[] | {[uid]: string[]}} -> {job:Job} | 409 {error:"busy"}
+                                    // codes —— 任务级勾选（只在 growth 腿生效，CONTRACT §6/§7）：
+                                    //   不传 → 全部任务（兼容现状）
+                                    //   数组 → 对 job 内每个选中账号都只做这些 code
+                                    //   对象 → 按 uid；未出现的 uid 或空数组 = 该账号全部任务
+                                    // 归一化在 daemon.startJob 完成（runner spec.taskCodes:
+                                    //   {uid:string[]}|null）：每个 uid 的清单去重、只留非空
+                                    //   字符串、上限 500；空清单/非法类型一律忽略（落 null），
+                                    //   绝不 500。job.spec 透出归一后的 taskCodes。
 POST /api/stop                  -> {job:Job}                                  // 取消当前 job
 POST /api/task/claim            body {uid, code} -> {ok, credit, energy, reason}
 POST /api/task/accept           body {uid, codes[]} -> AcceptResult
@@ -316,19 +337,30 @@ SSE 事件是看板实时进度的唯一来源；断线时看板回退到 `GET /
 - 看板的「停止/启动」按钮 = 写 `control.json` + 让 daemon 自杀/由下次宿主加载或 CLI 拉起。
 - `control.json` 是唯一意图来源；崩溃重启后按它决定要不要跑，避免僵尸守护进程。
 
-## 5. provider 声明（只为让 magpie 有理由加载我们）
+## 5. 不声明 provider（只提供页面与 MCP 工具）
 
-`auth.provider = "workbuddy-tasks"`；`config` 里声明该 provider，`models: {}`（不服务对话）；
-`methods: [{type:'api', label:'（无需填写）复用 magpie 已登录的 WorkBuddy 账号', placeholder:'直接留空即可'}]`，
-`authorize()` 返回 `{type:'success', key:'shared', metadata:{note:'凭据取自 magpie 的 workbuddy 账号'}}`。
-`auth.usage` 显示「可参与任务的账号数 / 今日积分」；`auth.checkin` **不实现**（社区插件已负责每日签到，别抢）。
-文档明确：provider id 撞车才会变 `-plugin`；我们用独立 id，不影响 workbuddy 本体。
+**本插件不声明 provider**：`index.mjs` 的 hooks 只有 `tool`（契约 §6），没有 `auth` / `config`。
+历史：早先版本声明过一个无模型 provider「workbuddy-tasks」（`models:{}`）只为给 magpie 一个
+加载理由；但它让 magpie 在供应商卡里显示「未登录」+ 登录按钮——用户既不需要也无法为它登录
+（任务凭据永远共享读 magpie 已登录的 workbuddy 账号），纯造成困惑，已移除（连带 `auth.usage`、
+`PROVIDER_ID` 等死代码）。后果与口径：
+
+- magpie 的「供应商」列表不再出现本插件，没有任何「登录/添加账号」入口——这是预期行为；
+- 对话链路照旧全权归 `@magpie-community/opencode-workbuddy-auth`（`workbuddy` / `workbuddy-ai`
+  两个 id 我们本来就不碰，铁律 §0.1；provider id 撞车才会变 `-plugin` 后缀的顾虑随之消失）；
+- **加载理由**：插件仍有 `package.json` 的 `magpie.page`（入口卡），且不是「只有页面」的插件——
+  `tool` 钩子在，magpie 仍会为工具启动插件宿主、调用 `index.mjs` 的入口函数，
+  `ensureDaemon` 生命周期（契约 §4）因此照常运转；
+- `auth.checkin` 与 `auth.usage` 随 provider 一起不存在（每日签到归社区插件；用量数字看板与
+  `workbuddy_tasks_status` 工具都有）。
 
 ## 6. `tool` 钩子（MCP `/mcp/magpie/tools`，单次执行上限 55 s）
 
 ```
 workbuddy_tasks_status()                 -> 账号/排程/当前 job 摘要（纯文本）
-workbuddy_tasks_run(uids?, legs?, claim?) -> 启动 job，立即返回 job id（不等待）
+workbuddy_tasks_run(uids?, legs?, claim?, codes?) -> 启动 job，立即返回 job id（不等待）
+                                            // codes?: string[] —— 任务级勾选，对所有选中
+                                            // 账号生效（= §3 的数组形状，daemon 归一化）
 workbuddy_tasks_wait(jobId, maxSeconds?)  -> 轮询到完成或超时，返回进度与结算
 workbuddy_tasks_list(uid?)                -> 任务表（code/标题/接取状态/进度/奖励）
 workbuddy_tasks_claim(uid, code)          -> 单个领奖
@@ -375,6 +407,12 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
   （`wb_wechat_oa_subscribe_task`/`Expert_Philanthropy`）不上报、接不上，只展示 `jump_url`。
 - `first_buddy` 是 `task_type==='auto'`：不许进接取批次，必须先点亮+领奖，否则单任务接取报 `prerequisite not met`。
 - 领奖竞态：上报后等 1.5 s，轮询进度最多 6 次（在涨就再等 2.5 s），没到位就把领奖顺延到下一轮，绝不硬闯。
+- **任务级勾选（`runGrowthTasks` 的 `opts.codes`，§2/§3/§6）**：非空数组 = 只对选中的任务
+  接取/点亮/领奖；**每次 `fetchTasks` 之后都按选中集合过滤**（含接取后的复查重取）——未选中的
+  任务不进 auto 前置、不进批量接取批次、不轮询进度、不领奖，上游状态原封不动。选中但任务表里
+  不存在的 code 记**一次**警告并跳过，绝不硬闯。未传/空数组/非法类型 = 全部任务（旧行为）。
+  「清单拉空」的失败判断按**过滤前**的整表算——勾选过滤后为空是正常现象（选中任务都不在表里），
+  不是拉取失败；此时跳过任务阶段、照常做猫猫旅行与能量结算。
 
 ### 7.1 hub 移植的时间单位：expiresAt = epoch 秒，magpie expires = epoch 毫秒（双向换算）
 
@@ -405,6 +443,14 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
 - 信封：`code!==0` → 失败；`403/11140` → restricted；TLS reset → 走 web 回退且 `X-Domain` 不变；
 - 事件：每种 kind 的 `eventCode` 与必填字段逐个断言；`userId` 必在；
 - 流水线：假账号跑完整轮 → 断言「接取在未接之前」「领奖在进度到位之后」「两次上游调用间隔 ≥1000 ms」「DESKTOP_ONLY 被跳过」「auto 任务不进接取批次」；
+- 任务级勾选（§3/§7）：`opts.codes` 非空 → 只对选中任务接取/点亮/领奖、未选中任务上游状态
+  原封不动、缺失 code 警告一次；runner 把 `spec.taskCodes[uid]` 原样传到 growth 腿、travel/night
+  不受影响、脏输入归一成 null；daemon 把 `/api/run` 的数组/按 uid 对象两种形状归一到
+  `taskCodes`（去重/剔非字符串/上限 500/非法忽略）；
+- schedule：窗口判定（09:00/21:00 猫猫旅行，01:00 夜猫，夜猫只认 23:00–08:00；**growth 不在
+  任何排程窗口**——排程只触发 travel/night，growth 只能手动跑）；daemon 读旧 settings.json 时
+  丢弃 `hours.growth`、`/api/state` 的 hours/nextRuns 无 growth、tick 不触发 growth job、
+  手动 `legs:["growth"]` 照常启动；
 - 去重：`expert_5` 五个事件用 5 个不同 id；
 - kind 解析（taskkind）：jump_url 派生专家 id（编码/裸/双重编码/解不出）、TASK_SPECS
   优先（Valorant 钉死 id 不被 jump_url 覆盖）、六类任务 × 四状态 canAccept/canLight
@@ -412,7 +458,6 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
   批次）、快照 energy/streak 只认 data.balance / data.streak.days（毒键不误读）；
 - store：回写只改 access/refresh/expires，保留未知字段，产出合法 JSON 且权限 600；
 - runner：两个 `start()` → 第二个 409；`stop()` 能在步骤边界中止；
-- schedule：窗口判定（09:00/21:00 成长+旅行，01:00 夜猫，夜猫只认 23:00–08:00）；
 - 沙箱卫生：测试 temp 沙箱一律走 `tests/helpers.mjs` 的 `makeSandbox()`（用完即删 + after/exit 兜底），跑完套件 temp 不残留 `wb-*` 沙箱（`tests/sandbox-hygiene.test.mjs` 钉死）。
 
 ## 9. 账号 JSON 导入 / 导出（hub 移植口径；engine/accountio.mjs）

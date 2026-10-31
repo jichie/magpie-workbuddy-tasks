@@ -948,6 +948,38 @@ details[open] > .acct-tasks-summary { color: var(--ink-2); border-bottom: 1px so
 .row-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .snap-stale { padding: 8px 20px 0; font-size: 11.5px; color: var(--warn); }
 
+/* ---- 任务级勾选（只收窄批量操作，不影响单任务按钮） ------------------------------ */
+
+.task-sel-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px 12px;
+  flex-wrap: wrap;
+  padding: 8px 20px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+  font-size: 11.5px;
+  color: var(--ink-3);
+}
+.task-sel-all { font-size: 11.5px; color: var(--ink-3); }
+.task-sel-hint { min-width: 0; }
+.task-sel-count {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+.task-sel-summary { font-size: 11.5px; color: var(--accent-strong); white-space: nowrap; }
+.task-sel-summary[hidden] { display: none; }
+
+.tbl th.pick-col, .tbl td.pick-cell {
+  width: 30px;
+  padding-right: 0;
+}
+.tbl td.pick-cell .check { cursor: pointer; }
+
 /* ---- 批量操作条 -------------------------------------------------------------- */
 
 .batchbar {
@@ -1084,6 +1116,7 @@ details[open] > .acct-tasks-summary { color: var(--ink-2); border-bottom: 1px so
 .hour-row .field-label { font-size: 12px; font-weight: 500; letter-spacing: 0; color: var(--ink-2); }
 .hour-row .input { width: 100%; max-width: 220px; }
 .hour-row .hint { grid-column: 2; }
+.hours-note { margin-top: -4px; }
 
 .form-actions { display: flex; justify-content: flex-end; }
 
@@ -1421,6 +1454,7 @@ dialog::backdrop { background: rgba(8, 10, 14, .5); }
   .banners { padding: 0 16px 10px; }
   .acct-intl { padding: 8px 16px 0; }
   .acct-tasks .tbl-wrap { padding: 2px 16px 10px; }
+  .task-sel-bar { padding-left: 16px; padding-right: 16px; }
   .acct-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .batchbar { padding: 14px 16px 10px; }
   .batch-actions { margin-left: 0; width: 100%; justify-content: space-between; }
@@ -1529,7 +1563,8 @@ dialog::backdrop { background: rgba(8, 10, 14, .5); }
   .tbl-history td[data-label="触发"] { display: none; }
 
   .tbl-tasks tr { grid-template-columns: auto minmax(0, 1fr) auto; }
-  .tbl-tasks td[data-label="任务"] { grid-column: 1 / -1; grid-row: 1; }
+  .tbl-tasks td[data-label="选"] { grid-column: 1; grid-row: 1; align-self: start; padding-top: 2px; }
+  .tbl-tasks td[data-label="任务"] { grid-column: 2 / -1; grid-row: 1; }
   .tbl-tasks td[data-label="状态"] { grid-column: 1; grid-row: 2; }
   .tbl-tasks td[data-label="进度"] { grid-column: 2; grid-row: 2; }
   .tbl-tasks td[data-label="奖励"] { grid-column: 3; grid-row: 2; justify-self: end; font-size: 11px; }

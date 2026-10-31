@@ -11,6 +11,7 @@
   "use strict";
 
   var DEFAULT_URL = "http://127.0.0.1:4390";
+  var DASH_PORT = "4390";
 
   function $(sel) {
     return document.querySelector(sel);
@@ -21,6 +22,8 @@
   function normalizeTheme(t) {
     if (typeof t === "string") return t;
     if (t && typeof t === "object") {
+      // magpie 的窗口主题形状是 { dark: bool, lang, tokens }；先认这个官方形状
+      if (typeof t.dark === "boolean") return t.dark ? "dark" : "light";
       if (typeof t.theme === "string") return t.theme;
       if (typeof t.value === "string") return t.value;
       if (typeof t.mode === "string") return t.mode;
@@ -37,9 +40,48 @@
 
   // ---- 看板地址 ----------------------------------------------------------------
 
+  function hostOf(url) {
+    try {
+      return new URL(url).hostname;
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function isLoopbackHost(h) {
+    return h === "127.0.0.1" || h === "localhost" || h === "[::1]" || h === "::1";
+  }
+
+  // 页面被 magpie 以 /_magpie/plugin/<token>/ 的形式服务在 magpie 自己的主机上，
+  // 所以 location.hostname 就是用户访问 magpie 用的地址：用 192.0.2.10 打开
+  // magpie，看板地址就是 http://192.0.2.10:4390，不再死写 127.0.0.1。
+  // 沙箱虽是无同源（opaque origin），仍可读取自身 location。
+  function derivedDashboardUrl() {
+    var h = "";
+    try {
+      h = location.hostname || "";
+    } catch (e) { h = ""; }
+    if (!h || h === "0.0.0.0" || h === "::") return "";
+    return "http://" + h + ":" + DASH_PORT;
+  }
+
+  // 地址选择顺序：
+  //   ① dashboardUrl 显式设置且不是回环地址 → 用它（运维声明的对外地址）
+  //   ② 从 magpie 访问主机推导出的地址（局域网/网关 IP 场景，用户要的口径）
+  //   ③ dashboardUrl 显式设置的回环地址（SSH 隧道场景，可能带自定义端口）
+  //   ④ 推导出的回环地址 / 最终兜底 127.0.0.1:4390
+  function resolveDashboardUrl(raw) {
+    var opt = typeof raw === "string" ? raw.trim() : "";
+    var hasOpt = /^https?:\/\//i.test(opt);
+    var derived = derivedDashboardUrl();
+    if (hasOpt && !isLoopbackHost(hostOf(opt))) return opt;
+    if (derived && !isLoopbackHost(hostOf(derived))) return derived;
+    if (hasOpt) return opt;
+    return derived || DEFAULT_URL;
+  }
+
   function setDashboardUrl(raw) {
-    var url = typeof raw === "string" ? raw.trim() : "";
-    if (!/^https?:\/\//i.test(url)) url = DEFAULT_URL; // 只接受 http(s)，其余回退默认
+    var url = resolveDashboardUrl(raw);
     var code = $("#dashUrl");
     var link = $("#dashLink");
     if (code) code.textContent = url;
@@ -86,12 +128,7 @@
     }, 3200);
   }
 
-  function copyDashboardUrl() {
-    var code = $("#dashUrl");
-    var text = code ? code.textContent : DEFAULT_URL;
-    var done = function (ok) {
-      showToast(ok ? "已复制：" + text : "复制被沙箱拒绝，请手动选中地址复制。", ok);
-    };
+  function copyText(text, done) {
     try {
       if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(text).then(
@@ -102,6 +139,45 @@
       }
     } catch (e) { /* 落到兜底 */ }
     done(fallbackCopy(text));
+  }
+
+  function currentUrl() {
+    var code = $("#dashUrl");
+    return code ? code.textContent : DEFAULT_URL;
+  }
+
+  function copyDashboardUrl() {
+    var text = currentUrl();
+    copyText(text, function (ok) {
+      showToast(ok ? "已复制：" + text : "复制被沙箱拒绝，请手动选中地址复制。", ok);
+    });
+  }
+
+  // magpie 的 iframe 只有 sandbox="allow-scripts"，没有 allow-popups：
+  // window.open / target="_blank" 会被浏览器静默拦掉。这里先诚实地试一次，
+  // 被拦就把地址复制好并给出下一步——绝不让点击「没反应」。
+  // 右键链接 →「在新标签页中打开」不受脚本弹窗限制，是另一条可靠路径。
+  function openDashboard(e) {
+    if (e) e.preventDefault();
+    var url = currentUrl();
+    var win = null;
+    try {
+      win = window.open(url, "_blank", "noopener,noreferrer");
+    } catch (err) {
+      win = null;
+    }
+    if (win) {
+      showToast("已在新窗口打开看板。", true);
+      return;
+    }
+    copyText(url, function (ok) {
+      showToast(
+        ok
+          ? "magpie 沙箱不允许弹新窗口：地址已复制，粘贴到浏览器新标签页即可；也可右键「打开看板」→ 在新标签页中打开。"
+          : "magpie 沙箱不允许弹新窗口：请复制上方地址，或右键「打开看板」→ 在新标签页中打开。",
+        ok,
+      );
+    });
   }
 
   function fallbackCopy(text) {
@@ -135,14 +211,13 @@
       if (typeof mp.onTheme === "function") mp.onTheme(applyTheme);
     } catch (e) {}
 
-    // 插件选项（dashboardUrl；声明默认值见 package.json 的 magpie.options）
+    // 插件选项（dashboardUrl；声明默认值见 package.json 的 magpie.options）。
+    // 选项为空字符串时也调用一次：setDashboardUrl("") 会按当前 magpie 访问主机重算。
     try {
       if (mp.options && typeof mp.options.get === "function") {
         Promise.resolve(mp.options.get()).then(
           function (opts) {
-            if (opts && typeof opts.dashboardUrl === "string" && opts.dashboardUrl) {
-              setDashboardUrl(opts.dashboardUrl);
-            }
+            setDashboardUrl(opts && typeof opts.dashboardUrl === "string" ? opts.dashboardUrl : "");
           },
           function () {},
         );
@@ -176,24 +251,34 @@
   }
 
   function start() {
-    setDashboardUrl(DEFAULT_URL); // 先落默认值，宿主选项到达后再覆盖
+    setDashboardUrl(""); // 先按当前访问 magpie 的主机落一版，宿主选项到达后再覆盖
     var copyBtn = $("#copyBtn");
     if (copyBtn) copyBtn.addEventListener("click", copyDashboardUrl);
+    var openLink = $("#dashLink");
+    if (openLink) openLink.addEventListener("click", openDashboard);
 
     var mp = window.magpie;
-    if (mp && typeof mp.ready === "function") {
-      // ready 可能是「回调式」或「返回 Promise」——两种都兜住
+    var ready = mp ? mp.ready : null;
+    if (mp && (typeof ready === "function" || (ready && typeof ready.then === "function"))) {
+      // magpie.ready 是 Promise（见 _magpie/bridge.js 契约），不是回调式 API。
+      // 加载 bridge.js + await ready 就是「跟 magpie 说上话」：少了这一步，宿主
+      // 10 秒内收不到消息，会把本卡标成「已停止工作」。
       try {
-        var r = mp.ready(function () {
-          consumeHost(window.magpie);
-        });
-        if (r && typeof r.then === "function") r.then(function () { consumeHost(window.magpie); }, function () {});
+        var r = typeof ready === "function" ? ready() : ready;
+        Promise.resolve(r).then(
+          function (theme) {
+            applyTheme(theme);
+            consumeHost(mp);
+          },
+          function () {
+            consumeHost(mp);
+          },
+        );
+        return;
       } catch (e) {
         consumeHost(mp);
+        return;
       }
-      // 有的实现 ready(cb) 之外还允许直接消费；再补一次轮询兜底
-      waitForHost(10);
-      return;
     }
     waitForHost(25); // 桥可能稍后注入
   }

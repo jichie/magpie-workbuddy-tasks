@@ -5,8 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>WorkBuddy 任务</title>
   <link rel="stylesheet" href="style.css">
-  <!-- magpie 沙箱页：CSP connect-src 'none'、禁内联脚本。用经典外链脚本（defer），
-       不依赖模块加载，也不发起任何网络请求。 -->
+  <!-- magpie 沙箱页：sandbox="allow-scripts"、CSP connect-src 'none'、禁内联脚本。
+       bridge.js 由 magpie 在每个插件页旁提供，负责主题/选项握手；不加载它，宿主
+       10 秒内收不到页面消息，会把本卡标成「已停止工作」。app.js 用经典外链（defer），
+       零网络请求。 -->
+  <script src="_magpie/bridge.js"></script>
   <script src="app.js" defer></script>
 </head>
 <body>
@@ -49,14 +52,13 @@
           <h2 class="wb-label" id="wbDashTitle">看板</h2>
           <p class="wb-hint">账号列表、任务进度、批量操作、实时步骤、排程与历史都在独立看板里。</p>
         </div>
-        <span class="wb-dash-note">地址来自插件选项 <code>dashboardUrl</code></span>
+        <span class="wb-dash-note">地址按当前访问 magpie 的主机自动推导，可用插件选项 <code>dashboardUrl</code> 覆盖</span>
       </div>
 
       <div class="wb-url-row">
         <code class="wb-url" id="dashUrl">http://127.0.0.1:4390</code>
         <button type="button" class="wb-btn" id="copyBtn">复制地址</button>
-        <a class="wb-btn wb-btn-primary" id="dashLink" href="http://127.0.0.1:4390"
-          target="_blank" rel="noopener noreferrer">打开看板</a>
+        <a class="wb-btn wb-btn-primary" id="dashLink" href="http://127.0.0.1:4390">打开看板</a>
       </div>
 
       <div class="wb-dash-actions">

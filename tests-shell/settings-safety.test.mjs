@@ -163,9 +163,9 @@ describe("C1：scheduler 安全默认", () => {
     const stateDir = makeSandbox("wb-safe-").dir
     const h = await boot(stateDir)
     try {
-      // 把 growth 窗口钉在当前小时，令「窗口命中」条件必然成立
+      // 把 travel 窗口钉在当前小时，令「窗口命中」条件必然成立
       const nowHour = new Date().getHours()
-      const st = await post(h.port, "/api/settings", { scheduler: false, hours: { growth: [nowHour] } })
+      const st = await post(h.port, "/api/settings", { scheduler: false, hours: { travel: [nowHour] } })
       assert.equal(st.status, 200)
 
       const job = h.ticks.checkScheduler(Date.now())
@@ -183,7 +183,7 @@ describe("C1：scheduler 安全默认", () => {
     const h = await boot(stateDir)
     try {
       const nowHour = new Date().getHours()
-      await post(h.port, "/api/settings", { scheduler: true, hours: { growth: [nowHour] } })
+      await post(h.port, "/api/settings", { scheduler: true, hours: { travel: [nowHour] } })
 
       const d = new Date()
       const job = h.ticks.checkScheduler(d.getTime())

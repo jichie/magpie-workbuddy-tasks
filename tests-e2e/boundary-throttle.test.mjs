@@ -215,9 +215,10 @@ test("跨边界 A：job 收尾的 finalizeJob→refreshSnapshots 与手动 claim
 // ---- B. 排程 tick 与手动 claim 并发 ----------------------------------------------
 
 test("跨边界 B：排程 tick（checkScheduler→startJob）与手动 claim 并发，全程间隔 ≥1000ms", async () => {
-  // 排程窗口设在当前真实小时的 growth 腿（checkScheduler 用真实墙钟取小时）
+  // 排程窗口设在当前真实小时的 travel 腿（checkScheduler 用真实墙钟取小时；
+  // growth 已不在排程窗口里——排程只触发 travel/night，growth 只能手动跑）
   const hour = new Date().getHours();
-  const set = await api.json(api.post("/api/settings", { scheduler: true, hours: { growth: [hour], travel: [], night: [] } }));
+  const set = await api.json(api.post("/api/settings", { scheduler: true, hours: { travel: [hour], night: [] } }));
   assert.equal(set.status, 200);
   assert.equal(set.data.scheduler, true);
 
@@ -239,14 +240,14 @@ test("跨边界 B：排程 tick（checkScheduler→startJob）与手动 claim �
   const claim = await claimP;
   assert.equal(claim.status, 200, "claim 在 job 启动前已被受理（非 409）");
 
-  // 3. 红线：claim 与排程 job 的所有上游调用（含 growth 腿全程）两两间隔 ≥1000ms
+  // 3. 红线：claim 与排程 job 的所有上游调用（travel 腿全程）两两间隔 ≥1000ms
   assertRedLine(from, calls.length, "B（排程 tick × 手动 claim）：");
   assert.ok(calls[from].path === "/activity/growth/tasks/skill_1/claim", "窗口从 claim 开始");
 
-  // 4. 排程 job 的 growth 腿真跑完了（unforgeable/已领任务诚实跳过，但腿本身 ok）
+  // 4. 排程 job 的 travel 腿真跑完了（traveling 状态 → 如实报告，腿本身 ok）
   const j = (await api.json(api.get(`/api/jobs/${job.id}`))).data;
   assert.equal(j.state, "done");
-  assert.deepEqual(j.steps.map((s) => s.leg), ["growth"]);
+  assert.deepEqual(j.steps.map((s) => s.leg), ["travel"]);
   assert.equal(j.steps[0].state, "ok");
 });
 

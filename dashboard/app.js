@@ -20,7 +20,9 @@
 //        snapshot.expired 若为 true（后端将来下发）按「快照已过期」渲染；前端不发明字段。
 //   GET  /api/events           -> SSE {kind:'job'|'step'|'log'|'scheduler'|'accounts'}（只读流）
 //   GET  /api/history?limit=   -> {rows:[{at,uid,nickname,leg,state,detail,credit,energy,jobId,trigger}]}
-//   POST /api/run {uids?,legs?,claim?} -> {job} | 409 busy | 400 无账号 | 503 引擎不可用
+//   POST /api/run {uids?,legs?,claim?,codes?} -> {job} | 409 busy | 400 无账号 | 503 引擎不可用
+//        codes 可选：string[]（对所有账号）或 {[uid]: string[]}（按账号）。看板只发按 uid 的对象，
+//        且只把「该账号有勾选任务」的 uid 放进去 —— 未出现的账号 = 不限制（全部任务）。
 //   POST /api/stop             -> {job} | 404 没有任务在跑
 //   POST /api/task/accept {uid,codes[]}   -> {accepted,already,failed}
 //   POST /api/task/claim  {uid,code}      -> {ok,credit,energy,via("chat"|"web"|""),reason}
@@ -83,6 +85,7 @@ const state = {
   feed: "idle", // sse | poll | idle
   data: null, // 最近一次 /api/state
   selected: new Set(), // 勾选的 uid
+  taskSel: {}, // 任务级勾选：{ [uid]: Set(code) }（内存；跨 renderAll/快照刷新保留）
   expanded: new Set(), // 展开任务表的 uid
   toggling: new Set(), // 「参与任务」开关正在请求中的 uid（期间禁用该行开关）
   busy: false, // 批量操作进行中
@@ -663,6 +666,142 @@ async function claimOne(uid, code, btn) {
   }
 }
 
+// ---- 任务级勾选（只收窄批量操作，不影响单任务「接取 / 领奖」按钮） -----------------
+// state.taskSel = { [uid]: Set(code) }：按账号保存勾选的任务码，只存在内存里。
+// · 跨 renderAll()/快照刷新保留；某账号的集合清空时删掉该键（不勾选 = 全部任务）。
+// · 无 code 的行不可勾选（无从提交）；勾选不影响 travel / night 腿（它们没有任务码）。
+// · 批量请求只把「有勾选」的 uid 放进 body.codes，未出现的账号 = 全部任务。
+
+function pickedSet(uid) {
+  return state.taskSel[uid] ?? null;
+}
+
+function isPicked(uid, code) {
+  const set = pickedSet(uid);
+  return !!set && set.has(String(code ?? ""));
+}
+
+// 该账号勾选的任务码（原样，供 /api/run 的 body.codes 用）；没有勾选 → null
+function pickedCodes(uid) {
+  const set = pickedSet(uid);
+  return set && set.size ? [...set] : null;
+}
+
+function selectableCodes(a) {
+  const tasks = Array.isArray(a?.snapshot?.tasks) ? a.snapshot.tasks : [];
+  return tasks.map((t) => String(t?.code ?? "")).filter(Boolean);
+}
+
+// 「已选 N 项」只数当前快照里真实存在的任务码；没有快照时才退回集合大小
+function pickedVisibleCount(uid) {
+  const set = pickedSet(uid);
+  if (!set || !set.size) return 0;
+  const avail = selectableCodes(accountByUid(uid));
+  if (!avail.length) return set.size;
+  let n = 0;
+  for (const c of avail) if (set.has(c)) n++;
+  return n;
+}
+
+function totalPickedCount() {
+  let n = 0;
+  // 只统计真正会进入批量操作的可参与账号（与 targetAccounts 同口径）
+  for (const a of eligibleAccounts()) n += pickedVisibleCount(a.uid);
+  return n;
+}
+
+function setPicked(uid, code, on) {
+  const c = String(code ?? "");
+  if (!c) return;
+  let set = state.taskSel[uid];
+  if (on) {
+    if (!set) set = state.taskSel[uid] = new Set();
+    set.add(c);
+  } else if (set) {
+    set.delete(c);
+    if (!set.size) delete state.taskSel[uid];
+  }
+  updateTaskSelUI(uid);
+}
+
+function setPickedAll(uid, on) {
+  const codes = selectableCodes(accountByUid(uid));
+  if (on && codes.length) state.taskSel[uid] = new Set(codes);
+  else delete state.taskSel[uid];
+  updateTaskSelUI(uid);
+}
+
+function taskAllBoxes(uid) {
+  return $$("input[data-task-all]").filter((i) => i.dataset.taskAll === uid);
+}
+function taskRowBoxes(uid) {
+  return $$("input[data-task-pick]").filter((i) => i.dataset.taskPick === uid);
+}
+
+// 同步某账号的勾选控件（行 checkbox / 表头与提示条的「全选」/ 已选计数），不整页重绘
+function updateTaskSelUI(uid) {
+  const set = pickedSet(uid);
+  for (const cb of taskRowBoxes(uid)) {
+    cb.checked = !!set && set.has(String(cb.dataset.code ?? ""));
+  }
+  const avail = selectableCodes(accountByUid(uid));
+  const n = pickedVisibleCount(uid);
+  for (const box of taskAllBoxes(uid)) {
+    box.checked = avail.length > 0 && n >= avail.length;
+    box.indeterminate = n > 0 && n < avail.length;
+    box.disabled = avail.length === 0;
+  }
+  for (const bar of $$("[data-task-sel-bar]").filter((b) => b.dataset.taskSelBar === uid)) {
+    const out = $(".task-sel-count", bar);
+    if (out) out.textContent = `已选 ${n} 项`;
+  }
+  updateTaskSelNote();
+}
+
+// 批量条上的全局提示：有任何任务级勾选时显示「已选 N 项任务」
+function updateTaskSelNote() {
+  const box = $("#taskSelSummary");
+  if (!box) return;
+  const n = totalPickedCount();
+  box.textContent = n ? `已选 ${n} 项任务` : "";
+  box.hidden = n === 0;
+}
+
+// 批量请求的 codes 形状：{ [uid]: string[] }；只收目标账号里有勾选的那些
+function selectionBody(accounts) {
+  const out = {};
+  for (const a of accounts) {
+    const codes = pickedCodes(a.uid);
+    if (codes) out[a.uid] = codes;
+  }
+  return out;
+}
+
+function selectionCount(codes) {
+  return Object.values(codes).reduce((n, arr) => n + (Array.isArray(arr) ? arr.length : 0), 0);
+}
+
+// 表格上方的短提示条：全选 + 说明 + 已选计数（窄屏 thead 被隐藏时也能全选）
+function taskSelBar(uid) {
+  return el(
+    "div",
+    { class: "task-sel-bar", dataset: { taskSelBar: uid } },
+    el(
+      "label",
+      { class: "check task-sel-all", title: "勾选 / 取消该账号的全部任务" },
+      el("input", {
+        type: "checkbox",
+        dataset: { taskAll: uid },
+        "aria-label": "全选该账号任务",
+        onchange: (ev) => setPickedAll(uid, ev.target.checked),
+      }),
+      el("span", { text: "全选" }),
+    ),
+    el("span", { class: "task-sel-hint", text: "勾选后批量操作只作用于选中任务；不勾选 = 全部" }),
+    el("span", { class: "task-sel-count", text: "已选 0 项" }),
+  );
+}
+
 // 单行任务：所有「能不能自动化」的标注与门控都来自 taskFlags（后端字段），
 // 服务端字符串（title / code / reason / id）一律走 textContent。
 function taskRow(a, t) {
@@ -756,6 +895,22 @@ function taskRow(a, t) {
     {},
     el(
       "td",
+      { "data-label": "选", class: "pick-cell" },
+      el(
+        "label",
+        { class: "check", title: code ? "勾选后批量操作只作用于选中任务；不勾选 = 全部" : "快照缺任务码，无法勾选" },
+        el("input", {
+          type: "checkbox",
+          dataset: { taskPick: a.uid, code },
+          checked: !!code && isPicked(a.uid, code),
+          disabled: !code,
+          "aria-label": code ? `选择任务 ${String(t.title ?? code)}` : "该任务无任务码，无法勾选",
+          onchange: (ev) => setPicked(a.uid, code, ev.target.checked),
+        }),
+      ),
+    ),
+    el(
+      "td",
       { "data-label": "任务" },
       el("span", { class: "cell-main", text: String(t.title ?? code ?? "（无标题）") }),
       code ? el("span", { class: "cell-sub", text: code }) : null,
@@ -798,6 +953,20 @@ function taskTable(a) {
     el(
       "tr",
       {},
+      el(
+        "th",
+        { class: "pick-col" },
+        el(
+          "label",
+          { class: "check", title: "全选 / 取消全选该账号的任务" },
+          el("input", {
+            type: "checkbox",
+            dataset: { taskAll: a.uid },
+            "aria-label": "全选该账号任务",
+            onchange: (ev) => setPickedAll(a.uid, ev.target.checked),
+          }),
+        ),
+      ),
       el("th", { text: "任务" }),
       el("th", { text: "状态" }),
       el("th", { text: "进度" }),
@@ -807,14 +976,16 @@ function taskTable(a) {
   );
   const body = el("tbody", {}, tasks.map((t) => taskRow(a, t)));
   const table = el("div", { class: "tbl-wrap" }, el("table", { class: "tbl tbl-tasks" }, head, body));
-  if (!expired) return table;
+  // 任务级勾选提示条始终在表格上方：说明「不勾选 = 全部」，并显示已选计数
+  const kids = [taskSelBar(a.uid)];
   // 后端标记过期：数据仍展示（比空白有用），但明确说明陈旧并给只读刷新入口
-  return el(
-    "div",
-    {},
-    el("p", { class: "snap-stale", text: `快照已过期（${fmtDateTime(snap.updatedISO)} 更新），${REFRESH_NOTE}` }),
-    table,
-  );
+  if (expired) {
+    kids.push(
+      el("p", { class: "snap-stale", text: `快照已过期（${fmtDateTime(snap.updatedISO)} 更新），${REFRESH_NOTE}` }),
+    );
+  }
+  kids.push(table);
+  return el("div", { class: "task-sel-wrap" }, ...kids);
 }
 
 // 账号行的轻量汇总：状态分布 + 后端判断字段的计数（共 N 项 · 桌面端 N · 无法自动化 N ·
@@ -1241,9 +1412,12 @@ function renderAccounts() {
     return;
   }
   for (const a of accounts) box.append(accountRow(a));
-  // 清掉已不存在的勾选
+  // 清掉已不存在的勾选（账号级 / 任务级都按 uid 收口）
   const uids = new Set(accounts.map((a) => a.uid));
   for (const s of [...state.selected]) if (!uids.has(s)) state.selected.delete(s);
+  for (const uid of Object.keys(state.taskSel)) if (!uids.has(uid)) delete state.taskSel[uid];
+  // 重建 DOM 后把勾选控件同步回 state（表头全选/半选、已选计数）
+  for (const a of accounts) updateTaskSelUI(a.uid);
   updateSelectionUI();
 }
 
@@ -1257,11 +1431,14 @@ function renderAcceptNote() {
   let noSnap = 0;
   let modern = false;
   for (const a of targetAccounts()) {
-    const tasks = a.snapshot?.tasks;
-    if (!Array.isArray(tasks)) {
+    const all = a.snapshot?.tasks;
+    if (!Array.isArray(all)) {
       noSnap++;
       continue;
     }
+    // 只看当前勾选（没勾选 = 全部）——说明文字与实际会提交的范围保持一致
+    const set = pickedSet(a.uid);
+    const tasks = set && set.size ? all.filter((t) => set.has(String(t?.code ?? ""))) : all;
     if (tasks.some((t) => taskFlags(t).modern)) modern = true;
     blocked += acceptPlan(tasks).blocked;
   }
@@ -1293,12 +1470,15 @@ function updateSelectionUI() {
   $("#btnRun").textContent = jobRunning ? "任务运行中…" : "批量做任务";
   if (noElig && !offline) {
     $("#btnRun").title = "没有可参与任务的账号";
+  } else if (totalPickedCount() > 0) {
+    $("#btnRun").title = "完整流水线：接取 → 点亮（上报进度）→ 领奖；只做各账号勾选的任务（旅行/夜猫子腿不受影响）";
   } else {
     $("#btnRun").title = "完整流水线：接取 → 点亮（上报进度）→ 领奖";
   }
   // 批量接取只提交 canAccept === true 的 codes；不可接取的项数在按钮旁说明
-  $("#btnAccept").title = "只接取守护进程判定 canAccept 的任务（桌面端 / 未收录 / 自动任务不会进名单）";
+  $("#btnAccept").title = "只接取守护进程判定 canAccept 的任务（桌面端 / 未收录 / 自动任务不会进名单）；有任务勾选时只接勾选项";
   renderAcceptNote();
+  updateTaskSelNote();
 }
 
 // ---- 实时进度区 --------------------------------------------------------------------------
@@ -1427,6 +1607,26 @@ function setBatchStatus(text) {
   $("#batchStatus").textContent = text ?? "";
 }
 
+// 顶部「任务腿」是唯一选择源：勾选由 settings.legs 回写，HTML 里不再写死 checked。
+// settings.legs 缺失/为空时回退到旧版出厂默认（成长任务），与后端「未指定 legs 时补 growth」一致。
+const DEFAULT_LEGS = ["growth"];
+let syncedLegsKey = null; // 最近一次从 settings.legs 同步到顶部的值（排序后拼接）
+
+function legsFromSettings(v) {
+  const legs = Array.isArray(v) ? v.filter((l) => typeof l === "string" && l) : [];
+  return legs.length ? legs : DEFAULT_LEGS;
+}
+
+// 按 settings.legs 同步顶部 .leg-check。默认只在服务端值变化（或 force）时覆盖：
+// 3s/5s 的后台轮询也会走 renderScheduler，不能把用户尚未保存的勾选改回去。
+function syncLegChecks(legs, { force = false } = {}) {
+  const list = legsFromSettings(legs);
+  const key = [...list].sort().join(",");
+  if (!force && key === syncedLegsKey) return;
+  syncedLegsKey = key;
+  for (const cb of $$(".leg-check")) setChecked(cb, list.includes(cb.value));
+}
+
 function selectedLegs() {
   return $$(".leg-check:checked").map((i) => i.value);
 }
@@ -1452,9 +1652,17 @@ async function runFull() {
   }
   await withBusy(async () => {
     const uids = [...state.selected];
+    // 任务级勾选按 uid 提交：只有「该账号有勾选」的 uid 进 codes，未出现的账号 = 全部任务。
+    // travel / night 腿没有任务码，后端会忽略 codes，不受勾选影响。
+    const codes = selectionBody(targetAccounts());
+    const picked = selectionCount(codes);
     const body = { legs, claim: $("#claimToggle").checked };
     if (uids.length) body.uids = uids;
-    setBatchStatus(`正在启动批量任务：${legs.map(legName).join(" + ")}，${uids.length ? `${uids.length} 个账号` : "全部可参与账号"}，${body.claim ? "自动领奖" : "手动领奖（做完不领，之后可「只领奖」）"}…`);
+    if (picked) body.codes = codes;
+    setBatchStatus(
+      `正在启动批量任务：${legs.map(legName).join(" + ")}，${uids.length ? `${uids.length} 个账号` : "全部可参与账号"}，` +
+        `${picked ? `仅选中任务（${picked} 项），` : ""}${body.claim ? "自动领奖" : "手动领奖（做完不领，之后可「只领奖」）"}…`,
+    );
     try {
       const r = await api("api/run", { method: "POST", body });
       setBatchStatus(`已启动 ${r?.job?.id ?? "批量任务"}：进度见「实时进度」区（SSE 推送）。`);
@@ -1486,7 +1694,9 @@ async function acceptSelected() {
       failed = 0;
     const noCode = [];
     const blockedNotes = [];
+    const pickedEmpty = [];
     const notes = [];
+    let usedPicked = false;
     for (let i = 0; i < targets.length; i++) {
       const a0 = targets[i];
       setBatchStatus(`批量接取（${i + 1}/${targets.length}）：${a0.nickname || a0.uid} …`);
@@ -1502,10 +1712,19 @@ async function acceptSelected() {
         continue;
       }
       const plan = acceptPlan(a.snapshot?.tasks);
-      const codes = plan.codes;
+      // 任务级勾选：只提交与 acceptPlan.codes 的交集；勾选项全被过滤掉时明确说明，
+      // 绝不静默退回「接该账号全部」（未勾选的账号不受影响 = 全部）。
+      const picked = pickedCodes(a.uid);
+      const pickedSet = picked ? new Set(picked) : null;
+      if (pickedSet) usedPicked = true;
+      const codes = pickedSet ? plan.codes.filter((c) => pickedSet.has(c)) : plan.codes;
       // 规则 4：不可自动接取的项要说出来，不能静默少接
       if (plan.blocked) {
         blockedNotes.push(`${a.nickname || a.uid}：${plan.blocked} 项不可自动接取（桌面端/未收录）`);
+      }
+      if (pickedSet && !codes.length) {
+        pickedEmpty.push(`${a.nickname || a.uid}：已选任务都不可自动接取/无待接`);
+        continue;
       }
       if (!codes.length) {
         const why = plan.noCode
@@ -1531,8 +1750,11 @@ async function acceptSelected() {
         notes.push(`${a.nickname || a.uid}：${e.message}`);
       }
     }
-    const parts = [`批量接取完成：新接 ${accepted} · 已接过 ${already} · 失败 ${failed}`];
+    const parts = [
+      `批量接取完成${usedPicked ? "（仅选中任务）" : ""}：新接 ${accepted} · 已接过 ${already} · 失败 ${failed}`,
+    ];
     if (blockedNotes.length) parts.push(`不可自动接取：${blockedNotes.join("、")}`);
+    if (pickedEmpty.length) parts.push(`按勾选跳过：${pickedEmpty.join("、")}`);
     if (noCode.length) parts.push(`跳过：${noCode.join("、")}`);
     if (notes.length) parts.push(notes.join("；"));
     setBatchStatus(parts.join("。"));
@@ -1550,6 +1772,8 @@ async function claimSelected() {
       viaWeb = 0;
     const failNotes = [];
     const noCode = [];
+    const pickedEmpty = [];
+    let usedPicked = false;
     for (let i = 0; i < targets.length; i++) {
       const a0 = targets[i];
       setBatchStatus(`只领奖（${i + 1}/${targets.length}）：${a0.nickname || a0.uid} …`);
@@ -1564,9 +1788,18 @@ async function claimSelected() {
         failNotes.push(`${a0.nickname || a0.uid}：快照刷新失败`);
         continue;
       }
+      // 任务级勾选：pending 任务按勾选过滤；有勾选但无匹配待领奖时明确说明
+      const picked = pickedCodes(a.uid);
+      const pickedSet = picked ? new Set(picked) : null;
+      if (pickedSet) usedPicked = true;
       const pending = (a.snapshot?.tasks ?? []).filter((t) => t.acceptStatus === "completed");
-      const codes = pending.filter((t) => t.code).map((t) => t.code);
-      if (pending.length && !codes.length) noCode.push(a.nickname || a.uid);
+      const scoped = pickedSet ? pending.filter((t) => pickedSet.has(String(t?.code ?? ""))) : pending;
+      const codes = scoped.filter((t) => t.code).map((t) => t.code);
+      if (pickedSet && !scoped.length) {
+        pickedEmpty.push(`${a.nickname || a.uid}：已选任务都不可领奖/无待领奖`);
+        continue;
+      }
+      if (scoped.length && !codes.length) noCode.push(a.nickname || a.uid);
       for (const code of codes) {
         try {
           const r = await api("api/task/claim", { method: "POST", body: { uid: a.uid, code } });
@@ -1587,8 +1820,11 @@ async function claimSelected() {
         }
       }
     }
-    const parts = [`领奖完成：成功 ${okCount} 项，+${fmtNum(credit)} 积分，+${fmtNum(energy)} 能量`];
+    const parts = [
+      `领奖完成${usedPicked ? "（仅选中任务）" : ""}：成功 ${okCount} 项，+${fmtNum(credit)} 积分，+${fmtNum(energy)} 能量`,
+    ];
     if (viaWeb) parts.push(`其中 ${viaWeb} 项已走网页通道（桌面端领奖被拒，网页兜底成功）`);
+    if (pickedEmpty.length) parts.push(`按勾选跳过：${pickedEmpty.join("、")}`);
     if (noCode.length) parts.push(`无法领取（快照缺任务码）：${noCode.join("、")}`);
     if (failNotes.length) parts.push(`未成功：${failNotes.slice(0, 6).join("；")}${failNotes.length > 6 ? " 等" : ""}`);
     parts.push("任务表里的状态以快照为准，可点账号旁「刷新快照」查看最新。");
@@ -2172,13 +2408,14 @@ function renderScheduler() {
   const settings = d.settings ?? {};
 
   setChecked($("#schedEnabled"), sch.enabled);
+  // 小时窗口只保留猫猫旅行 / 夜猫子；settings.hours.growth 即使老后端还带也一律忽略。
   const hours = settings.hours ?? {};
-  setVal($("#hoursGrowth"), (hours.growth ?? []).join(","));
   setVal($("#hoursTravel"), (hours.travel ?? []).join(","));
   setVal($("#hoursNight"), (hours.night ?? []).join(","));
   setChecked($("#defClaim"), settings.claim);
   setVal($("#gapMs"), settings.gapMs);
-  for (const cb of $$(".defleg-check")) setChecked(cb, (settings.legs ?? []).includes(cb.value));
+  // 顶部任务腿跟 settings.legs 同步（唯一选择源；不再有独立的默认腿控件）
+  syncLegChecks(settings.legs);
 
   $("#lastCycle").textContent = sch.lastCycle ? `上次触发 ${fmtDateTime(sch.lastCycle)}` : "尚未触发过";
 
@@ -2188,7 +2425,11 @@ function renderScheduler() {
   if (!sch.enabled) {
     nr.append(el("p", { class: "muted", text: "排程已停用：打开上方开关后，到点会自动跑一轮。" }));
   } else {
-    const items = nextRunItems(sch.nextRuns);
+    // 防御性过滤：后端不再返回 growth，但老/脏数据里若带 [ "growth", h ] 也不展示
+    const runs = (Array.isArray(sch.nextRuns) ? sch.nextRuns : []).filter(
+      (r) => Array.isArray(r) && String(r[0]) !== "growth",
+    );
+    const items = nextRunItems(runs);
     if (!items.length) {
       nr.append(el("p", { class: "muted", text: "没有配置任何小时窗口。" }));
     } else {
@@ -2247,8 +2488,8 @@ function parseHoursInput(v) {
 }
 
 async function saveHours() {
+  // 排程只服务两条无任务码的腿；成长任务已从排程里移除（手工运行仍可选它）。
   const hours = {
-    growth: parseHoursInput($("#hoursGrowth").value),
     travel: parseHoursInput($("#hoursTravel").value),
     night: parseHoursInput($("#hoursNight").value),
   };
@@ -2262,7 +2503,12 @@ async function saveHours() {
 }
 
 async function saveDefaults() {
-  const legs = $$(".defleg-check:checked").map((i) => i.value);
+  // 顶部 .leg-check 是唯一选择源：「保存默认」保存的就是此刻顶部的勾选。
+  const legs = selectedLegs();
+  if (!legs.length) {
+    toast("请至少勾选一条任务腿（成长任务 / 猫猫旅行 / 夜猫子）。", "warn");
+    return;
+  }
   const gapMs = Number($("#gapMs").value);
   const body = { legs, claim: $("#defClaim").checked };
   if (Number.isFinite(gapMs)) body.gapMs = gapMs;
@@ -2300,6 +2546,8 @@ function applySettings(s) {
   if (typeof s.scheduler === "boolean") {
     state.data.scheduler = { ...(state.data.scheduler ?? {}), enabled: s.scheduler };
   }
+  // 保存后强制用服务端返回的 settings.legs 回写顶部勾选（保存的是顶部选择，这里保证两边一致）。
+  syncLegChecks(state.data.settings.legs, { force: true });
   renderScheduler();
 }
 

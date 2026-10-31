@@ -447,8 +447,25 @@ export async function progressTask(acct, t, logs, opts = {}) {
 
 // ---- 完整流水线（wb_tasks.run_growth_tasks 的移植）---------------------------
 
+// 任务级勾选（CONTRACT §3/§6/§7）：opts.codes 非空数组 = 只处理这些 code；
+// 未传 / 空数组 / 非法类型 = 全部任务（旧行为）。这里做一层防御性归一——只留
+// 非空字符串并去重（去重保序不必要，进 Set）；每个 uid 清单的去重/上限（500）
+// 由 daemon 的 API 边界负责（startJob），引擎只认「非空集合 = 勾选生效」。
+function selectedCodeSet(codes) {
+  if (!Array.isArray(codes)) return null;
+  const out = new Set();
+  for (const c of codes) {
+    if (typeof c === "string" && c.trim()) out.add(c.trim());
+  }
+  return out.size ? out : null;
+}
+
 // runGrowthTasks(acct, opts) -> GrowsResult
-// opts: {gap=1000, claim=true, log(fn), sleep(fn), now(fn), fetch, signal}
+// opts: {gap=1000, claim=true, codes?: string[], log(fn), sleep(fn), now(fn), fetch, signal}
+//   opts.codes —— 任务级勾选：非空数组时只对选中的任务接取/点亮/领奖；未选中
+//   的任务完全不动作（不接取、不上报、不轮询、不领奖）。每次 fetchTasks 之后
+//   都按选中集合过滤；选中但任务表里没有的 code 记一次警告并跳过，绝不硬闯。
+//   空数组/未传 = 全部任务（旧行为）。
 // GrowsResult: {ok, logs, earnedCredit, credit, energy, lit, claimed, restricted?}
 export async function runGrowthTasks(acct, opts = {}) {
   const ctx = makeCtx(opts);
@@ -485,9 +502,27 @@ export async function runGrowthTasks(acct, opts = {}) {
     return { ok: false, logs, earnedCredit: 0, ...totals };
   }
 
+  // 任务级勾选（CONTRACT §3/§6/§7）：选中集合对「整份任务表」先校验一次——
+  // 选中但任务表里不存在的 code 记一次警告并跳过（绝不硬闯），随后每次
+  // fetchTasks 之后都重新按集合过滤。selected=null = 未勾选，原样透传（旧行为）。
+  const selected = selectedCodeSet(opts.codes);
+  const scope = (list) => (selected ? list.filter((t) => selected.has(t.code)) : list);
+  if (selected) {
+    emit(`仅处理选中的 ${selected.size} 项任务`);
+    const missing = [...selected].filter((c) => !tasks.some((t) => t.code === c));
+    if (missing.length) {
+      emit(
+        `! 选中的 ${missing.length} 项任务不在任务表中，本轮跳过: ${missing.slice(0, 5).join(", ")}` +
+        (missing.length > 5 ? " ..." : ""),
+      );
+    }
+  }
+  tasks = scope(tasks);
+
   // 0. auto 类任务（如 first_buddy）不需要接取，且可能是其他任务与猫猫旅行
   //    的前置：必须先把它们点亮并领奖（first_buddy 的奖励就是 Buddy 实例），
   //    否则 single 任务接取会报 "prerequisite not met: first_buddy"。
+  //    只有选中的任务才进这一步（tasks 已按勾选过滤）。
   for (const t of tasks) {
     if (t.taskType === "auto") {
       if (collect(await progressTask(acct, t, logsOut, run))) {
@@ -517,9 +552,15 @@ export async function runGrowthTasks(acct, opts = {}) {
     }
     if (acc.accepted.length) emit(`✓ 已接取 ${acc.accepted.length} 个任务`);
     await ctx.breathe();
-    tasks = await fetchTasks(acct, run);
     // 复核一次：上游偶尔会瞬时拒绝整个批次，复查后仍处于未接取的再补一次，
     // 否则后面所有上报都作用在未接取的任务上 —— 进度全是 0。
+    // 「清单拉空」按**过滤前**的整表判断（勾选过滤后为空是正常现象，不是拉取失败）。
+    let refetched = await fetchTasks(acct, run);
+    if (!refetched.length) {
+      emit("! 接取后无法获取任务清单，本轮中止");
+      return { ok: false, logs, earnedCredit: totals.credit, ...totals };
+    }
+    tasks = scope(refetched);
     const still = tasks.filter(needsAccept).map((t) => t.code);
     if (still.length) {
       emit(`仍有 ${still.length} 个未接取，重试接取一次...`);
@@ -529,11 +570,12 @@ export async function runGrowthTasks(acct, opts = {}) {
       }
       if (retry.accepted.length) emit(`✓ 重试接取成功 ${retry.accepted.length} 个`);
       await ctx.breathe();
-      tasks = await fetchTasks(acct, run);
-    }
-    if (!tasks.length) {
-      emit("! 接取后无法获取任务清单，本轮中止");
-      return { ok: false, logs, earnedCredit: totals.credit, ...totals };
+      refetched = await fetchTasks(acct, run);
+      if (!refetched.length) {
+        emit("! 接取后无法获取任务清单，本轮中止");
+        return { ok: false, logs, earnedCredit: totals.credit, ...totals };
+      }
+      tasks = scope(refetched);
     }
     const stillPending = tasks.filter(needsAccept).map((t) => t.code);
     if (stillPending.length) {
@@ -541,7 +583,7 @@ export async function runGrowthTasks(acct, opts = {}) {
     }
   }
 
-  // 2. 处理每个任务（auto 已在第 0 步处理过）
+  // 2. 处理每个任务（auto 已在第 0 步处理过；tasks 仍是选中集合的投影）
   for (const t of tasks) {
     if (t.taskType === "auto") continue;
     if (collect(await progressTask(acct, t, logsOut, run))) {

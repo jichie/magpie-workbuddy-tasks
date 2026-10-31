@@ -1,5 +1,10 @@
-// schedule.mjs —— 小时窗口排程（CONTRACT §8：09:00/21:00 成长+旅行，01:00 夜猫，
+// schedule.mjs —— 小时窗口排程（CONTRACT §8：09:00/21:00 猫猫旅行，01:00 夜猫，
 // 夜猫只认 23:00–08:00）与账号间隔（铁律 4：手动 1.5 s，排程 2–5 s 抖动）。
+//
+// 成长任务（growth）不在任何排程窗口里：到点自动跑的是无任务码、对账号零写入
+// 风险的腿；growth 只能手动发起（看板「立即运行」/ POST /api/run / 工具
+// workbuddy_tasks_run，可再配合 codes 勾选任务）。手动运行的默认 settings.legs
+// 仍可含 growth（daemon 的 LEGS 常量不变），这里只是排程不触发它。
 
 import {
   ACCOUNT_GAP_MANUAL_MS,
@@ -11,10 +16,10 @@ export { inNightWindow } from "./constants.mjs";
 
 const HOUR_MS = 3600_000;
 
-// 每日本地时间窗口：hour = 本地小时。
+// 每日本地时间窗口：hour = 本地小时。growth 刻意缺席（见文件头注释）。
 export const SCHEDULE_WINDOWS = [
-  { hour: 9, legs: ["growth", "travel"] },
-  { hour: 21, legs: ["growth", "travel"] },
+  { hour: 9, legs: ["travel"] },
+  { hour: 21, legs: ["travel"] },
   { hour: 1, legs: ["night"] },
 ];
 
