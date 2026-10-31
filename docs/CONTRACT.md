@@ -45,6 +45,12 @@ magpie-workbuddy-tasks/
 // store.mjs
 readMagpieConfigDir(env) -> string|null        // directory / $MAGPIE_CONFIG_DIR / ~/.config/magpie
 loadAccounts(cfg) -> Account[]                 // 读 plugin-auth.json 的 workbuddy* 条目
+                                               // **层级边界（纯国内版口径）**：这里原样返回全部
+                                               // workbuddy* 条目（含国际版 workbuddy-ai）——accountio
+                                               // 导入合并与导出 realm=intl 逃生口要全量数据；
+                                               // daemon 在使用侧统一经自己的 loadAccountsCn()
+                                               // （只留 provider==="workbuddy"）做列表/统计/排程/
+                                               // 运行取数，别把「只出国内版」的过滤下沉到本层
 saveAccountRefresh(cfg, acctKey, patch) -> void // 原子回写（tmp + rename，保留未知字段，mode 600）
 acctKey = "workbuddy" | "workbuddy#xxxxxxxx"   // magpie/OpenCode 的多账号键格式
 
@@ -129,38 +135,53 @@ class JobRunner {
 **时间必须可注入**：所有 sleep/now 走 `opts.sleep/opts.now`，测试里换成假时钟，保证「≥1 s 间隔」可断言、测试秒级完成。
 **fetch 同样可注入**：runner/daemon 全程把 `opts.fetch` 透传给 upstream（daemon 亦接受 `startDaemon({fetch})`，并注入到快照刷新、手动领奖/接取/签到等每一路引擎调用），测试以假 fetch 替换全部上游调用，零真实网络。跨腿/跨刷新的边界由 runner 在每条腿前补一拍 `gap`（腿内由 `makeCtx.breathe` 保证），使「任意两次上游调用 ≥1 s」在整条链路上成立。
 
-## 3. daemon HTTP API（前端唯一依赖；全部 JSON；**按副作用分级要 key**）
+## 3. daemon HTTP API（前端唯一依赖；全部 JSON；**免密钥**）
 
-鉴权分级（用户口径「打开看板页面不再弹密钥」）：`Authorization: Bearer <daemon key>` 或 `?k=<daemon key>`；
-key 由 `index.mjs` 生成存 `state/daemon.json`。**路由→是否需密钥的单一数据源**在 `daemon.mjs` 的
-`API_ROUTE_AUTH` + `routeNeedsKey()`（导出供测试），任何新路由都必须登记进表，别散在各处 if：
+鉴权（**用户明确要求「全部改成免密钥」**，局域网自建工具口径）：**所有路由一律不需要密钥**——包括
+`POST /api/run`、`/api/stop`、`/api/task/claim`、`/api/task/accept`、`/api/checkin`、`/api/settings`、
+`/api/account/toggle`、`/api/shutdown`、导入确认写盘（`confirm:true`）、含 token 的导出（`secrets=1`）、
+SSE 与静态资源。鉴权由**网络边界**负责：默认只绑 `127.0.0.1`；绑定 `0.0.0.0`/`::` 即暴露到容器网桥/
+局域网——同一局域网内任何主机都能触发批量任务、写入 `plugin-auth.json`（导入确认）、下载含
+accessToken/refreshToken 的导出并关停守护进程（README 安全段如实写明，不粉饰）。
 
-- **免密钥（只读、无副作用、响应不含凭据）**：`GET /` 与静态资源、`GET /api/hello`、`GET /api/state`
-  （含现有 `?refresh=` 语义——它只打上游只读 GET，保持免密钥）、`GET /api/history`、`GET /api/jobs/:id`、
-  `GET /api/events`(SSE)、`POST /api/accounts`（重扫本地文件，无副作用）、
-  `GET /api/accounts/export?secrets=0`（脱敏导出）、`POST /api/accounts/import` 的**预览分支**
-  （confirm 缺省）。
-- **必须密钥（有副作用或含凭据）**：`POST /api/run`、`/api/stop`、`/api/task/claim`、`/api/task/accept`、
-  `/api/checkin`、`/api/settings`、`/api/account/toggle`、`/api/shutdown`、
-  `POST /api/accounts/import?confirm=true`（或 body `{"confirm":true}`）、
-  `GET /api/accounts/export` 缺省或 `secrets=1`（**红线：这条免密钥就能把所有 access/refresh
-  打包下载走，绝不放开**）。
-- 无密钥访问需密钥路由 → `401 {error: KEY_REQUIRED_MSG}`，文案说明「此操作会改动账号或涉及凭据，
-  请在看板右上「解锁写操作」里填入 state/daemon.json 的 key」。
-- **未登记的路由一律按需密钥处理**（默认关死；带 key 才能看到 404）。
+- **单一真相**在 `daemon.mjs` 的 `routeNeedsKey()`（导出供测试）：**恒返回 `false`**，函数注释写明
+  「用户明确要求免密钥、局域网自建工具、鉴权由网络边界负责」。若将来要重新引入鉴权，只改这一处。
+- `API_ROUTE_AUTH` 保留为**路由登记表**（每条 `{method, re, path, note}`）：任何新路由都必须登记进表；
+  「全路由免密钥清单测试」（tests-shell/account-routes.test.mjs）遍历全表证明不存在需要密钥的路径。
+- **向后兼容**：旧调用带 `Authorization: Bearer <…>` 或 `?k=<…>` 照常接受（不做任何校验、不报
+  400/401），升级期平滑过渡；新集成不需要带。
+- `state/daemon.json` 仍写 `key` 字段（0600；`index.mjs`/`lifecycle.mjs` 的探测逻辑与老看板依赖该
+  字段存在），**但不再作为访问凭据，任何接口都不校验它**；`KEY_REQUIRED_MSG` 与一切「需要密钥」
+  文案已删除，日志与静态兜底页如实描述「无鉴权，靠网络边界（默认只绑 127.0.0.1）」。
+
+**纯国内版口径（用户明确要求「国际版账号彻底不出现」）**：daemon 的**列表/统计/快照/排程/运行/
+单账号操作**统一经 daemon 侧唯一的取数过滤 `loadAccountsCn()`（只留 `provider === "workbuddy"`）；
+`workbuddy-ai`（国际版）不进 `/api/state` 的 `accounts[]`、不进快照/汇总/统计、不进任何 job。
+**过滤只发生在 daemon 使用侧**——`engine/store.loadAccounts` 行为不变（仍返回全部 workbuddy\*
+条目：accountio 的导入合并与导出 `realm=intl` 逃生口要全量数据），**别把「只出国内版」的过滤
+下沉进 store 层**。诊断计数：`/api/state` 顶层 `intlSkipped:{count,note}` 只给数量与说明，
+绝不列出国际版账号内容（uid/昵称/域名都不给）。
 
 绑定：`127.0.0.1` 默认；链路 `options.listenAddress → WB_DAEMON_ADDR → --addr`，设 `0.0.0.0`/`::` 才对外
-（README 强调只在局域网/VPN 用；真实绑定 host 由 daemon 心跳写进 `daemon.json` 的 `host`，三处日志/提示同口径）。
+（**免密钥口径下这就是唯一的安全边界**：对外绑定 = 同一局域网内任何主机都能执行上文全部路由，
+包括写入凭据与下载 token；README 安全段如实写明风险与建议；真实绑定 host 由 daemon 心跳写进
+`daemon.json` 的 `host`，三处日志/提示同口径）。
 
 ```
 GET  /api/hello                 -> {name, version, ready}
 GET  /api/state                 -> {bindHost, port, reachableHint,
+                                    intlSkipped:{count,note},   // 只读诊断计数：国际版账号
+                                    // 的数量与去向说明（note="本插件只服务国内版 workbuddy，
+                                    // 国际版账号不列出、不参与任务、不默认导出"）；绝不列出
+                                    // 国际版账号内容（uid/昵称/域名都不给）
                                     accounts:[{uid,nickname,masked,domain,expiresInMs,expiresInDays,tasksEnabled,
                                              imported,eligible,
                                              snapshot:{tasks:[{code,title,acceptStatus,progress:{current,target},
                                              rewardCredit,rewardEnergy,jumpUrl,taskType,
                                              desktopOnly,unforgeable,reason,canAccept,canLight,pinnedExpertId}],
                                              energy,streak,days,updatedISO}}],
+                                    // accounts[] 只含 provider==="workbuddy"（国内版）条目；
+                                    // 国际版 workbuddy-ai 一律不出现（见上方纯国内版口径）
                                     scheduler:{enabled,nextRuns[[leg,hour]],lastCycle,
                                                holds:[{uid,nickname,releasedAt}]},
                                     job:Job|null, stats:{creditsToday,energyToday,runs},
@@ -170,9 +191,9 @@ GET  /api/state                 -> {bindHost, port, reachableHint,
                                     // 被占用顺延后可能与配置值不同）。bindHost 为 0.0.0.0/:: 时
                                     // reachableHint = 「仅容器网桥/局域网可达，请用 SSH 隧道或局域网地址访问，
                                     // 切勿发布到公网」（lifecycle.bindHint 的同一句口径），否则为 ""。
-                                    // 前端拼可点开的看板地址用 bindHost:port；**绝不把 daemon key
-                                    // 放进任何响应、页面或日志**——key 只存在 state/daemon.json（0600），
-                                    // 看板拿到后只存浏览器 sessionStorage，不得回显到 URL 或导出。
+                                    // 前端拼可点开的看板地址用 bindHost:port；**daemon 的 key 字段
+                                    // 绝不出现在任何响应、页面或日志里**（它只在 state/daemon.json，
+                                    // 0600，向后兼容保留、不是访问凭据——API 全部免密钥）。
                                     // snapshot.tasks 的字段名 = §2 的规范 Task（daemon 只做投影，不猜第二种拼写）；
                                     // acceptStatus 是上游字符串状态（"not_accepted"|"accepted"|"completed"|"claimed"）
                                     // P0-2 判断字段（六个都出自 engine/taskkind.resolveTaskKind，
@@ -225,15 +246,18 @@ POST /api/task/accept           body {uid, codes[]} -> AcceptResult
 POST /api/checkin               body {uids?:string[]} -> CheckinResult[]     // 仅手动，社区插件负责自动签到
 POST /api/settings              body 部分 settings -> 新的 settings（写 state/settings.json）
 POST /api/accounts              -> 重新读 plugin-auth.json -> {count, eligible, added[], removed[]}
-                                    // count = workbuddy* 全部条目（含 API key，不参与任务）；
+                                    // 纯国内版口径：count = provider==="workbuddy" 的条目
+                                    // （含 API key，不参与任务；国际版不计入、不出现）；
                                     // eligible = 可参与任务的 OAuth 账号数（engine.store.eligibleAccounts 口径）
 GET  /api/accounts/export?realm=cn|intl&secrets=0|1&uid=a,b&download=1
                                     -> {format:"workbuddy-accounts",version:1,
                                         exportedAt:"YYYY-MM-DD HH:MM:SS",count,accounts:[hub 形状行]}
                                     // hub /accounts/export（wb_proxy.py:19314）移植；语义/文件名/404
-                                    // 规则与脱敏行为见 §9；secrets=0 免密钥，缺省/secrets=1 必须密钥
+                                    // 规则与脱敏行为见 §9；纯国内版口径：不带 realm 只出 cn，
+                                    // 显式 realm=intl 才出国际版（逃生口，UI 不提供）；
+                                    // secrets 缺省/secrets=1 含 token 真值，secrets=0 脱敏
 POST /api/accounts/import       -> 预览/确认两段式（body 形状、响应形状、错误码见 §9）；
-                                    // 预览免密钥，confirm=true 必须密钥
+                                    // 预览与确认都不需要密钥（免密钥口径）
 POST /api/account/toggle        body {uid, tasksEnabled:bool} -> account 行（同 /api/state 的 accounts[] 元素）
                                     // 「参与任务」开关（hub 的 task_active）：写 state/accounts.json 并回读；
                                     // 400 缺 uid / tasksEnabled 非布尔，404 账号不存在；
@@ -373,11 +397,13 @@ GET /api/accounts/export?realm=cn|intl&secrets=0|1&uid=a,b&download=1
       count:N, accounts:[hub 形状行]}
 ```
 
-- 语义照 hub `_get_accounts_export`（wb_proxy.py:19314）：`realm` 过滤（cn/intl，其他值=不过滤）、
-  `uid` 逗号分隔可重复（未知的 uid → `404 {error:"no such account: …"}`）、`download=1` 走
-  `Content-Disposition: attachment`（文件名规则同 hub，见下）、`secrets=0|false|no` 按 hub 行为
-  **删除 accessToken/refreshToken 两键**（其余字段保留）。
-- **secrets 缺省 = 1（含 token），必须密钥**；`secrets=0` 免密钥（§3 门禁红线）。
+- 语义照 hub `_get_accounts_export`（wb_proxy.py:19314），但 **realm 默认值按纯国内版口径收窄**：
+  不带 `realm`（或任何非 `intl` 值）**只导出国内版**；显式 `realm=intl` 才导出国际版——这是给 hub
+  备份场景留的**逃生口**（UI 不提供此入口，只存在于 API 层，导出的文档可再回灌本插件的导入）。
+  `uid` 逗号分隔可重复（不在所选 realm 范围内的 uid → `404 {error:"no such account: …"}`，默认
+  范围里的国际版 uid 同样 404）、`download=1` 走 `Content-Disposition: attachment`（文件名规则同 hub，
+  见下）、`secrets=0|false|no` 按 hub 行为**删除 accessToken/refreshToken 两键**（其余字段保留）。
+- **secrets 缺省 = 1（含 token）**；`secrets=0` 脱敏。免密钥口径下两种取值都不需要密钥（§3）。
 - 文件名（hub :19347-19353 + `_download` :18706 净化）：单 uid →
   `workbuddy-accounts-<uid 前 8 位><YYYYMMDD-HHMMSS>.json`；多 uid/无 uid →
   `workbuddy-accounts-[<realm>-]<YYYYMMDD-HHMMSS>.json`；`[^A-Za-z0-9._-]`→`_`，截 120。
@@ -414,12 +440,12 @@ body = 账号数据本体（**四种形态**，hub `_coerce_account_rows` wb_acc
 导出信封 `{format,accounts}`、裸数组、单账号对象、桌面端凭据 `{"auth":{…},"account":{…}}`；
 cockpit snake_case 行 `access_token/expires_at(毫秒)` 也认）或 `{"blob":<同上>,"confirm":bool}`。
 
-- **预览（默认，免密钥，绝不写盘）**：
+- **预览（默认，绝不写盘）**：
   `{wrote:false, note:"预览未写入任何文件", preview:{adds:[{uid,nickname,key}],
   updates:[{uid,nickname,key,fromExpires,toExpires,reason}], skips:[{uid,nickname,reason}],
   rejects:[{index,reason,inputHint}], totals:{adds,updates,skips,rejects}}}`
   （index 从 1 起，hub 口径；`inputHint` 只含身份字段/字段名清单，**绝不含 token**）
-- **确认（`confirm:true`，必须密钥）**：
+- **确认（`confirm:true`，免密钥口径下无需任何密钥）**：
   `{wrote:true, added:[…], updated:[…], skipped:[…], backedUpTo:"plugin-auth.json.bak-hubimport-<stamp>",
   needReload:true, reloadHint:"在 magpie「插件管理」里把 WorkBuddy 关掉再打开，新账号才会被 magpie 认到"}`
 - **错误**：文档读不出可导入账号 → `400`；`plugin-auth.json` 解析失败 → `409` 拒写（连预览也拒：

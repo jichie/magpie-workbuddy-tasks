@@ -37,11 +37,10 @@
         <a class="wb-btn wb-btn-primary" id="dashLink" href="http://127.0.0.1:4390" target="_blank" rel="noopener noreferrer">在新窗口打开看板</a>
       </div>
       <p class="wb-hint" id="dashHint">
-        地址来自插件选项 <code>dashboardUrl</code>（magpie 插件页可改）。看板<strong>直接打开即可</strong>：
-        账号、任务、历史等只读数据免密钥；批量任务、导入写入、含凭据导出等有副作用的操作，
-        在看板右上<strong>「解锁写操作」</strong>里填入密钥 —— 密钥在
-        <code>&lt;magpie 配置目录&gt;/workbuddy-tasks/state/daemon.json</code> 的 <code>key</code> 字段
-        （权限 0600，实际端口同文件），只存浏览器本标签页的 sessionStorage。密钥请勿贴进链接分享。
+        地址来自插件选项 <code>dashboardUrl</code>（magpie 插件页可改）。看板<strong>直接打开即可</strong>，
+        全部接口无鉴权，靠网络边界保护 —— 守护进程默认只绑
+        <code>127.0.0.1</code>；改成 <code>0.0.0.0</code> 后局域网内任何人都能触发批量任务或导出含凭据的文件，
+        不用时请关闭端口转发。
       </p>
       <p class="wb-hint" id="tunnelHint" hidden>
         magpie 跑在 NAS/容器里、你用 SSH 隧道访问？隧道映射后仍可用
@@ -75,7 +74,7 @@
             建隧道：<code>ssh -L &lt;port&gt;:&lt;容器IP&gt;:&lt;port&gt; &lt;user&gt;@&lt;NAS地址&gt;</code>，
             映射后仍可用 <code>http://127.0.0.1:&lt;port&gt;/</code> 打开。实际端口与绑定 host 由守护进程写在
             <code>state/daemon.json</code>，看板顶栏「看板地址」会按真实绑定给出同一组提示。
-            密钥在 <code>state/daemon.json</code>，请勿贴进链接分享。
+            看板无鉴权：改绑 <code>0.0.0.0</code> 期间请用防火墙/隧道限制来源，不用时关闭端口转发。
           </p>
         </div>
       </details>
@@ -107,7 +106,7 @@
             实时步骤与滚动日志走 SSE，断线自动回退 3 秒轮询；小时窗口排程可编辑并预览下一次运行；
             历史记录失败 / 跳过都会留一行说明；
             <strong>账号导入 / 导出</strong>：导出为 hub 同款 <code>workbuddy-accounts</code> JSON
-            （默认含凭据，可改脱敏；脱敏免密钥，含凭据需解锁），导入走「先预览（免密钥、不写盘）→
+            （默认含凭据，可改脱敏），导入走「先预览（只读、不写盘）→
             确认写入 <code>plugin-auth.json</code>（写前自动备份）」两段式，只同步国内版、智能合并，
             不删除任何现有账号。
           </p>

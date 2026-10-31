@@ -5,6 +5,8 @@
 //   - 定位 magpie 配置目录与插件自己的 state 目录
 //   - control.json（唯一意图来源：desired = 'on' | 'off'）的读写
 //   - daemon.json（pid/port/key/version/startedAt，权限 0600）的读写
+//     （key 字段向后兼容保留：老版本看板/探测逻辑会读；免密钥口径下它不是
+//      访问凭据，daemon 的任何接口都不校验它）
 //   - 探测守护进程健康（GET /api/hello）
 //   - ensureDaemon()：健康则复用，不健康才 spawn（detached + stdio ignore + unref）
 //   - shutdownDaemon()：POST /api/shutdown 通知退出
@@ -95,6 +97,8 @@ export function writeControl(stateDir, desired, extra = {}) {
 }
 
 // ---- daemon.json：pid / port / key / version / startedAt（0600） -------
+// key 字段仅为向后兼容保留（老看板/宿主探测逻辑依赖它存在）：免密钥口径下
+// 它不是访问凭据、不被任何接口校验；写进去是为了老代码读字段不空转。
 
 export function daemonInfoPath(stateDir) {
   return join(stateDir, "daemon.json")
@@ -126,6 +130,8 @@ export function writeDaemonInfo(stateDir, info) {
 }
 
 export function daemonKey() {
+  // 免密钥口径下生成的值只写进 daemon.json 的 key 字段（向后兼容保留，不是
+  // 访问凭据）；保留生成逻辑让 daemon.json 的形状与老版本一致。
   return randomBytes(24).toString("base64url")
 }
 
@@ -160,7 +166,9 @@ export function pidAlive(pid) {
   }
 }
 
-// probeDaemon：GET /api/hello，且 name 必须是本插件——端口被别的程序占了不算数
+// probeDaemon：GET /api/hello，且 name 必须是本插件——端口被别的程序占了不算数。
+// key 参数兼容保留：免密钥 daemon 不校验，但探测老版本 daemon（仍要密钥）时
+// 带上它才能探活，升级期平滑过渡。
 export async function probeDaemon(port, key, timeoutMs = 1500, host = "127.0.0.1") {
   let res
   try {
@@ -268,6 +276,8 @@ export async function ensureDaemon({ cfgDir, pluginDir, log = () => {}, budgetMs
 // ---- shutdownDaemon：请守护进程退场 ------------------------------------
 
 export async function shutdownDaemon(info, timeoutMs = 2500) {
+  // Bearer 头兼容保留：免密钥 daemon 不校验，老版本 daemon 需要；info.key 恒有
+  // （daemon.json 的 key 字段向后兼容保留）。
   if (!info?.port || !info?.key) return false
   try {
     const res = await fetch(`http://127.0.0.1:${info.port}/api/shutdown`, {

@@ -96,6 +96,12 @@ function readTasksEnabledMap(cfg) {
 // loadAccounts(cfg) -> Account[]
 // 只读 plugin-auth.json 的 workbuddy* 条目，映射成我们的内部形状。字段缺失
 // 都给默认值，坏的条目跳过而不是抛错（一个坏账号不能拖死整个面板）。
+//
+// 层级边界（纯国内版口径，别改错层）：本函数**原样返回全部 workbuddy\* 条目，
+// 包括国际版 provider "workbuddy-ai"**——accountio 的导入合并、daemon 导出的
+// realm=intl 逃生口都要全量数据。daemon 在**使用侧**统一经自己的
+// loadAccountsCn()（只留 provider === "workbuddy"）做列表/统计/排程/运行取数；
+// 不要把「只出国内版」的过滤下沉到这里，否则导入合并与逃生口会拿到残缺数据。
 export function loadAccounts(cfg) {
   const file = authFile(cfg);
   let raw;

@@ -283,7 +283,7 @@ after(async () => {
 // 1. 启动真实 daemon（真实引擎 + 全部定时器），HTTP 门禁与就绪
 // ==============================================================================
 
-test("e2e 启动：真实 daemon + 真实引擎，/api/hello ready，密钥门禁生效", async () => {
+test("e2e 启动：真实 daemon + 真实引擎，/api/hello ready，全路由免密钥", async () => {
   h = await startDaemon({
     args: { cfg: cfgDir, state: stateDir, port: "0", key: DAEMON_KEY },
     now: clock.now,
@@ -297,10 +297,20 @@ test("e2e 启动：真实 daemon + 真实引擎，/api/hello ready，密钥门�
   assert.equal(hello.name, "workbuddy-tasks");
   assert.equal(hello.ready, true, "真实引擎应完整装载");
 
-  // 密钥分级（契约 §3）：只读免密钥（打开看板不再弹密钥），写操作才要密钥
+  // 免密钥口径（契约 §3）：全部路由一律不需要密钥。只读免 key；写操作无 key
+  // 也放行（用点名不存在账号的 /api/run 探一个「有业务理由的非 401」——
+  // WB_NO_ACCOUNTS → 400，绝不 401；不真启动 job，避免扰动后续用例）
   assert.equal((await fetch(api.base() + "/api/state")).status, 200);
-  assert.equal((await fetch(api.base() + "/api/run", { method: "POST" })).status, 401);
+  const noKeyRun = await fetch(api.base() + "/api/run", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ uids: ["__no_such_uid__"] }),
+  });
+  assert.equal(noKeyRun.status, 400);
+  assert.match((await noKeyRun.json()).error, /没有可参与任务的账号/);
+  // 带旧密钥（header 或 ?k=）的调用继续可用：平滑过渡，不报 400/401
   assert.equal((await api.json(api.get("/api/state"))).status, 200);
+  assert.equal((await fetch(api.base() + `/api/state?k=${encodeURIComponent(DAEMON_KEY)}`)).status, 200);
 
   startSse();
 });

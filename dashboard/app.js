@@ -3,10 +3,12 @@
 // 数据面（只消费 daemon.mjs 真实存在的路由，绝不发明接口）：
 //   GET  /api/hello            -> {name, version, ready}
 //   GET  /api/state[?refresh=1|<uid>] -> {bindHost, port, reachableHint,
-//                                        accounts, scheduler, job, stats, settings, notice?, engineErrors?}
+//                                        accounts, intlSkipped, scheduler, job, stats, settings, notice?, engineErrors?}
 //        顶层 bindHost/port/reachableHint = 真实监听 host、实际端口（顺延后真值）与通绑定提示
 //        （bindHost 为 0.0.0.0/:: 时非空）——顶栏「看板地址」项据此渲染；老后端缺字段时回退
 //        页面自身 origin，绝不报错（见 addrModel）
+//        accounts[] 只含国内版（provider === "workbuddy"）；国际版不再出现在列表里。
+//        intlSkipped = {count, note}：被忽略的国际版账号数量与说明（只给数字，绝不给账号内容）。
 //        scheduler.holds = [{uid, nickname, releasedAt(ISO)}] —— 真正的风控冷却（403/11140）名单
 //        accounts[].tasksEnabled 可写（见 /api/account/toggle）；snapshot.tasks[] 为规范化
 //        camelCase：{code,title,acceptStatus,progress:{current,target},rewardCredit,rewardEnergy,
@@ -16,7 +18,7 @@
 //        —— 任务表的所有「能不能自动化」判断只来自这六个字段，前端不再自己拼规则
 //        （详见下方 taskFlags）。老后端字段缺失时按 legacy 回退，绝不报错。
 //        snapshot.expired 若为 true（后端将来下发）按「快照已过期」渲染；前端不发明字段。
-//   GET  /api/events           -> SSE {kind:'job'|'step'|'log'|'scheduler'|'accounts'}（免密钥）
+//   GET  /api/events           -> SSE {kind:'job'|'step'|'log'|'scheduler'|'accounts'}（只读流）
 //   GET  /api/history?limit=   -> {rows:[{at,uid,nickname,leg,state,detail,credit,energy,jobId,trigger}]}
 //   POST /api/run {uids?,legs?,claim?} -> {job} | 409 busy | 400 无账号 | 503 引擎不可用
 //   POST /api/stop             -> {job} | 404 没有任务在跑
@@ -24,26 +26,22 @@
 //   POST /api/task/claim  {uid,code}      -> {ok,credit,energy,via("chat"|"web"|""),reason}
 //   POST /api/checkin     {uids?}         -> [{uid,outcome,credit?,streak?,message}]
 //   POST /api/settings    (部分字段)       -> 完整 settings {scheduler,claim,legs,gapMs,hours,host}
-//   POST /api/accounts                    -> {count,eligible,added,removed}（重扫本地文件，免密钥）
+//   POST /api/accounts                    -> {count,eligible,added,removed}（重扫本地文件，无副作用）
 //   POST /api/account/toggle {uid,tasksEnabled:bool} -> 200 该账号的最新行（accounts[] 元素同形状）
 //                                            | 400/404 {error:"…"}（中文）
 //   POST /api/shutdown                    -> {ok:true}（随后守护进程退出）
-//   GET  /api/accounts/export?secrets=1|0&realm=cn|intl&uid=a,b&download=1
+//   GET  /api/accounts/export?secrets=1|0&uid=a,b&download=1
 //                                         -> 信封 {format:"workbuddy-accounts",version,exportedAt,count,accounts}
-//        secrets=0（脱敏）免密钥；缺省/secrets=1（含 token）必须密钥（契约 §3 红线）。
+//        不带 realm（或非 intl）时守护进程只导出国内版；secrets=0 脱敏，缺省/1 含 token。
 //        download=1 时走 Content-Disposition 附件（文件名取响应头，取不到按 hub 规则本地拼）。
 //   POST /api/accounts/import   body = {"blob":<账号数据本体>,"confirm":bool}
-//        预览（confirm 缺省/false）免密钥不写盘 -> {wrote:false,note,preview:{adds,updates,skips,rejects,totals}}
-//        确认（confirm:true）必须密钥 -> {wrote:true,added,updated,skipped,backedUpTo,needReload,reloadHint}
+//        预览（confirm 缺省/false）不写盘 -> {wrote:false,note,preview:{adds,updates,skips,rejects,totals}}
+//        确认（confirm:true）写 plugin-auth.json（写前自动备份）-> {wrote:true,added,updated,skipped,backedUpTo,needReload,reloadHint}
 //        409 needRepreview = 预览后 plugin-auth.json 被改动，要求重新预览（契约 §9.2）。
 //
-// 鉴权（契约 §3 按副作用分级；用户口径「打开看板页面不再弹密钥」）：
-//   只读、无副作用的路由免密钥 —— 首屏直接渲染，没有启动弹框。
-//   有副作用或含凭据的路由需要密钥：fetch 一律带 Authorization: Bearer <key> 头；
-//   key 绝不拼进 URL / <a href> / 复制内容（会进浏览器历史）。唯一例外：老守护进程
-//   （只读路由也 401，legacyAuth 标记）下 EventSource 无法设 header，SSE 才回退 ?k=。
-//   401 → 弹一次「解锁写操作」密钥框 → 存 sessionStorage → 自动重试刚才那一个调用
-//   （见 withUnlockRetry）。右上「解锁写操作」按钮可随时先解锁 / 撤销解锁。
+// 鉴权：守护进程无鉴权 —— 所有接口都直接放行，fetch 不带 Authorization、URL 不带 ?k=。
+// 安全靠网络边界：默认只绑 127.0.0.1；改成 0.0.0.0 后局域网内任何人都能触发写操作，
+// 页脚已如实写明。业务错误（400/404/409/503）照常按中文提示透出；SSE 断线回退轮询。
 //
 // 安全：服务端字符串（任务标题、detail、msg、日志、导入 reason、文件名）一律经
 // textContent 进 DOM —— 本文件不使用 innerHTML 注入任何动态内容。token 永不渲染到
@@ -75,16 +73,13 @@ const STEP_STATE_NAMES = {
 const TRIGGER_NAMES = { manual: "手动", schedule: "排程" };
 const OUTCOME_NAMES = { claimed: "已签到", done: "今日已签", failed: "失败" };
 
-const SS_KEY = "wbt.key"; // 密钥：sessionStorage（任务要求）
 const LS_THEME = "wbt.theme"; // 主题：localStorage 持久化
 
 // ---- 全局状态 ------------------------------------------------------------------
 
 const state = {
-  key: "",
   hello: null,
-  conn: "checking", // checking | online | nokey(仅旧守护进程) | down | stopped
-  legacyAuth: false, // 只读路由也 401 = 旧口径守护进程（新口径只读免密钥）；SSE 需 ?k= 兜底
+  conn: "checking", // checking | online | down | stopped
   feed: "idle", // sse | poll | idle
   data: null, // 最近一次 /api/state
   selected: new Set(), // 勾选的 uid
@@ -227,13 +222,6 @@ export function expiryInfo(a) {
   return { text: "有效期未知", cls: "badge-quiet", title: null };
 }
 
-function expiryChip(a) {
-  const info = expiryInfo(a);
-  const chip = badge(info.text, info.cls);
-  if (info.title) chip.title = info.title;
-  return chip;
-}
-
 // ---- API 层 -----------------------------------------------------------------------
 
 class ApiError extends Error {
@@ -244,16 +232,11 @@ class ApiError extends Error {
   }
 }
 
-// 新口径下绝对免密钥的只读路由（契约 §3）：它们也 401 = 对面是旧守护进程，
-// 标记 legacyAuth（SSE 需要 ?k= 兜底；EventSource 无法设 header）。
-const LEGACY_PROBE_RE = /^api\/(hello|state|history|jobs\/)/;
-
+// 守护进程无鉴权：fetch 只带 Content-Type，不设 Authorization，URL 不带 ?k=。
 async function apiOnce(path, { method = "GET", body, params } = {}) {
   const url = new URL(path, location.href);
   if (params) for (const [k, v] of Object.entries(params)) url.searchParams.set(k, String(v));
-  // key 只走 Authorization 头（daemon 认 Bearer 与 ?k= 两种；头不进浏览器历史/访问日志）
   const headers = {};
-  if (state.key) headers.Authorization = `Bearer ${state.key}`;
   if (body !== undefined) headers["Content-Type"] = "application/json";
   let res;
   try {
@@ -277,54 +260,15 @@ async function apiOnce(path, { method = "GET", body, params } = {}) {
   return data;
 }
 
-// 401 → 弹一次密钥框 → 存 sessionStorage → 自动重试刚才那一个调用（不让用户从头再点）。
-// 并发 401 共享同一个对话框与结果（promptKeyAsync 单飞）；用户取消 → 抛 unlockCancelled
-// （toast 已说明，调用方静默收尾）。重试后仍 401（密钥不对）→ 原样抛出，绝不循环弹框。
-async function withUnlockRetry(fn, cancelMsg) {
-  try {
-    return await fn();
-  } catch (e) {
-    if (!(e instanceof ApiError) || e.status !== 401) throw e;
-    const ok = await promptKeyAsync(e.message);
-    if (!ok) {
-      toast(cancelMsg || "已取消解锁：该操作会改动账号或涉及凭据，需要密钥，未执行。", "warn", 7000);
-      const c = new Error("已取消解锁");
-      c.unlockCancelled = true;
-      throw c;
-    }
-    return await fn(); // 自动重试同一个调用（此时 state.key 已是新值）
-  }
-}
-
 async function api(path, opts = {}) {
-  return await withUnlockRetry(async () => {
-    try {
-      return await apiOnce(path, opts);
-    } catch (e) {
-      if (
-        e instanceof ApiError &&
-        e.status === 401 &&
-        (opts.method ?? "GET") === "GET" &&
-        LEGACY_PROBE_RE.test(path)
-      ) {
-        state.legacyAuth = true; // 只读 GET 也要密钥 = 旧守护进程
-      }
-      throw e;
-    }
-  });
+  return await apiOnce(path, opts);
 }
 
 // 把异常翻译成人话（后端给的中文原样透出，绝不显示堆栈）
 function humanErr(e, prefix = "操作失败") {
-  if (e && e.unlockCancelled) return; // 取消解锁：withUnlockRetry 已 toast 说明
   if (e instanceof ApiError) {
     if (e.status === 409) {
       toast("已有批量任务在跑：同一时刻只允许一个 job。等它结束，或先点「停止当前任务」。", "warn", 7000);
-      return;
-    }
-    if (e.status === 401) {
-      // withUnlockRetry 已弹过一次并重试过；到这里 = 密钥不对，不再弹框（避免循环）
-      toast("密钥不正确（或守护进程已更换密钥）：点右上「解锁写操作」重新输入。密钥在 state/daemon.json 的 key 字段。", "warn", 9000);
       return;
     }
     toast(`${prefix}（HTTP ${e.status}）：${e.message}`, "warn", 8000);
@@ -337,62 +281,6 @@ function humanErr(e, prefix = "操作失败") {
     return;
   }
   toast(`${prefix}：${e && e.message ? e.message : String(e)}`, "warn", 8000);
-}
-
-// ---- 密钥 / 解锁写操作 ----------------------------------------------------------------
-
-function readKeyFromUrl() {
-  const q = new URLSearchParams(location.search).get("k");
-  if (q) {
-    state.key = q;
-    try {
-      sessionStorage.setItem(SS_KEY, q);
-    } catch {}
-    // 把 key 从地址栏摘掉，避免截图/分享泄漏（不触发请求）
-    try {
-      const u = new URL(location.href);
-      u.searchParams.delete("k");
-      history.replaceState(null, "", u);
-    } catch {}
-    return;
-  }
-  try {
-    state.key = sessionStorage.getItem(SS_KEY) || "";
-  } catch {}
-}
-
-function promptKey(msg) {
-  const dlg = $("#keyDialog");
-  const err = $("#keyError");
-  if (msg) {
-    err.textContent = msg;
-    err.hidden = false;
-  } else {
-    err.hidden = true;
-  }
-  $("#keyInput").value = state.key || "";
-  if (!dlg.open) dlg.showModal();
-}
-
-// 打开密钥对话框并等待结果：true = 已保存（state.key 生效），false = 取消/ESC。
-// 单飞：并发多个 401（或用户连点）共享同一个对话框与同一个 Promise。
-let unlockWait = null;
-let unlockResolve = null;
-
-function promptKeyAsync(msg) {
-  if (unlockWait) return unlockWait;
-  unlockWait = new Promise((resolve) => {
-    unlockResolve = resolve;
-  });
-  promptKey(msg);
-  return unlockWait;
-}
-
-function settleUnlock(ok) {
-  const r = unlockResolve;
-  unlockWait = null;
-  unlockResolve = null;
-  if (r) r(ok);
 }
 
 // ---- 主题（默认跟随系统；显式选择持久化到 localStorage） -----------------------------
@@ -463,9 +351,10 @@ async function copyText(text) {
 //   fallback：老后端三字段 undefined → 回退页面自身 origin（看板由守护进程同源服务），
 //             再兜底默认端口 4390；绝不报错。
 // key 永不进地址 / 复制内容 / title：地址项只显示 http://host:port/ 路径。
+// 守护进程无鉴权：地址旁只提示「默认只绑回环」，完整安全口径在页脚。
 
 const DEFAULT_PORT = 4390;
-const KEY_NOTE = "密钥在 state/daemon.json，请勿贴进链接分享";
+const SECURITY_NOTE = "看板无鉴权 · 默认只绑 127.0.0.1";
 
 function isWildcardBind(host) {
   return host === "0.0.0.0" || host === "::";
@@ -535,7 +424,7 @@ function renderAddr() {
         el("span", { class: "label", text: "看板地址" }),
         el("code", { class: "addr-url", text: m.url }),
         copyBtn(m.url, "看板地址"),
-        el("span", { class: "addr-note", text: KEY_NOTE }),
+        el("span", { class: "addr-note", text: SECURITY_NOTE }),
       ),
     );
   } else {
@@ -549,7 +438,7 @@ function renderAddr() {
         }),
       ),
       el("div", { class: "addr-row" },
-        el("span", { class: "addr-note", text: m.hint ? `${m.hint} · ${KEY_NOTE}` : KEY_NOTE }),
+        el("span", { class: "addr-note", text: m.hint ? `${m.hint} · ${SECURITY_NOTE}` : SECURITY_NOTE }),
       ),
     );
     if (m.docker) {
@@ -594,9 +483,6 @@ function renderTop() {
   if (state.conn === "checking") {
     pill.classList.add("pill-quiet");
     pill.textContent = "检查中…";
-  } else if (state.conn === "nokey") {
-    pill.classList.add("pill-warn");
-    pill.textContent = "需要密钥";
   } else if (state.conn === "stopped") {
     pill.classList.add("pill-off");
     pill.textContent = "已停止";
@@ -627,24 +513,6 @@ function renderTop() {
     feed.textContent = "连接中…";
   }
 
-  // 读写分级标识（轻量胶囊）+「解锁写操作」按钮：只读免密钥，写操作需 key
-  const mp = $("#modePill");
-  if (mp) {
-    mp.className = state.key ? "pill pill-ok" : "pill pill-quiet";
-    mp.textContent = state.key ? "已解锁" : "只读模式";
-    mp.title = state.key
-      ? "写操作已解锁：密钥只存本标签页的 sessionStorage，点右上「已解锁」可撤销"
-      : "只读模式：账号、任务、历史等只读数据免密钥；有副作用的操作会提示解锁";
-  }
-  const ub = $("#unlockBtn");
-  if (ub) {
-    ub.textContent = state.key ? "已解锁" : "未解锁（只读）";
-    ub.setAttribute("aria-pressed", state.key ? "true" : "false");
-    ub.title = state.key
-      ? "已解锁写操作：点击撤销（清除 sessionStorage 里的密钥，回到只读模式）"
-      : "解锁写操作：批量任务、参与任务开关、保存窗口、导入写出、含凭据导出等有副作用的操作需要守护进程密钥（state/daemon.json 的 key）";
-  }
-
   const st = state.data?.stats;
   $("#statCredits").textContent = st ? fmtNum(st.creditsToday) : "—";
   $("#statEnergy").textContent = st ? fmtNum(st.energyToday) : "—";
@@ -656,6 +524,7 @@ function renderTop() {
   }
 
   renderAddr();
+  if (syncTopbarHeight) syncTopbarHeight();
 }
 
 // ---- 账号区 -------------------------------------------------------------------------------
@@ -1041,11 +910,12 @@ export function taskSummary(snap) {
   return `任务快照${snapExpired(snap) ? "（已过期）" : ""}：${parts.join(" · ")}`;
 }
 
-// 账号行上的快照标签：snapshot === null → 「快照为空」；后端标记 expired → 「快照已过期」
+// 账号行上的快照时间：只给时间本身（列头/移动端标签已说明是「快照」）；
+// snapshot === null → 「无快照」；后端标记 expired → 「已过期 HH:MM:SS」。
 function snapLabel(snap) {
-  if (!snap) return "快照为空";
+  if (!snap) return "无快照";
   const at = fmtTime(snap.updatedISO);
-  return snapExpired(snap) ? `快照已过期 ${at}` : `快照 ${at}`;
+  return snapExpired(snap) ? `已过期 ${at}` : at;
 }
 
 // 批量接取计划（规则 4）：codes 只取 canAccept === true 的项（判断只来自后端字段），
@@ -1136,9 +1006,81 @@ async function toggleTasksEnabled(uid, want) {
   }
 }
 
+// 单行状态：只给一枚徽章（凭据状态），剩余时间作为 --ink3 次要文本；
+// 不再把「已登录 / 有效期未知 / 不参与任务」叠成多枚徽章。
+function accountBadge(a) {
+  const isApiKey = String(a.masked ?? "").startsWith("API key");
+  const info = expiryInfo(a);
+  const expired = !isApiKey && info.text === "凭据已过期";
+  let node;
+  if (isApiKey) node = badge("API key", "badge-quiet");
+  else if (expired) node = badge("凭据已过期", "badge-warn");
+  else node = badge("已登录", "badge-strong");
+  if (!isApiKey && info.title) node.title = info.title;
+  return {
+    node,
+    sub: isApiKey ? "无有效期" : expired ? "需要重新登录" : info.text,
+    subWarn: !isApiKey && !expired && info.cls === "badge-warn",
+  };
+}
+
+// 快照计数（与 taskSummary 同源）：账号行展示「已领奖 / 总数」与「待接取 · 待领奖」两行
+function snapCounts(snap) {
+  const tasks = snap && Array.isArray(snap.tasks) ? snap.tasks : null;
+  if (!tasks) return null;
+  const count = (st) => tasks.filter((t) => t.acceptStatus === st).length;
+  return {
+    total: tasks.length,
+    notAccepted: count("not_accepted"),
+    accepted: count("accepted"),
+    pending: count("completed"),
+    claimed: count("claimed"),
+  };
+}
+
+// 分项小格：数值在上、标签在下；换行只发生在格与格之间，绝不把一句长文案劈开
+function metric(value, label) {
+  return el(
+    "span",
+    { class: "metric" },
+    el("span", { class: "metric-l", text: label }),
+    el("span", { class: "metric-v", text: String(value) }),
+  );
+}
+
+function snapMetrics(snap) {
+  const c = snapCounts(snap);
+  if (!c) {
+    return el("span", {
+      class: "acct-metrics-empty",
+      text: "无快照：点「刷新快照」读取（只读，不接取、不上报）",
+    });
+  }
+  const cells = [
+    metric(c.total, "任务总量"),
+    metric(c.notAccepted, "未接取"),
+    metric(c.accepted, "已接取"),
+    metric(c.pending, "待领奖"),
+    metric(c.claimed, "已领奖"),
+  ];
+  const flags = (snap.tasks ?? []).map(taskFlags);
+  if (flags.some((f) => f.modern)) {
+    const n = (pred) => flags.filter(pred).length;
+    cells.push(
+      metric(n((f) => f.desktopOnly), "桌面端"),
+      metric(n((f) => f.unforgeable), "无法自动化"),
+      metric(n((f) => f.canAccept), "可接取"),
+    );
+  }
+  return el("span", { class: "acct-metrics" }, ...cells);
+}
+
 function accountRow(a) {
   const isApiKey = String(a.masked ?? "").startsWith("API key");
   const uid = String(a.uid ?? "");
+  const name = String(a.nickname || uid || "（无昵称）");
+  const metaBits = [a.domain, uid].filter((x) => x != null && x !== "");
+  const metaText = metaBits.length ? metaBits.join(" · ") : "（无 uid）";
 
   const check = el("input", {
     type: "checkbox",
@@ -1146,7 +1088,7 @@ function accountRow(a) {
     value: uid,
     checked: state.selected.has(uid),
     disabled: !a.eligible,
-    "aria-label": `选择账号 ${a.nickname || uid}`,
+    "aria-label": `选择账号 ${name}`,
     onchange: (ev) => {
       if (ev.target.checked) state.selected.add(uid);
       else state.selected.delete(uid);
@@ -1154,29 +1096,52 @@ function accountRow(a) {
     },
   });
 
-  const expChip = expiryChip(a);
+  const st = accountBadge(a);
+  const statusInner = el(
+    "span",
+    { class: "acct-cell-inner" },
+    st.node,
+    el("span", { class: st.subWarn ? "acct-sub warn-text" : "acct-sub", text: st.sub }),
+  );
 
-  const meta = el(
-    "div",
-    { class: "acct-meta" },
-    a.domain ? el("span", { class: "chip chip-quiet mono", text: a.domain }) : null,
-    badge(String(a.masked ?? ""), isApiKey ? "badge-quiet" : ""),
-    expChip,
-    a.eligible ? null : badge(isApiKey ? "API key 不参与任务" : "不参与任务", "badge-quiet"),
-    el("label", {
-      class: state.toggling.has(uid) ? "switch switch-busy" : "switch",
-      title: "参与任务：关闭后该账号不进入批量操作与排程（POST /api/account/toggle，立即生效并持久化）",
+  const c = snapCounts(a.snapshot);
+  const progInner = el(
+    "span",
+    { class: "acct-cell-inner" },
+    el("span", { class: "acct-prog-main", text: c ? `已领奖 ${c.claimed} / ${c.total}` : "—" }),
+    el("span", {
+      class: "acct-prog-sub",
+      text: c ? `待接取 ${c.notAccepted} · 待领奖 ${c.pending}` : "无快照",
+    }),
+  );
+
+  const toggling = state.toggling.has(uid);
+  const toggle = el(
+    "label",
+    {
+      class: `acct-toggle${isApiKey ? " is-disabled" : ""}`,
+      title: isApiKey
+        ? "API key 账号不参与任务（批量与排程都会跳过）"
+        : "参与任务：关闭后该账号不进入批量操作与排程（POST /api/account/toggle，立即生效并持久化）",
     },
-      el("input", {
-        type: "checkbox",
-        checked: !!a.tasksEnabled,
-        disabled: state.toggling.has(uid),
-        "aria-label": `账号 ${a.nickname || uid} 参与任务`,
-        onchange: (ev) => toggleTasksEnabled(uid, ev.target.checked),
-      }),
-      state.toggling.has(uid) ? "提交中…" : "参与任务",
-    ),
-    el("span", { class: "acct-snap", text: snapLabel(a.snapshot) }),
+    el("span", { text: toggling ? "提交中…" : "参与任务" }),
+    el("input", {
+      type: "checkbox",
+      checked: isApiKey ? false : !!a.tasksEnabled,
+      disabled: toggling || isApiKey,
+      "aria-label": `账号 ${name} 参与任务`,
+      onchange: (ev) => toggleTasksEnabled(uid, ev.target.checked),
+    }),
+  );
+
+  const sideInner = el(
+    "span",
+    { class: "acct-cell-inner" },
+    el("span", {
+      class: "acct-time",
+      text: snapLabel(a.snapshot),
+      title: a.snapshot ? `快照更新于 ${fmtDateTime(a.snapshot.updatedISO)}` : "还没有任务快照",
+    }),
     isApiKey
       ? null
       : el("button", {
@@ -1189,8 +1154,19 @@ function accountRow(a) {
         }),
   );
 
-  const tasks = el("details", { class: "acct-tasks" },
-    el("summary", { text: taskSummary(a.snapshot) }),
+  const expired = snapExpired(a.snapshot);
+  const tasks = el(
+    "details",
+    { class: "acct-tasks" },
+    el(
+      "summary",
+      { class: "acct-tasks-head" },
+      el("span", {
+        class: expired ? "acct-tasks-label warn-text" : "acct-tasks-label",
+        text: expired ? "任务明细 · 快照已过期" : "任务明细",
+      }),
+      snapMetrics(a.snapshot),
+    ),
     taskTable(a),
   );
   if (state.expanded.has(uid)) tasks.open = true;
@@ -1201,18 +1177,33 @@ function accountRow(a) {
 
   return el(
     "div",
-    { class: "acct" },
+    { class: "acct", role: "group", "aria-label": `账号 ${name}` },
     el(
       "div",
-      { class: "acct-head" },
-      el("label", { class: "check" }, check),
+      { class: "acct-grid" },
+      el("div", { class: "acct-cell acct-pick" }, el("label", { class: "check" }, check)),
       el(
         "div",
-        { class: "acct-title" },
-        el("span", { class: "acct-name", text: String(a.nickname || uid || "（无昵称）") }),
-        el("span", { class: "acct-uid", text: uid || "（无 uid）" }),
+        { class: "acct-cell acct-id" },
+        el("span", { class: "acct-name", text: name, title: name }),
+        el("span", { class: "acct-sub", text: metaText, title: metaText }),
       ),
-      meta,
+      el(
+        "div",
+        { class: "acct-cell acct-status", dataset: { label: "状态" } },
+        statusInner,
+      ),
+      el(
+        "div",
+        {
+          class: "acct-cell acct-prog",
+          dataset: { label: "任务进度" },
+          title: isApiKey ? "API key 账号不参与任务，没有任务快照" : taskSummary(a.snapshot),
+        },
+        progInner,
+      ),
+      el("div", { class: "acct-cell acct-toggle-cell" }, toggle),
+      el("div", { class: "acct-cell acct-side", dataset: { label: "快照" } }, sideInner),
     ),
     tasks,
   );
@@ -1242,10 +1233,28 @@ function renderBanners() {
   }
 }
 
+// 国际版只剩一行诊断文字：数字取 /api/state 的 intlSkipped.count；
+// 缺失或为 0 时整行不显示，绝不渲染任何国际版账号行。
+function renderIntlNote() {
+  const box = $("#intlNote");
+  if (!box) return;
+  const count = Number(state.data?.intlSkipped?.count);
+  if (!Number.isFinite(count) || count <= 0) {
+    box.hidden = true;
+    box.textContent = "";
+    return;
+  }
+  box.textContent = `已忽略 ${count} 个国际版账号（workbuddy-ai）：本插件只服务国内版`;
+  box.hidden = false;
+}
+
 function renderAccounts() {
   const box = $("#accountsList");
   box.replaceChildren();
   const accounts = state.data?.accounts ?? [];
+  const head = $("#acctHead");
+  if (head) head.hidden = accounts.length === 0;
+  renderIntlNote();
   if (!accounts.length) {
     box.append(
       el("div", { class: "empty" },
@@ -1513,10 +1522,6 @@ async function acceptSelected() {
           setBatchStatus("已有批量任务在跑，接取中止（守护进程限速保护）。");
           return;
         }
-        if (e && e.unlockCancelled) {
-          setBatchStatus("已取消解锁：批量接取中止（该操作需要密钥）。");
-          return;
-        }
         notes.push(`${a0.nickname || a0.uid}：快照刷新失败（${e.message}）`);
         continue;
       }
@@ -1545,11 +1550,6 @@ async function acceptSelected() {
       } catch (e) {
         if (e instanceof ApiError && e.status === 409) {
           setBatchStatus("已有批量任务在跑，接取中止（守护进程限速保护）。");
-          return;
-        }
-        if (e && e.unlockCancelled) {
-          // 取消解锁 = 用户明确不继续：中止整个批次，绝不对下一个账号再弹框
-          setBatchStatus("已取消解锁：批量接取中止（该操作需要密钥）。");
           return;
         }
         notes.push(`${a.nickname || a.uid}：${e.message}`);
@@ -1585,10 +1585,6 @@ async function claimSelected() {
           setBatchStatus("已有批量任务在跑，领奖中止。");
           return;
         }
-        if (e && e.unlockCancelled) {
-          setBatchStatus("已取消解锁：只领奖中止（该操作需要密钥）。");
-          return;
-        }
         failNotes.push(`${a0.nickname || a0.uid}：快照刷新失败`);
         continue;
       }
@@ -1609,10 +1605,6 @@ async function claimSelected() {
         } catch (e) {
           if (e instanceof ApiError && e.status === 409) {
             setBatchStatus("已有批量任务在跑，领奖中止。");
-            return;
-          }
-          if (e && e.unlockCancelled) {
-            setBatchStatus("已取消解锁：只领奖中止（该操作需要密钥）。");
             return;
           }
           failNotes.push(`${a.nickname || a.uid}/${code}：${e.message}`);
@@ -1690,8 +1682,8 @@ async function rescanAccounts() {
 
 // ---- 账号导出 / 导入（契约 §9；hub 移植口径）------------------------------------------
 // 纪律：
-//   - key 只进 Authorization 头，绝不进 URL / <a href> / 复制内容（防浏览器历史泄漏）；
-//     下载走 fetch → Blob → URL.createObjectURL（object URL 不含 key）。
+//   - 守护进程无鉴权：导出走 fetch，不带 Authorization，URL 不带 ?k=。
+//     下载走 fetch → Blob → URL.createObjectURL。
 //   - token 只出现在下载的导出文件里：页面文本绝不渲染 accessToken/refreshToken
 //     （导入响应经后端 planView 本就剥掉 token；导出只读 count/exportedAt 做摘要）。
 //   - uid / 目标 key / 文件名 / 备份名一律等宽（.mono / code）。
@@ -1726,7 +1718,7 @@ export function localExportFileName({ uids = [], realm = null, now = Date.now() 
   return safe || "export.json";
 }
 
-const SCOPE_NAMES = { all: "全部", cn: "仅国内版", intl: "仅国际版", selected: "仅勾选的账号" };
+const SCOPE_NAMES = { all: "全部（国内版）", selected: "仅勾选的账号" };
 
 function triggerBlobDownload(blob, filename) {
   const url = URL.createObjectURL(blob);
@@ -1737,12 +1729,12 @@ function triggerBlobDownload(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
+// 后端不带 realm 时只导出国内版；「仅勾选」用 uid 列表收窄。
 function exportScope() {
   const radio = $('input[name="expScope"]:checked');
   const scope = radio ? radio.value : "all";
-  if (scope === "cn" || scope === "intl") return { scope, realm: scope, uids: [] };
   if (scope === "selected") return { scope, realm: null, uids: [...state.selected] };
-  return { scope, realm: null, uids: [] };
+  return { scope: "all", realm: null, uids: [] };
 }
 
 // 「含凭据」勾选联动：默认勾上（与 hub 一致）；勾/取消各自给一行说明
@@ -1750,9 +1742,9 @@ function syncExportHints() {
   const secrets = $("#expSecrets").checked;
   $("#expSecretsWarn").hidden = !secrets;
   $("#expSanitizedNote").hidden = secrets;
-  $("#expKeyHint").textContent = secrets
-    ? "含凭据导出需要密钥（secrets=1）：未解锁时会先弹「解锁写操作」，保存后自动继续下载。"
-    : "脱敏导出免密钥（secrets=0，后端删掉 accessToken/refreshToken 两键）。";
+  $("#expCredHint").textContent = secrets
+    ? "含凭据导出会下载含 accessToken / refreshToken 的文件（等同钥匙，别外发）。"
+    : "脱敏导出删掉 accessToken / refreshToken 两个键，只能看不能登录。";
 }
 
 async function exportAccounts(btn) {
@@ -1769,13 +1761,10 @@ async function exportAccounts(btn) {
     const url = new URL("api/accounts/export", location.href);
     url.searchParams.set("secrets", secrets ? "1" : "0");
     url.searchParams.set("download", "1");
-    if (realm) url.searchParams.set("realm", realm);
     if (uids.length) url.searchParams.set("uid", uids.join(","));
-    const headers = {};
-    if (state.key) headers.Authorization = `Bearer ${state.key}`; // key 只进头，绝不进 URL
     let res;
     try {
-      res = await fetch(url, { headers });
+      res = await fetch(url);
     } catch {
       const err = new Error("连不上守护进程");
       err.network = true;
@@ -1791,8 +1780,7 @@ async function exportAccounts(btn) {
     return res;
   };
   try {
-    // secrets=1 未解锁 → 401 → 弹一次密钥框 → 自动重试本次下载；secrets=0 免密钥直接过
-    const res = await withUnlockRetry(doFetch, "已取消解锁：含凭据导出需要密钥，未导出任何内容。");
+    const res = await doFetch();
     const name = filenameFromDisposition(res.headers.get("Content-Disposition")) || localExportFileName({ uids, realm });
     const blob = await res.blob();
     // 摘要只取 count / exportedAt（绝不把账号行、token 渲染进页面）
@@ -1815,9 +1803,7 @@ async function exportAccounts(btn) {
         : el("span", { class: "muted", text: " · 脱敏清单不能用于登录，只能用来看。" }),
     );
   } catch (e) {
-    if (e && e.unlockCancelled) {
-      status.textContent = "";
-    } else if (e && e.network) {
+    if (e && e.network) {
       status.textContent = "";
       humanErr(e, "导出失败");
     } else if (e instanceof ApiError) {
@@ -1831,7 +1817,7 @@ async function exportAccounts(btn) {
   }
 }
 
-// ---- 导入（两段式：预览免密钥不写盘 → 确认写入需密钥）--------------------------------
+// ---- 导入（两段式：预览只读不写盘 → 确认写入 plugin-auth.json）-----------------------
 // impState.blob = 预览用的已解析对象（确认必须与预览同一份内容）；previewOk = 预览
 // 成功才显示「确认写入」。textarea / 文件的任何变动都让预览失效 —— 后端的哈希竞态
 // 守卫只盯 plugin-auth.json 的变化，「导入内容改了没重新预览」只能前端挡。
@@ -1871,9 +1857,9 @@ async function importPreview() {
   btn.disabled = true;
   $("#impConfirmBtn").hidden = true;
   $("#impResult").replaceChildren();
-  setImpStatus("正在预览…（免密钥，不写盘）");
+  setImpStatus("正在预览…（只读，不写盘）");
   try {
-    // body = {"blob":<账号数据本体>}：confirm 缺省 = 预览分支（免密钥）
+    // body = {"blob":<账号数据本体>}：confirm 缺省 = 预览分支（只读）
     const r = await api("api/accounts/import", { method: "POST", body: { blob: parsed, confirm: false } });
     impState.blob = parsed;
     impState.previewOk = true;
@@ -1998,7 +1984,7 @@ async function importConfirm() {
   btn.disabled = true;
   setImpStatus("正在写入 plugin-auth.json…");
   try {
-    // confirm:true 需密钥：未解锁 → api() 弹一次密钥框 → 自动重试本次确认
+    // confirm:true 写盘（写前自动备份）
     const r = await api("api/accounts/import", { method: "POST", body: { blob: impState.blob, confirm: true } });
     impInvalidate(); // 本次预览已被消耗：再写必须重新预览
     $("#impResult").replaceChildren();
@@ -2069,10 +2055,6 @@ function renderImportError(e, prefix) {
         ),
       ),
     );
-    return;
-  }
-  if (e && e.unlockCancelled) {
-    setImpStatus("已取消解锁：确认写入需要密钥，未写入任何文件。");
     return;
   }
   box.replaceChildren();
@@ -2300,8 +2282,7 @@ async function loadHistory() {
     if (state.history.page > maxPage) state.history.page = maxPage;
     renderHistory();
   } catch (e) {
-    // 401（旧守护进程已弹过框）与取消解锁不进错误空态：密钥补上后会自动重拉
-    if (!(e instanceof ApiError && e.status === 401) && !(e && e.unlockCancelled)) renderHistoryError(e);
+    renderHistoryError(e);
   }
 }
 
@@ -2432,10 +2413,8 @@ function disconnectSSE() {
 function connectSSE() {
   disconnectSSE();
   if (state.conn === "stopped") return;
+  // 守护进程无鉴权：SSE 地址不带任何鉴权参数。
   const url = new URL("api/events", location.href);
-  // 新口径 /api/events 免密钥，永不带 k。仅旧守护进程（legacyAuth：只读路由也 401）
-  // 才回退 ?k= —— EventSource 无法设 Authorization 头；该 URL 只在内存，不进浏览历史。
-  if (state.legacyAuth && state.key) url.searchParams.set("k", state.key);
   let es;
   try {
     es = new EventSource(url);
@@ -2468,7 +2447,7 @@ function connectSSE() {
     startPolling();
     errs++;
     if (!opened && errs >= 2) {
-      // 密钥不对或守护进程没起来：别再无限重连，30s 后再试一次
+      // 守护进程没起来：别再无限重连，30s 后再试一次（此间用 3s 轮询）
       disconnectSSE();
       state.esRetryTimer = setTimeout(() => {
         state.esRetryTimer = 0;
@@ -2564,17 +2543,7 @@ async function loadState({ quiet = false } = {}) {
     if (state.conn !== "stopped") state.conn = "online";
     renderAll();
   } catch (e) {
-    if (e && e.unlockCancelled) {
-      // 只读 state 也要密钥 = 旧守护进程，且用户取消了输入：停在「需要密钥」，
-      // 点右上「解锁写操作」补 key 后会自动重跑 boot（新口径不会走到这里）
-      if (state.conn !== "stopped") state.conn = "nokey";
-      renderTop();
-    } else if (e instanceof ApiError && e.status === 401) {
-      // 解锁后重试仍 401 = 密钥不对（旧守护进程）：不循环弹框
-      if (state.conn !== "stopped") state.conn = "nokey";
-      renderTop();
-      toast("读取状态需要密钥（守护进程为旧口径）且密钥不正确：点右上「解锁写操作」重新输入。", "warn", 9000);
-    } else if (e.network) {
+    if (e && e.network) {
       if (state.conn !== "stopped") state.conn = "down";
       state.feed = "idle";
       renderTop();
@@ -2606,7 +2575,48 @@ async function stopDaemon() {
 
 // ---- 初始化 ------------------------------------------------------------------------------------
 
+// 账号表头 sticky 偏移：顶栏本身是 sticky 且会在窄屏换行，按它的实际高度写 --topbar-h，
+// 避免表头被顶栏盖住或悬在半空。ResizeObserver 管内容变化，resize 管视口变化；
+// renderTop 末尾再补一次（地址行首次出现时高度会跳变）。
+let syncTopbarHeight = null;
+let topbarObserver = null;
+let topbarTick = 0;
+
+function trackTopbarHeight() {
+  const bar = $(".topbar");
+  if (!bar) return;
+  let last = -1;
+  syncTopbarHeight = () => {
+    const h = Math.round(bar.getBoundingClientRect().height);
+    if (h === last) return;
+    last = h;
+    document.documentElement.style.setProperty("--topbar-h", `${h}px`);
+  };
+  syncTopbarHeight();
+  try {
+    if (typeof ResizeObserver !== "undefined") {
+      // 保留引用：不持有 observer 时它可能被回收，顶栏换行后偏移不会更新
+      topbarObserver = new ResizeObserver(syncTopbarHeight);
+      topbarObserver.observe(bar);
+    }
+  } catch {}
+  window.addEventListener("resize", syncTopbarHeight, { passive: true });
+  // 兜底：某些嵌入视图改视口时不发 resize；下一帧滚动时校正一次（值不变则零成本）
+  window.addEventListener(
+    "scroll",
+    () => {
+      if (topbarTick) return;
+      topbarTick = requestAnimationFrame(() => {
+        topbarTick = 0;
+        syncTopbarHeight();
+      });
+    },
+    { passive: true },
+  );
+}
+
 function wireStatic() {
+  trackTopbarHeight();
   $("#themeBtn").addEventListener("click", cycleTheme);
   $("#daemonStopBtn").addEventListener("click", stopDaemon);
   $("#daemonStartBtn").addEventListener("click", () => $("#cmdDialog").showModal());
@@ -2614,53 +2624,6 @@ function wireStatic() {
     const ok = await copyText("node daemon.mjs");
     toast(ok ? "已复制：node daemon.mjs" : "复制失败，请手动选择文本复制。", ok ? "info" : "warn");
   });
-
-  // 「解锁写操作」按钮：未解锁 → 弹密钥框；已解锁 → 撤销（清 sessionStorage 回只读）
-  $("#unlockBtn").addEventListener("click", async (ev) => {
-    ev.currentTarget.blur();
-    if (state.key) {
-      state.key = "";
-      try {
-        sessionStorage.removeItem(SS_KEY);
-      } catch {}
-      renderTop();
-      toast("已撤销解锁：回到只读模式。写操作会再次要求密钥。");
-      return;
-    }
-    const ok = await promptKeyAsync("");
-    if (!ok) return; // 取消：保持只读
-    renderTop();
-    toast("已解锁写操作：密钥只存本标签页的 sessionStorage。");
-    // 旧守护进程场景：只读数据此前被密钥挡住 → 现在补跑启动链
-    if (state.conn === "nokey" || (!state.data && state.conn !== "stopped" && state.conn !== "down")) {
-      state.conn = "checking";
-      boot();
-    }
-  });
-
-  $("#keyForm").addEventListener("submit", (ev) => {
-    // method=dialog：submit 事件触发时 returnValue 可能尚未赋值（规范在事件后才写），
-    // 以 submitter 的 value 为准，returnValue 兜底。
-    const val = ev.submitter?.value || $("#keyDialog").returnValue || "";
-    if (val !== "save") return; // 取消 → close 事件里 settleUnlock(false)
-    const v = $("#keyInput").value.trim();
-    if (!v) {
-      ev.preventDefault(); // 留在对话框里补输入
-      promptKey("密钥不能为空。");
-      return;
-    }
-    state.key = v;
-    try {
-      sessionStorage.setItem(SS_KEY, v);
-    } catch {}
-    $("#keyError").hidden = true;
-    renderTop();
-    // 唤醒等这个 key 的那一个调用（401 自动重试），或解锁按钮的 handler
-    settleUnlock(true);
-  });
-  // 对话框关闭（取消 / ESC / 保存后自动关）：未决的等待一律按 false 收尾。
-  // settleUnlock 幂等（保存路径已先 settle(true)），不会覆盖成功结果。
-  $("#keyDialog").addEventListener("close", () => settleUnlock(false));
 
   $("#selectAll").addEventListener("change", (ev) => {
     const elig = eligibleAccounts();
@@ -2702,8 +2665,7 @@ function wireStatic() {
 
 async function boot() {
   renderTop();
-  // 首屏没有密钥门槛：hello / state / history / SSE 都是免密钥只读路由，直接渲染。
-  // 旧守护进程（只读也 401）会在 loadState 里自动弹一次解锁框，保存后原调用自动重试。
+  // 守护进程无鉴权：首屏直接渲染，hello / state / history / SSE 都不需要任何凭据。
   try {
     state.hello = await api("api/hello");
   } catch (e) {
@@ -2715,19 +2677,14 @@ async function boot() {
           el("strong", {}, "连不上守护进程。"),
           "它可能没有启动：magpie 开启本插件时会自动拉起；也可在插件目录手动执行 ",
           el("code", { text: "node daemon.mjs" }),
-          "，启动后刷新本页。实际端口与密钥写在 ",
+          "，启动后刷新本页。实际端口与绑定地址写在 ",
           el("code", { text: "<状态目录>/daemon.json" }),
           "。",
         ),
       );
       return;
     }
-    if (e && e.unlockCancelled) {
-      state.conn = "nokey"; // 旧守护进程：用户取消了密钥输入
-      renderTop();
-      return;
-    }
-    // 其余错误（如密钥不对的 401）：继续读 state，让它把话说全
+    // 其余错误：继续读 state，让它把话说全
   }
   if (state.conn !== "stopped") state.conn = "checking";
   await loadState();
@@ -2739,7 +2696,6 @@ async function boot() {
 
 function init() {
   applyTheme();
-  readKeyFromUrl();
   wireStatic();
   syncExportHints(); // 「含凭据」默认勾上：警示/提示行按初始状态就位
   // batchStatus 保留换行

@@ -68,6 +68,8 @@ function makeDaemonClient(getInfo) {
     const signal = typeof AbortSignal.any === "function" ? AbortSignal.any(signals) : signals[0]
     const res = await fetch(`http://127.0.0.1:${info.port}${path}`, {
       method,
+      // Bearer 头兼容保留：免密钥口径下 daemon 不校验任何密钥（routeNeedsKey 恒
+      // false），带上它只为与老版本 daemon（仍设密钥门禁）平滑共存。
       headers: {
         authorization: `Bearer ${info.key}`,
         ...(body !== undefined ? { "content-type": "application/json" } : {}),
@@ -208,7 +210,6 @@ export const WorkBuddyTasksPlugin = async (input, options) => {
   async function usage() {
     try {
       const r = await client.call("GET", "/api/state", undefined, 8000)
-      if (r.status === 401) return { error: "守护进程密钥不匹配（删除 state/daemon.json 后重开插件可重建）", windows: [] }
       if (!r.ok || !r.data) return { error: `守护进程返回异常（HTTP ${r.status}）`, windows: [] }
       const s = r.data
       const count = (s.accounts ?? []).filter((a) => a.tasksEnabled).length

@@ -1,7 +1,8 @@
 // tests-shell/daemon.test.mjs —— 守护进程外壳自测（node --test；不依赖 engine/*）
 //
 // 用注入的 fake engine（契约 §2 形状）驱动 daemon.mjs，零真实网络、零真实账号：
-//   1. 密钥门禁：无 key / 错 key 一律 401，/api/hello 豁免
+//   1. 免密钥口径（用户明确要求）：全部路由无 key / 错 key 一律放行，写操作按
+//      业务语义响应（绝不 401）；带旧 Bearer/?k= 的调用继续可用
 //   2. /api/hello 形状
 //   3. 409 busy：同一时刻只允许一个 job
 //   4. control.json desired=off → 守护进程优雅退出
@@ -168,24 +169,31 @@ const tick = (ms = 50) => new Promise((r) => setTimeout(r, ms))
 // ---- 1–3. HTTP 外壳 ------------------------------------------------------
 
 describe("daemon HTTP 外壳", () => {
-  test("密钥分级（契约 §3）：只读免密钥，写操作无 key/错 key 一律 401", async () => {
+  test("全路由免密钥（契约 §3 免密钥口径）：无 key/错 key 一律放行，写操作按业务语义响应", async () => {
     const { h } = await boot()
     try {
       assert.equal((await get(h.port, "/api/hello")).status, 200)
 
-      // 免密钥（只读、无副作用）：打开看板不再弹密钥
+      // 只读路由：无 key、错 key 都 200（不存在「需要密钥」这回事）
       assert.equal((await get(h.port, "/api/state")).status, 200)
       assert.equal((await get(h.port, "/api/history")).status, 200)
-      assert.equal((await get(h.port, "/api/state", "wrong-key")).status, 200, "免密钥路由不校验 key（错 key 也不挡）")
+      assert.equal((await get(h.port, "/api/state", "wrong-key")).status, 200, "错 key 也不挡（不做任何校验）")
 
-      // 写操作：无 key 401
-      assert.equal((await post(h.port, "/api/run", {}, null)).status, 401)
-      assert.equal((await post(h.port, "/api/stop", undefined, null)).status, 401)
-      assert.equal((await post(h.port, "/api/settings", {}, null)).status, 401)
+      // 写操作：无 key 放行，按业务语义响应（不再 401）
+      assert.equal((await post(h.port, "/api/settings", { claim: true }, null)).status, 200)
+      const run = await post(h.port, "/api/run", {}, "wrong-key")
+      assert.equal(run.status, 200, "写操作无 key/错 key 照常执行")
+      assert.ok((await run.json()).job.id)
+      for (let i = 0; i < 100 && h.runner.current(); i++) await tick()
+      // 无 job 可停 → 404（业务理由），绝不是 401
+      const stopRes = await post(h.port, "/api/stop", undefined, null)
+      assert.equal(stopRes.status, 404)
+      assert.match((await stopRes.json()).error, /没有正在运行/)
 
-      // 带 key（header 或 ?k=）一切照旧
+      // 带旧密钥（header 或 ?k=）的调用继续可用：平滑过渡，不报 400/401
       assert.equal((await get(h.port, "/api/state", KEY)).status, 200)
       assert.equal((await get(h.port, `/api/state?k=${encodeURIComponent(KEY)}`)).status, 200)
+      assert.equal((await get(h.port, `/api/state?k=${encodeURIComponent("完全无关的旧值")}`)).status, 200)
     } finally {
       await h.stop()
     }
@@ -323,7 +331,7 @@ describe("daemon HTTP 外壳", () => {
     }
   })
 
-  test("SSE /api/events：text/event-stream，先发 retry 行；免密钥可连（契约 §3 只读分级）", async () => {
+  test("SSE /api/events：text/event-stream，先发 retry 行；无需任何密钥（免密钥口径）", async () => {
     const { h } = await boot()
     const ctrl = new AbortController()
     try {
@@ -338,7 +346,7 @@ describe("daemon HTTP 外壳", () => {
       assert.ok(new TextDecoder().decode(value).includes("retry"))
 
       const anon = await fetch(base(h.port) + "/api/events", { signal: ctrl.signal })
-      assert.equal(anon.status, 200, "SSE 是只读事件流，免密钥")
+      assert.equal(anon.status, 200, "SSE 无需任何密钥（全部路由免密钥口径）")
       anon.body?.cancel?.().catch(() => {})
     } finally {
       ctrl.abort()

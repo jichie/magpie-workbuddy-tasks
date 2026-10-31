@@ -10,7 +10,8 @@
 // 环境变量：
 //   WB_STATE_DIR    状态目录（优先）；否则 <WB_CONFIG_DIR|cfg>/workbuddy-tasks/state
 //   WB_CONFIG_DIR   magpie 配置目录（读 plugins.json、账号凭据）
-//   WB_DAEMON_KEY   API 密钥；缺省时生成并写进 daemon.json
+//   WB_DAEMON_KEY   仅作为 daemon.json 的 key 字段写入（向后兼容保留，不是访问凭据，
+//                   任何接口都不校验它）；缺省时随机生成
 //   WB_DAEMON_PORT  期望端口；缺省 4390，被占用则向后找，再不行用随机端口
 //   WB_DAEMON_ADDR  监听地址；缺省 127.0.0.1（Docker 内可设 0.0.0.0，只到容器网桥）
 //   WB_MANAGED      =1 表示由 magpie 宿主拉起（plugins.json 条目消失时允许自杀）
@@ -18,6 +19,7 @@
 // 命令行：--addr <host:port|host|:port>  --port <n>  --cfg <dir>  --state <dir>
 // startDaemon 可注入（测试/嵌入用）：{ cfgDir, stateDir, port, key, args, engine,
 //   now, sleep, fetch, log, noTimers, skipExistingCheck, managed, runner }。
+//   key —— 只写进 daemon.json（向后兼容保留的字段），不是访问凭据。
 //   fetch —— 假 fetch 顶替全部上游网络（引擎全程 opts.fetch），零真实请求（契约 §8）。
 //
 // 铁律：账号 access/refresh token 永不出现在任何响应、SSE 或日志里
@@ -123,62 +125,55 @@ function writeJson(file, data, mode) {
   }
 }
 
-function timingSafeEqual(a, b) {
-  const ba = Buffer.from(String(a ?? ""))
-  const bb = Buffer.from(String(b ?? ""))
-  if (ba.length !== bb.length || ba.length === 0) return false
-  return crypto.timingSafeEqual(ba, bb)
-}
-
 function shortErr(e) {
   return scrub(e?.message ?? String(e)).slice(0, 200)
 }
 
-// ---- 路由 → 是否需密钥（单一数据源；契约 §3）--------------------------------
-// 用户口径：「打开看板页面不再弹密钥」落实为按副作用分级：
-//   free     —— 只读、无副作用、响应不含凭据
-//   write    —— 有副作用或响应含凭据（红线：secrets=1 的导出免密钥就能把
-//               所有 access/refresh 打包下载走，绝不放开）
-//   secrets  —— GET /api/accounts/export：仅 secrets=0（脱敏）免密钥，
-//               缺省/secrets=1 一律要密钥
-//   confirm  —— POST /api/accounts/import：预览分支免密钥，confirm=true 要密钥
-// 未登记的路由一律按需密钥处理（默认关死，绝不给默认免密；带 key 访问未知路由
-// 才能看到 404）。
+// ---- 路由 → 是否需密钥（单一真相；契约 §3）----------------------------------
+// 免密钥口径（用户明确要求「全部改成免密钥」，2026-10 定稿）：本守护进程是
+// 局域网自建工具，**所有路由一律不需要密钥**——包括 POST /api/run、/api/stop、
+// /api/task/claim、/api/task/accept、/api/checkin、/api/settings、
+// /api/account/toggle、/api/shutdown、导入确认写入与含 token 的导出、SSE 与静态
+// 资源。鉴权由网络边界负责：默认只绑 127.0.0.1（仅本机可达）；绑定 0.0.0.0/::
+// 即暴露到容器网桥/局域网，同一局域网内任何主机都能触发批量任务、写入凭据、
+// 导出 token 并关停进程（详见 README 安全段，风险如实写明）。
+//
+// API_ROUTE_AUTH 保留为「路由登记表」：每个路由在此唯一登记（path 是测试用的
+// 样例路径，note 是给人看的一句话）；「全路由免密钥清单测试」遍历本表证明
+// 不存在需要密钥的路径。若将来要重新引入鉴权，只改 routeNeedsKey 一处即可。
 const API_ROUTE_AUTH = [
-  { method: "GET", re: /^\/api\/hello$/, level: "free" },
-  { method: "GET", re: /^\/api\/state$/, level: "free" },
-  { method: "GET", re: /^\/api\/history$/, level: "free" },
-  { method: "GET", re: /^\/api\/jobs\/[A-Za-z0-9_-]+$/, level: "free" },
-  { method: "GET", re: /^\/api\/events$/, level: "free" },
-  { method: "POST", re: /^\/api\/accounts$/, level: "free" }, // 重扫本地文件，无副作用
-  { method: "GET", re: /^\/api\/accounts\/export$/, level: "secrets" },
-  { method: "POST", re: /^\/api\/accounts\/import$/, level: "confirm" },
-  { method: "POST", re: /^\/api\/run$/, level: "write" },
-  { method: "POST", re: /^\/api\/stop$/, level: "write" },
-  { method: "POST", re: /^\/api\/task\/claim$/, level: "write" },
-  { method: "POST", re: /^\/api\/task\/accept$/, level: "write" },
-  { method: "POST", re: /^\/api\/checkin$/, level: "write" },
-  { method: "POST", re: /^\/api\/settings$/, level: "write" },
-  { method: "POST", re: /^\/api\/account\/toggle$/, level: "write" },
-  { method: "POST", re: /^\/api\/shutdown$/, level: "write" },
+  { method: "GET", re: /^\/api\/hello$/, path: "/api/hello", note: "服务状态" },
+  { method: "GET", re: /^\/api\/state$/, path: "/api/state", note: "看板状态快照" },
+  { method: "GET", re: /^\/api\/history$/, path: "/api/history", note: "历史记录" },
+  { method: "GET", re: /^\/api\/jobs\/[A-Za-z0-9_-]+$/, path: "/api/jobs/job-1", note: "job 查询" },
+  { method: "GET", re: /^\/api\/events$/, path: "/api/events", note: "SSE 实时事件" },
+  { method: "POST", re: /^\/api\/accounts$/, path: "/api/accounts", note: "重扫本地账号文件，无副作用" },
+  { method: "GET", re: /^\/api\/accounts\/export$/, path: "/api/accounts/export", note: "账号导出（secrets=1 含 token）" },
+  { method: "POST", re: /^\/api\/accounts\/import$/, path: "/api/accounts/import", note: "账号导入（confirm=true 写盘）" },
+  { method: "POST", re: /^\/api\/run$/, path: "/api/run", note: "启动批量任务" },
+  { method: "POST", re: /^\/api\/stop$/, path: "/api/stop", note: "停止当前任务" },
+  { method: "POST", re: /^\/api\/task\/claim$/, path: "/api/task/claim", note: "单任务领奖" },
+  { method: "POST", re: /^\/api\/task\/accept$/, path: "/api/task/accept", note: "单任务接取" },
+  { method: "POST", re: /^\/api\/checkin$/, path: "/api/checkin", note: "手动签到" },
+  { method: "POST", re: /^\/api\/settings$/, path: "/api/settings", note: "写设置" },
+  { method: "POST", re: /^\/api\/account\/toggle$/, path: "/api/account/toggle", note: "参与任务开关" },
+  { method: "POST", re: /^\/api\/shutdown$/, path: "/api/shutdown", note: "关停守护进程" },
 ]
 
-export const KEY_REQUIRED_MSG =
-  "此操作会改动账号或涉及凭据，需要守护进程密钥：请在看板右上「解锁写操作」里填入 state/daemon.json 的 key（Authorization: Bearer <key> 或 ?k=<key>）"
+export { API_ROUTE_AUTH }
 
 const TRUTHY = ["1", "true", "yes"]
 const isTruthyParam = (v) => TRUTHY.includes(String(v ?? "").trim().toLowerCase())
-// secrets=0/false/no = 脱敏导出（免密钥）；缺省/1/true/其他值 = 含凭据（必须密钥）
+// secrets=0/false/no = 脱敏导出（删 token 两键）；缺省/1/true/其他值 = 含凭据真值导出。
+// 这只是导出的脱敏开关（展示层口径），与鉴权无关 —— 免密钥口径下任何取值都放行。
 const isSecretsFree = (v) => ["0", "false", "no"].includes(String(v ?? "").trim().toLowerCase())
 
-// routeNeedsKey(method, pathname, {secrets, confirm}) -> boolean（导出供测试）
-export function routeNeedsKey(method, pathname, cond = {}) {
-  const row = API_ROUTE_AUTH.find((r) => r.method === method && r.re.test(pathname))
-  if (!row) return true
-  if (row.level === "free") return false
-  if (row.level === "secrets") return !isSecretsFree(cond.secrets)
-  if (row.level === "confirm") return cond.confirm === true
-  return true
+// routeNeedsKey(method, pathname, cond) -> boolean（导出供测试）
+// 单一真相：恒为 false —— 用户明确要求免密钥（局域网自建工具，鉴权由网络边界
+// 负责，默认只绑 127.0.0.1）。签名与旧行为兼容（参数忽略）；带旧密钥的调用
+// （Authorization: Bearer / ?k=）不做任何校验、不报 400/401，平滑过渡。
+export function routeNeedsKey() {
+  return false
 }
 
 // ---- 快照投影（导出供测试）-------------------------------------------------
@@ -415,6 +410,8 @@ export async function startDaemon(opts = {}) {
     }
   }
 
+  // key 只落 daemon.json（0600，向后兼容保留的字段：index.mjs/lifecycle 的探测
+  // 逻辑与老看板会读它），不是访问凭据 —— 免密钥口径下任何接口都不校验它。
   const key = opts.key || args.key || process.env.WB_DAEMON_KEY || readDaemonInfo(stateDir)?.key || crypto.randomBytes(24).toString("base64url")
 
   // ---- 引擎 ----
@@ -463,8 +460,10 @@ export async function startDaemon(opts = {}) {
     cfgDir,
     stateDir,
     settings: () => readSettings(),
-    // runner 可选注入（engine/runner.mjs 的 opts）：账号由我们合并好 tasksEnabled 再给
-    loadAccounts: () => loadAccountsAll(),
+    // runner 可选注入（engine/runner.mjs 的 opts）：账号由我们合并好 tasksEnabled 再给。
+    // 与列表同源（纯国内版口径）：只把 provider==="workbuddy" 的账号交给引擎，
+    // 国际版绝不进任何 job（runner 内部的 eligibleAccounts 是第二道 cn 过滤）。
+    loadAccounts: () => loadAccountsCn(),
     // 铁律 3：token 刷新后原子回写 plugin-auth.json（engine/store.saveAccountRefresh），
     // 保证 magpie 社区插件与我们用的是同一对凭据。
     saveRefresh: (acctKey, patch) => {
@@ -494,6 +493,22 @@ export async function startDaemon(opts = {}) {
   // ---- 账号（经 engine/store 读 plugin-auth.json；缺引擎时空列表） --------
   let accountsError = ""
 
+  // 纯国内版口径（用户明确要求「国际版账号不出现」）：本插件只服务国内版
+  // provider === "workbuddy"；workbuddy-ai（国际版）不进列表、不进快照/汇总/统计、
+  // 不进排程/运行。**过滤只发生在 daemon 使用侧**（本文件这一个函数是唯一边界，
+  // 列表/统计/排程/运行/单账号操作全部经它取数）：engine/store.loadAccounts 行为
+  // 不变，仍返回全部 workbuddy* 条目（accountio 的导入合并与导出 realm=intl
+  // 逃生口要用全量）——别把过滤挪进 store 层。
+  function loadAccountsCn(all = loadAccountsAll()) {
+    return all.filter((a) => a.provider === "workbuddy")
+  }
+
+  // 国际版账号的只读诊断计数：只给数量与说明，绝不列出 intl 账号内容（契约 §3）
+  const INTL_SKIPPED_NOTE = "本插件只服务国内版 workbuddy，国际版账号不列出、不参与任务、不默认导出"
+  function intlSkippedCountOf(all) {
+    return all.filter((a) => a.provider === "workbuddy-ai").length
+  }
+
   function cfgEnvLike() {
     const envLike = { ...process.env, WB_CONFIG_DIR: cfgDir, WB_STATE_DIR: stateDir }
     return envLike
@@ -521,7 +536,7 @@ export async function startDaemon(opts = {}) {
   }
 
   function eligibleNow() {
-    const accts = loadAccountsAll()
+    const accts = loadAccountsCn() // 与列表同源：只有国内版账号可能参与任务
     const filter = engine?.store?.eligibleAccounts
     if (typeof filter !== "function") return []
     try {
@@ -546,7 +561,8 @@ export async function startDaemon(opts = {}) {
   }
 
   function accountByUid(uid) {
-    return loadAccountsAll().find((a) => a.uid === uid) || null
+    // 与列表同源：只在国内版账号里找（intl uid 一律「找不到」，不会从侧门进引擎）
+    return loadAccountsCn().find((a) => a.uid === uid) || null
   }
 
   // ---- 快照（/api/state 的 tasks/energy/streak；只在闲时刷新，限流） ------
@@ -764,7 +780,7 @@ export async function startDaemon(opts = {}) {
       return []
     }
     if (!Array.isArray(list)) return []
-    const nick = new Map(loadAccountsAll().map((a) => [a.uid, a.nickname || a.uid]))
+    const nick = new Map(loadAccountsCn().map((a) => [a.uid, a.nickname || a.uid]))
     return list
       .filter((h) => h && typeof h === "object" && h.uid)
       .map((h) => ({
@@ -986,7 +1002,8 @@ export async function startDaemon(opts = {}) {
   }
 
   function statePayload() {
-    const accts = loadAccountsAll()
+    const all = loadAccountsAll()
+    const accts = loadAccountsCn(all)
     const cur = runner?.current?.() ?? null
     const payload = {
       // 绑定信息（B）：前端展示可点开的看板地址用；bindHost 是真实监听 host，
@@ -996,6 +1013,9 @@ export async function startDaemon(opts = {}) {
       port,
       reachableHint: bindHint(host),
       accounts: accts.map(accountRow),
+      // 纯国内版诊断计数（只读）：国际版账号的数量与去向说明。绝不列出 intl
+      // 账号内容（uid/昵称都不给）—— 用户明确要求国际版账号「彻底不出现」。
+      intlSkipped: { count: intlSkippedCountOf(all), note: INTL_SKIPPED_NOTE },
       scheduler: {
         enabled: !!settings.scheduler,
         nextRuns: schedulerNextRuns(),
@@ -1048,12 +1068,6 @@ export async function startDaemon(opts = {}) {
     res.end(text)
   }
 
-  function authorized(req, u) {
-    const header = String(req.headers.authorization ?? "")
-    const tok = header.replace(/^Bearer\s+/i, "").trim() || u.searchParams.get("k") || ""
-    return timingSafeEqual(tok, key)
-  }
-
   const MIME = {
     ".html": "text/html; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
@@ -1071,7 +1085,10 @@ export async function startDaemon(opts = {}) {
 <body style="font-family:system-ui,sans-serif;max-width:42rem;margin:4rem auto;padding:0 1rem;color:#333">
 <h2>看板尚未构建</h2>
 <p>本插件的 <code>dashboard/</code> 目录还没有前端文件。任务 API、排程与守护进程已在运行。</p>
-<p>把看板文件放进 <code>dashboard/</code> 后刷新本页即可。<code>/api/hello</code> 可确认服务状态；只读接口免密钥，改动账号或涉及凭据的接口需要密钥（见 <code>state/daemon.json</code>）。</p>
+<p>把看板文件放进 <code>dashboard/</code> 后刷新本页即可。<code>/api/hello</code> 可确认服务状态。</p>
+<p>本看板与全部 API <strong>无需任何密钥</strong>（用户明确要求的免密钥口径）：鉴权由网络边界负责 ——
+守护进程默认只绑定 <code>127.0.0.1</code>，只有本机能访问；若改绑 <code>0.0.0.0</code>/容器网桥，同一局域网内
+任何主机都能用你的账号跑任务、写入凭据、导出 token 并关停本进程，请勿把端口发布到公网或开放局域网。</p>
 </body></html>`
   }
 
@@ -1136,11 +1153,8 @@ export async function startDaemon(opts = {}) {
     }
     const confirm =
       (body && typeof body === "object" && body.confirm === true) || isTruthyParam(u.searchParams.get("confirm"))
-    // 门禁（confirm=true 有副作用 → 必须密钥；预览免密钥，见 API_ROUTE_AUTH）
-    if (confirm && !authorized(req, u)) {
-      json(res, 401, { error: KEY_REQUIRED_MSG })
-      return
-    }
+    // 免密钥口径：confirm=true（写盘）不再设密钥门禁，与所有路由同一政策
+    //（routeNeedsKey 恒 false，见文件头「路由 → 是否需密钥」单一真相）。
 
     const blob =
       body && typeof body === "object" && !Array.isArray(body) && "blob" in body ? body.blob : body
@@ -1239,15 +1253,10 @@ export async function startDaemon(opts = {}) {
       return
     }
 
-    // 导入路由单独前置：confirm 可以在 body 里，必须先读完 body 才能定门禁
-    // （读 body 本身无副作用）。其余路由按 API_ROUTE_AUTH 表判级。
+    // 导入路由单独前置：confirm 可以在 body 里，必须先读完 body 才能定预览/确认
+    //（读 body 本身无副作用）。其余路由按 API_ROUTE_AUTH 登记表口径（免密钥）。
     if (p === "/api/accounts/import" && req.method === "POST") {
       await handleAccountsImport(req, res, u)
-      return
-    }
-
-    if (routeNeedsKey(req.method, p, { secrets: u.searchParams.get("secrets") }) && !authorized(req, u)) {
-      json(res, 401, { error: KEY_REQUIRED_MSG })
       return
     }
 
@@ -1403,9 +1412,10 @@ export async function startDaemon(opts = {}) {
     }
 
     if (p === "/api/accounts" && req.method === "POST") {
-      // 重新读 plugin-auth.json，按 uid 报告增删；eligible = 可参与任务的 OAuth 账号数
-      const before = new Set(loadAccountsAll().map((a) => a.uid))
-      const after = loadAccountsAll()
+      // 重新读 plugin-auth.json，按 uid 报告增删（纯国内版口径：count/eligible/
+      // added/removed 全部只算 provider==="workbuddy" 的国内版条目，国际版不出现）
+      const before = new Set(loadAccountsCn().map((a) => a.uid))
+      const after = loadAccountsCn()
       const afterIds = new Set(after.map((a) => a.uid))
       let eligible = 0
       try {
@@ -1423,18 +1433,19 @@ export async function startDaemon(opts = {}) {
 
     if (p === "/api/accounts/export" && req.method === "GET") {
       // hub /accounts/export（wb_proxy.py:19314）的移植：realm/secrets/uid/download。
-      // secrets=0/false/no = 脱敏（免密钥，见 API_ROUTE_AUTH）；缺省/secrets=1 = 含
-      // access/refresh 的真值导出（必须密钥 —— 红线）。导出文件本身必须真值，否则
-      // 回灌无效；打码只属于界面展示层。
+      // 纯国内版口径：不带 realm（或任何非 intl 值）只导出国内版；显式 realm=intl
+      // 才导出国际版 —— 这是给 hub 备份场景留的逃生口（UI 不提供，契约 §9）。
+      // secrets=0/false/no = 脱敏（删 token 两键）；缺省/secrets=1 = 含 access/refresh
+      // 的真值导出。导出文件本身必须真值，否则回灌无效；打码只属于界面展示层。
       const realmParam = u.searchParams.get("realm")
-      const realm = realmParam === "cn" || realmParam === "intl" ? realmParam : null
+      const realm = realmParam === "intl" ? "intl" : "cn"
       const includeSecrets = !isSecretsFree(u.searchParams.get("secrets"))
       const uids = u.searchParams
         .getAll("uid")
         .flatMap((s) => String(s).split(","))
         .map((s) => s.trim())
         .filter(Boolean)
-      const accts = loadAccountsAll()
+      const accts = realm === "intl" ? loadAccountsAll() : loadAccountsCn()
       if (uids.length) {
         const known = new Set(accts.map((a) => a.uid))
         const missing = uids.filter((x) => !known.has(x))
@@ -1444,7 +1455,7 @@ export async function startDaemon(opts = {}) {
         }
       }
       const doc = buildExportDocument(accts, { realm, includeSecrets, uids: uids.length ? uids : null, now: now() })
-      log(`[export] realm=${realm ?? "all"} secrets=${includeSecrets ? 1 : 0} uids=${uids.length} count=${doc.count}`)
+      log(`[export] realm=${realm} secrets=${includeSecrets ? 1 : 0} uids=${uids.length} count=${doc.count}`)
       if (isTruthyParam(u.searchParams.get("download"))) {
         // hub _download()：attachment + 净化文件名 + no-store
         const name = exportFileName({ uids, realm, now: now() })
@@ -1755,7 +1766,8 @@ if (isMain) {
   const log = (...a) => console.log(new Date().toISOString(), ...a)
   startDaemon({ log })
     .then((h) => {
-      log(`看板地址：http://${h.host}:${h.port}/  （API 需要密钥，见 state/daemon.json）`)
+      // 免密钥口径的如实提示：无鉴权，安全靠网络边界（默认只绑 127.0.0.1）
+      log(`看板地址：http://${h.host}:${h.port}/  （无鉴权：全部 API 免密钥，默认只绑 127.0.0.1，安全靠网络边界，勿暴露公网）`)
       // 通配绑定的提示由 startDaemon 的启动日志统一给出，这里不再重复
       const bye = (sig) => () => {
         log(`收到 ${sig}，退出`)

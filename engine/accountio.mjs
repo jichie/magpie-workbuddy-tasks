@@ -601,7 +601,10 @@ function accountToExportRow(a) {
 //   realm: "cn"|"intl"|null（null = 不过滤，hub 同款）
 //   includeSecrets: false → 按 hub 行为删 accessToken/refreshToken（secrets=0）
 //   uids: uid 数组 | null（narrows to specific accounts）
-//   now: 毫秒（数字或函数），exportedAt 用本地时间 "YYYY-MM-DD HH:MM:SS"
+//   now: 毫秒（数字或 () => ms），exportedAt 用本地时间 "YYYY-MM-DD HH:MM:SS"
+// 纯国内版口径的 realm 默认值由调用方（daemon 的 /api/accounts/export 路由）决定：
+// 不带 realm 只出 cn、显式 realm=intl 才出国际版（逃生口）。本引擎层保持 hub
+// 通用的 realm 过滤语义（null = 不过滤），不掺路由层政策。
 export function buildExportDocument(accounts, opts = {}) {
   const realm = opts.realm === "cn" || opts.realm === "intl" ? opts.realm : null;
   const includeSecrets = opts.includeSecrets !== false;

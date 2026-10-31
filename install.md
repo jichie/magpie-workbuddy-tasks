@@ -57,10 +57,10 @@ magpie plugin add github:<owner>/<repo>
 
 ### 验证
 
-1. 看板守护进程由插件宿主懒加载拉起，**不一定立刻就绪**（详见 README「生命周期」）。等宿主加载过本插件后，检查 `<magpie 配置目录>/workbuddy-tasks/state/daemon.json` 是否出现（内含 `pid / port / key / version / startedAt`）。
-2. `curl http://127.0.0.1:<port>/api/hello` 返回 `{"name":"workbuddy-tasks",...}`（不需要密钥）；`ready:true` 表示引擎文件齐全。
-3. 带密钥 `GET /api/state`：`accounts` 非空；若 `notice` 提示找不到配置目录，给守护进程设 `MAGPIE_CONFIG_DIR`（Docker 里通常是 `/config/magpie`）后重启 magpie。
-4. 守护进程就绪后打开看板 `http://127.0.0.1:<port>/`（首次访问按提示把 `daemon.json` 里的 `key` 粘进去，存在 sessionStorage）。批量按钮共四个：「批量接任务」（只接取，不点亮）、「批量做任务」（完整流水线：接取 → 点亮 → 领奖）、「只领奖」（补领停在「待领奖」的任务）、「每日签到」（手动补签；自动签到仍归官方插件）。也可用工具 `workbuddy_tasks_run` 启动一轮、`workbuddy_tasks_wait` 看逐步进度。
+1. 看板守护进程由插件宿主懒加载拉起，**不一定立刻就绪**（详见 README「生命周期」）。等宿主加载过本插件后，检查 `<magpie 配置目录>/workbuddy-tasks/state/daemon.json` 是否出现（内含 `pid / port / key / version / startedAt`；`key` 仅为向后兼容保留的字段，不是访问凭据）。
+2. `curl http://127.0.0.1:<port>/api/hello` 返回 `{"name":"workbuddy-tasks",...}`；`ready:true` 表示引擎文件齐全。
+3. `curl http://127.0.0.1:<port>/api/state`（**无需任何密钥**，全部 API 免密钥）：`accounts` 非空且只含国内版 workbuddy 账号（国际版不出现，顶层 `intlSkipped.count` 是它的只读计数）；若 `notice` 提示找不到配置目录，给守护进程设 `MAGPIE_CONFIG_DIR`（Docker 里通常是 `/config/magpie`）后重启 magpie。
+4. 守护进程就绪后打开看板 `http://127.0.0.1:<port>/`（无需登录/解锁，看板与 API 均无鉴权——安全靠网络边界，默认只绑 127.0.0.1）。批量按钮共四个：「批量接任务」（只接取，不点亮）、「批量做任务」（完整流水线：接取 → 点亮 → 领奖）、「只领奖」（补领停在「待领奖」的任务）、「每日签到」（手动补签；自动签到仍归官方插件）。也可用工具 `workbuddy_tasks_run` 启动一轮、`workbuddy_tasks_wait` 看逐步进度。
 
 ## 2b. Docker 里跑 magpie（实测环境：ghcr.io/yetone/magpie，配置卷 /config）
 
@@ -76,10 +76,12 @@ docker exec magpie magpie plugin add /config/magpie/plugins-local/magpie-workbud
 看板默认只听 `127.0.0.1`——那是**容器自己的**回环，宿主机和其他机器都进不去。两种办法：
 
 - 在「插件 → 已安装 → 选项」里把 `listenAddress` 设为 `"0.0.0.0"`：守护进程会绑定容器内**所有接口**（`0.0.0.0`），宿主机只能经**容器网桥 IP** 访问（用 `docker inspect magpie` 查容器 IP，如 `172.17.x.x` / `172.31.x.x`）——**没有** `-p` 发布就不出宿主机。改完后 `GET /api/state` 会带 `bindHost:"0.0.0.0"` 与 `reachableHint`（提示只到容器网桥、走 SSH 隧道）。再从你自己的电脑打一条隧道看网页：
-  `ssh -L 4390:<容器IP>:4390 <nas-user>@<nas-host>` → 浏览器开 `http://127.0.0.1:4390/`，密钥见容器内 `/config/magpie/workbuddy-tasks/state/daemon.json` 的 `key`（**不要**把 key 贴进 URL 分享给别人）。
+  `ssh -L 4390:<容器IP>:4390 <nas-user>@<nas-host>` → 浏览器开 `http://127.0.0.1:4390/`。
 - 或者重建容器加 `-p 127.0.0.1:4390:4390`（把容器 4390 映射到宿主机回环），同样只走 SSH 隧道访问。
 
-`MAGPIE_CONFIG_DIR` 在容器里通常是 `/config/magpie`；插件的 `input.directory` 会直接给出该路径，一般不用设。别把这个端口发布到公网或开放的 LAN——看板能驱动你已登录的 WorkBuddy 账号。
+`MAGPIE_CONFIG_DIR` 在容器里通常是 `/config/magpie`；插件的 `input.directory` 会直接给出该路径，一般不用设。
+
+**免密钥要特别当心边界**：看板与全部 API 无任何鉴权（用户明确要求的口径）——能连上端口的人都能用你已登录的 WorkBuddy 账号跑任务、写入 `plugin-auth.json`、下载含 token 的导出并关停守护进程。默认只绑容器内回环是安全的；一旦绑 `0.0.0.0` 或用 `-p` 把端口发布出去，同一局域网内的任何主机都拥有上述全部能力。因此：**不要**把 4390 发布到公网或开放 LAN（`-p 0.0.0.0:4390:4390` 这类映射等于把控制权交给全网）；不用时在插件管理里停用（守护进程 10 秒内退出）；跨机器访问一律走 SSH 隧道——隧道本身就是鉴权。
 
 ## 3. 本地沙箱测试（不碰你真实的 magpie）
 
@@ -105,7 +107,7 @@ node --test tests-shell/daemon.test.mjs
 
 ```bash
 node daemon.mjs --state ./tmp/state --cfg ./tmp/cfg --port 4390
-# Windows 下路径含空格要加引号；实际端口与密钥写在 ./tmp/state/daemon.json（0600）
+# Windows 下路径含空格要加引号；实际端口写在 ./tmp/state/daemon.json（0600；其 key 字段为向后兼容保留，非访问凭据）
 ```
 
 ## 4. 停用与卸载

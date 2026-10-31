@@ -244,6 +244,7 @@ a:hover { text-decoration-color: var(--ink3); }
   border-radius: 6px;
   padding: 5px 8px;
   min-width: 0;
+  min-height: 32px; /* 与 .btn / .btn-quiet 同高（6px 内边距 + 1px 边框） */
 }
 .input:hover { border-color: var(--ink3); }
 .input:focus { border-color: var(--ink); outline: none; }
@@ -295,7 +296,9 @@ input[type="checkbox"] { accent-color: var(--btn); width: 14px; height: 14px; ma
   padding: 0 20px 32px;
   color: var(--ink3);
   font-size: 12px;
+  line-height: 1.65;
 }
+.foot p + p { margin-top: 4px; }
 
 /* ---- 提示条 / 空态 ------------------------------------------------------------ */
 
@@ -324,75 +327,182 @@ input[type="checkbox"] { accent-color: var(--btn); width: 14px; height: 14px; ma
 }
 .empty strong { color: var(--ink2); font-weight: 600; }
 
-/* ---- 账号区 -------------------------------------------------------------------- */
+/* ---- 账号区：固定列轨道的表格式列表 ------------------------------------------------
+   表头与每一行共用 --acct-cols（选择 | 账号 | 状态 | 任务进度 | 参与任务 | 快照/操作）。
+   长昵称/邮箱在账号列内省略（title 给全值），后列横坐标因此恒定；状态列只有一枚
+   徽章，其余信息用 --ink3 小号文本。窄屏（≤760px）整行降级为带标签的卡片。 */
 
-.acct {
-  border: 1px solid var(--line);
-  border-radius: var(--r);
-  background: var(--card);
-  margin-bottom: 10px;
-  overflow: hidden;
+.acct-table {
+  --acct-cols: 30px minmax(0, 1.7fr) 104px minmax(150px, 1fr) 108px 148px;
+  min-width: 0;
 }
-.acct:last-child { margin-bottom: 0; }
 
 .acct-head {
-  display: flex;
+  position: sticky;
+  top: var(--topbar-h, 0px);
+  z-index: 3;
+  display: grid;
+  grid-template-columns: var(--acct-cols);
   align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  padding: 10px 14px;
+  gap: 0 16px;
+  padding: 7px 14px;
+  background: var(--card);
+  border-bottom: 1px solid var(--line);
 }
-
-.acct-title { display: flex; align-items: baseline; gap: 8px; min-width: 0; flex-wrap: wrap; }
-.acct-name { font-size: 14px; font-weight: 600; color: var(--ink); }
-.acct-uid { font-family: var(--font-mono); font-size: 12px; color: var(--ink3); }
-
-.chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  background: var(--bg2);
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  padding: 1px 9px;
-  font-size: 11.5px;
-  color: var(--ink2);
+.acct-head[hidden] { display: none; }
+.acct-head-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  color: var(--ink3);
   white-space: nowrap;
 }
-.chip-warn { color: var(--warn); }
-.chip-quiet { color: var(--ink3); }
+.acct-head-label.num { text-align: right; }
 
-.acct-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-left: auto; }
-.acct-snap { font-family: var(--font-mono); font-size: 11.5px; color: var(--ink3); white-space: nowrap; }
+.acct { border-bottom: 1px solid var(--line); }
+.acct:last-child { border-bottom: none; }
 
-/* 「参与任务」开关（可写：POST /api/account/toggle） */
-.switch {
-  display: inline-flex;
+.acct-grid {
+  display: grid;
+  grid-template-columns: var(--acct-cols);
   align-items: center;
-  gap: 6px;
+  gap: 0 16px;
+  padding: 10px 14px;
+}
+.acct-cell { min-width: 0; }
+.acct-pick { display: flex; align-items: center; }
+
+.acct-id { display: grid; gap: 1px; }
+.acct-name {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.acct-sub {
+  font-size: 11.5px;
+  color: var(--ink3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.acct-sub.warn-text { color: var(--warn); }
+
+/* 每个单元格内部纵向两行：主值 + 次要文本；数字/时间列右对齐 */
+.acct-cell-inner { display: grid; gap: 2px; justify-items: start; }
+.acct-status .badge { max-width: 100%; }
+.acct-prog .acct-cell-inner,
+.acct-side .acct-cell-inner {
+  justify-items: end;
+  text-align: right;
+}
+.acct-prog-main {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--ink);
+  white-space: nowrap;
+}
+.acct-prog-sub { font-size: 11.5px; color: var(--ink3); white-space: nowrap; }
+.acct-time {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--ink3);
+  white-space: nowrap;
+}
+.acct-side .acct-cell-inner { min-height: 43px; }
+.acct-side .mini-btn { margin-top: 2px; }
+
+/* 「参与任务」：标签与开关同一基线一行，列宽固定，不换行 */
+.acct-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   font-size: 12px;
   color: var(--ink2);
   cursor: pointer;
   user-select: none;
   white-space: nowrap;
 }
-.switch input { accent-color: var(--btn); cursor: pointer; }
-.switch:hover { color: var(--ink); }
-.switch-busy { opacity: .55; cursor: wait; }
-.switch-busy input { cursor: wait; }
+.acct-toggle:hover { color: var(--ink); }
+.acct-toggle input { accent-color: var(--btn); cursor: pointer; }
+.acct-toggle.is-disabled { opacity: .5; cursor: not-allowed; }
+.acct-toggle.is-disabled input { cursor: not-allowed; }
 
+/* 任务明细：折叠标题里的分项小格（数值在上、标签在下），换行只发生在格与格之间 */
 .acct-tasks { border-top: 1px solid var(--line); }
 .acct-tasks > summary {
-  padding: 8px 14px;
+  display: flex;
+  align-items: center;
+  gap: 6px 14px;
+  flex-wrap: wrap;
+  min-height: 45px;
+  padding: 7px 14px;
   font-size: 12.5px;
   color: var(--ink2);
   cursor: pointer;
-  list-style-position: inside;
+  list-style: none;
   user-select: none;
 }
+.acct-tasks > summary::-webkit-details-marker { display: none; }
+.acct-tasks > summary::marker { content: ""; }
 .acct-tasks > summary:hover { color: var(--ink); background: var(--bg2); }
 .acct-tasks[open] > summary { border-bottom: 1px solid var(--line); }
+.acct-tasks-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  color: var(--ink3);
+  white-space: nowrap;
+}
+/* 自绘折叠箭头（display:flex 的 summary 会隐藏原生 marker；不引入新配色） */
+.acct-tasks-label::before {
+  content: "";
+  display: inline-block;
+  width: 0;
+  height: 0;
+  margin-right: 6px;
+  border-left: 4px solid var(--ink3);
+  border-top: 3px solid transparent;
+  border-bottom: 3px solid transparent;
+  vertical-align: 1px;
+  transition: transform .15s ease;
+}
+.acct-tasks[open] > summary .acct-tasks-label::before { transform: rotate(90deg); }
+.acct-tasks-label.warn-text { color: var(--warn); }
+.acct-tasks-label.warn-text::before { border-left-color: var(--warn); }
+.acct-metrics {
+  flex: 1 1 auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(64px, 1fr));
+  gap: 2px 16px;
+  min-width: 0;
+}
+.metric {
+  display: flex;
+  flex-direction: column-reverse;
+  align-items: flex-start;
+  line-height: 1.35;
+}
+.metric-v {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--ink);
+}
+.metric-l { font-size: 10.5px; color: var(--ink3); white-space: nowrap; }
+.acct-metrics-empty { font-size: 11.5px; color: var(--ink3); }
 .acct-tasks .tbl-wrap { padding: 4px 8px 10px; }
+
+/* 国际版账号诊断：一行次要文字，绝不列出具体账号 */
+.acct-intl {
+  margin-top: 8px;
+  font-size: 11.5px;
+  color: var(--ink3);
+  line-height: 1.6;
+}
+.acct-intl[hidden] { display: none; }
 
 /* ---- 表格（任务 / 步骤 / 历史）--------------------------------------------------- */
 
@@ -793,7 +903,13 @@ dialog::backdrop { background: rgba(0, 0, 0, .35); }
   margin: 0;
 }
 
-/* ---- 响应式：900px / 600px --------------------------------------------------------------- */
+/* ---- 响应式：1000px / 900px / 760px / 600px ------------------------------------------------ */
+
+@media (max-width: 1000px) {
+  /* 收紧固定轨道，给账号列留出足够宽度（长邮箱仍靠省略号收口） */
+  .acct-table { --acct-cols: 24px minmax(0, 1.7fr) 90px minmax(130px, 1fr) 100px 132px; }
+  .acct-head, .acct-grid { gap: 0 12px; padding-left: 12px; padding-right: 12px; }
+}
 
 @media (max-width: 900px) {
   .topbar { padding: 10px 14px; gap: 10px; }
@@ -803,13 +919,84 @@ dialog::backdrop { background: rgba(0, 0, 0, .35); }
   .main { padding: 14px 12px 48px; }
   .card { padding: 14px; }
   .batch-actions { margin-left: 0; }
-  .hour-row { grid-template-columns: 80px minmax(100px, 1fr); }
-  .hour-row .btn { grid-column: 2; justify-self: start; }
+  /* 小时窗口：标签 + 输入框一行，提示整行放到下方，避免被 80px 窄列折断 */
+  .hour-row { grid-template-columns: 80px minmax(0, 1fr); }
+  .hour-row .input { width: 100%; }
+  .hour-row .hour-hint { grid-column: 1 / -1; }
+}
+
+/* 账号行降级为卡片：左标签 / 右数值，仍保持两列对齐 */
+@media (max-width: 760px) {
+  /* 小屏顶栏改为随页面滚动（表头在此宽度已降级为卡片，无需吸顶补偿） */
+  .topbar { position: static; }
+  .acct-head { display: none; }
+
+  .acct-grid {
+    grid-template-columns: 26px minmax(0, 1fr);
+    grid-template-areas:
+      "pick id"
+      "pick status"
+      ".    prog"
+      ".    toggle"
+      ".    side";
+    align-items: start;
+    gap: 7px 10px;
+    padding: 12px 12px 10px;
+  }
+  .acct-pick { grid-area: pick; justify-content: flex-start; padding-top: 2px; }
+  .acct-id { grid-area: id; }
+  .acct-status { grid-area: status; }
+  .acct-prog { grid-area: prog; }
+  .acct-toggle-cell { grid-area: toggle; border-top: 1px dashed var(--line); padding-top: 6px; }
+  .acct-side { grid-area: side; border-top: 1px dashed var(--line); padding-top: 6px; }
+
+  .acct-cell[data-label] {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .acct-cell[data-label]::before {
+    content: attr(data-label);
+    flex: none;
+    font-size: 11px;
+    letter-spacing: .06em;
+    color: var(--ink3);
+  }
+  .acct-cell[data-label] .acct-cell-inner {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    min-width: 0;
+    text-align: right;
+  }
+  .acct-prog .acct-cell-inner { flex-wrap: wrap; }
+  .acct-side .mini-btn { margin-top: 0; }
+  .acct-toggle-cell .acct-toggle { width: 100%; }
+
+  /* 任务明细：标签独占一行，分项小格两列、格内左标签右数值 */
+  .acct-tasks > summary { align-items: flex-start; }
+  .acct-tasks-label { flex-basis: 100%; }
+  .acct-metrics {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 4px 16px;
+    width: 100%;
+  }
+  .metric {
+    flex-direction: row;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+  }
 }
 
 @media (max-width: 600px) {
   body { font-size: 13px; }
   .stats { gap: 10px; }
+  /* 顶栏地址项只留地址本身；完整无鉴权说明在页脚，避免小屏顶栏过高 */
+  .addr-note { display: none; }
 
   /* 表格降级为卡片 */
   .tbl thead { display: none; }
@@ -846,7 +1033,11 @@ dialog::backdrop { background: rgba(0, 0, 0, .35); }
   .detail-cell, .prog-cell { max-width: none; }
   .prog-cell { flex: 1 1 auto; }
 
-  .acct-meta { margin-left: 0; }
+  /* 任务表降级后与账号卡片对齐：去掉内边距，避免双线 */
+  .acct-tasks .tbl-wrap { padding: 4px 10px 10px; }
+  .acct-tasks .tbl tr { border-color: transparent; border-bottom: 1px solid var(--line); border-radius: 0; margin-bottom: 0; }
+  .acct-tasks .tbl tr:last-child { border-bottom: none; }
+
   .toasts { left: 12px; right: 12px; justify-items: stretch; }
   .toast { max-width: none; }
 
