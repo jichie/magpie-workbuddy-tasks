@@ -70,9 +70,9 @@ import { beijingDateKey, beijingHour } from "./engine/constants.mjs"
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const VERSION = (() => {
   try {
-    return String(JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf8")).version || "0.1.0")
+    return String(JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf8")).version || "0.2.0")
   } catch {
-    return "0.1.0"
+    return "0.2.0"
   }
 })()
 

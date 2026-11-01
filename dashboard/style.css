@@ -34,8 +34,9 @@
   --shadow-pop: 0 12px 32px -12px rgba(16, 24, 40, .28), 0 2px 6px rgba(16, 24, 40, .06);
 
   --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI",
-    "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Yu Gothic UI", "Yu Gothic", Meiryo,
-    "Noto Sans CJK JP", system-ui, sans-serif;
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei",
+    "Noto Sans SC", "Noto Sans CJK SC", "Source Han Sans SC", "WenQuanYi Micro Hei",
+    system-ui, sans-serif;
   --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
 
   --radius: 14px;
