@@ -119,6 +119,7 @@ export class JobRunner {
     if (this.current()) {
       throw Object.assign(new Error("another job is already running"), { status: 409, code: "busy" });
     }
+    const norm = normalizeSpec(spec);
     const job = {
       id: `job-${++this._seq}-${uuidHex().slice(0, 8)}`,
       state: "queued",
@@ -127,7 +128,11 @@ export class JobRunner {
       totals: { credit: 0, energy: 0, tasksLit: 0, tasksClaimed: 0 },
       steps: [],
       log: [],
-      spec: normalizeSpec(spec),
+      spec: norm,
+      // 顶层 trigger = 归一后的 spec.trigger（"schedule" | "manual"）：/api/jobs、
+      // 看板 job 卡不必钻 spec 就能读；daemon 历史的口径仍是 job.spec.trigger
+      //（这里只是同一份值的顶层冗余，两处永远一致）。
+      trigger: norm.trigger,
       stopped: false,
       error: null,
     };

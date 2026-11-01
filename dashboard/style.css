@@ -733,7 +733,7 @@ input[type="radio"] { accent-color: var(--accent); width: 14px; height: 14px; ma
 .acct-note { font-size: 11px; color: var(--ink-3); white-space: nowrap; }
 .acct-note.warn-text { color: var(--warn); }
 
-.acct-progress { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; min-width: 0; }
+.acct-progress { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; min-width: 0; padding-right: 24px; }
 .acct-prog-main {
   font-size: 12.5px;
   font-weight: 600;
@@ -746,7 +746,9 @@ input[type="radio"] { accent-color: var(--accent); width: 14px; height: 14px; ma
 .acct-bar {
   display: block;
   width: 100%;
-  max-width: 190px;
+  /* 填满任务列：写死 190px 时弹性任务列会在「任务 → 积分」之间
+     留下约 90px 空白，与其余 18px 的列间距明显不均。 */
+  max-width: none;
   height: 4px;
   overflow: visible;
   background: none;
@@ -1651,6 +1653,7 @@ dialog::backdrop { background: rgba(8, 10, 14, .5); }
     grid-template-columns: minmax(0, 1fr) auto;
     align-items: center;
     gap: 4px 10px;
+    padding-right: 0;
   }
   .acct-progress .acct-prog-main { grid-column: 1; }
   .acct-progress .acct-prog-sub { grid-column: 2; text-align: right; }

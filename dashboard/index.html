@@ -229,15 +229,15 @@
             <div class="hour-row">
               <span class="field-label">猫猫旅行</span>
               <input class="input input-mono" id="hoursTravel" inputmode="numeric" placeholder="9,21" aria-label="猫猫旅行小时窗口">
-              <span class="hint">逗号分隔的本地小时（0–23）；默认 09:00 与 21:00</span>
+              <span class="hint">北京时间（UTC+8）小时（0–23）；默认 09:00 与 21:00</span>
             </div>
             <div class="hour-row">
               <span class="field-label">夜猫子</span>
               <input class="input input-mono" id="hoursNight" inputmode="numeric" placeholder="1" aria-label="夜猫子小时窗口">
-              <span class="hint">默认 01:00；上游只在 23:00–08:00 计数</span>
+              <span class="hint">默认北京时间 01:00；上游只在 23:00–08:00 计数</span>
             </div>
           </div>
-          <p class="hint hours-note">默认旅行 09:00 与 21:00；夜猫子 01:00（上游只在 23:00–08:00 计数）</p>
+          <p class="hint hours-note">按北京时间（UTC+8）：默认旅行 09:00 与 21:00；夜猫子 01:00（上游只在 23:00–08:00 计数）</p>
           <div class="form-actions">
             <button type="button" class="ghost-btn" id="saveHoursBtn">保存窗口</button>
           </div>

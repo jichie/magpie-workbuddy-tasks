@@ -149,9 +149,37 @@ export const TEAM_ID_POOL = [
   ["DesignEngineTeam", "设计引擎团队"], ["HrOperationsTeam", "人力运营团队"],
 ];
 
+// ---- 北京时间（UTC+8）口径 ---------------------------------------------------
+// 生产 magpie 容器时区是 UTC（date 显示 UTC、TZ 为空）：new Date().getHours()
+// 读的是宿主时区，在 UTC 容器里会把北京 09:00 读成 1 点，从而误触夜猫子窗口、
+// 错过旅行窗口。因此排程小时、夜猫子 23:00–08:00 窗口、同日去重的日界一律按
+// **北京时间（UTC+8）** 解释，与宿主/容器时区无关 —— 与 engine/daily 的
+// beijingDayKey、engine/credits 的「naive 时间按 +08:00 解析」同一口径。
+// 实现：UTC 毫秒 + 8h 后取 **UTC** 分量，绝不碰 getHours()/getDate() 这类
+// 宿主本地分量。
+
+// beijingHour(nowMs) -> 北京小时（0–23）。UTC 01:00 = 北京 09:00；
+// UTC 17:00 = 北京次日 01:00。nowMs 可注入（测试/假时钟）。
+export function beijingHour(nowMs) {
+  return new Date((nowMs ?? Date.now()) + 8 * 3600 * 1000).getUTCHours();
+}
+
+// beijingDateKey(nowMs) -> 北京日期 "YYYY-MM-DD"（UTC+8）。UTC 16:00 整翻到
+// 北京次日（与 engine/daily.beijingDayKey 同一日界）。排程「同日同窗口只触发
+// 一次」的去重键用它，绝不使用 toDateString()（宿主时区）。
+export function beijingDateKey(nowMs) {
+  const d = new Date((nowMs ?? Date.now()) + 8 * 3600 * 1000);
+  return (
+    `${d.getUTCFullYear()}-` +
+    `${String(d.getUTCMonth() + 1).padStart(2, "0")}-` +
+    `${String(d.getUTCDate()).padStart(2, "0")}`
+  );
+}
+
 // ---- 夜间窗口 ---------------------------------------------------------------
-// 夜猫子任务只在 23:00-08:00 上报才计数（本地时区）。nowMs 可注入。
+// 夜猫子任务只在 23:00-08:00 上报才计数，且每天 1 次、累计 3 天。小时按北京
+// 时间（UTC+8）取 —— UTC 容器里 getHours() 会把北京 23:30 读成 15 点而漏判。
 export function inNightWindow(nowMs) {
-  const h = new Date(nowMs).getHours();
+  const h = beijingHour(nowMs);
   return h >= 23 || h < 8;
 }

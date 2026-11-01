@@ -380,6 +380,9 @@ test("主回路：job 完成，步骤/结算/日志/上游调用顺序全部对�
   const job = await waitJobDone(job1Id);
   assert.equal(job.state, "done");
   assert.equal(job.error, null);
+  // 顶层 trigger = 归一后的 spec.trigger（真实引擎口径；手动 /api/run → manual）
+  assert.equal(job.trigger, "manual", "/api/jobs 的 job 顶层 trigger");
+  assert.equal(job.spec.trigger, "manual");
 
   // 步骤：2 账号 × 3 腿，顺序固定 growth→travel→night；全部 ok
   assert.deepEqual(
@@ -541,6 +544,9 @@ test("/api/history 记录该轮；job 结束后自动快照回填 /api/state", a
   assert.equal(rows.filter((r) => r.leg === "growth" && r.state === "ok").length, 2);
   assert.ok(rows.every((r) => typeof r.at === "string" && !Number.isNaN(Date.parse(r.at))), "history.at 应为 ISO 串（stats 口径）");
   assert.ok(rows.some((r) => r.uid === UID_EXP && r.detail.includes("+100")));
+  // trigger 口径（真实引擎端到端）：手动 /api/run 的行 = manual；
+  // 排程行的 schedule 拼写由 tests-shell/history-trigger.test.mjs 钉死
+  assert.ok(rows.every((r) => r.trigger === "manual"), `手动运行的历史行 trigger=manual，实际：${JSON.stringify([...new Set(rows.map((r) => r.trigger))])}`);
 
   const st = (await api.json(api.get("/api/state"))).data;
   assert.equal(st.stats.creditsToday, 920);

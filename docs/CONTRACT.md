@@ -182,7 +182,7 @@ expertNameFromTitle(title) -> string           // 任务标题「」内的专家
 
 // travel.mjs
 runCatTravel(acct, opts) -> TravelResult
-runNightTask(acct, opts) -> NightResult       // black_cat，23:00–08:00
+runNightTask(acct, opts) -> NightResult       // black_cat，23:00–08:00（北京时间）
 
 // runner.mjs
 class JobRunner {
@@ -194,6 +194,8 @@ class JobRunner {
                             //       归一化在两处设防：daemon.startJob（API 边界，§3）
                             //       与 runner.normalizeSpec（直接构造 runner 的调用方）
   get(id) -> Job            // Job: {id, state:'queued|running|done|error', startedAt, endedAt,
+                            //       trigger:'manual'|'schedule',   // = spec.trigger 的顶层冗余
+                            //       （start() 归一后写两处，永远一致；消费方直接读顶层即可）
                             //       totals:{credit,energy,tasksLit,tasksClaimed}, steps:Step[], log:string[]}
   current() -> Job|null     // 同一时刻只允许 1 个 job（全局闸门）
   holds() -> [{uid, releasedAt}] // 风控冷却（403/11140）中的账号；releasedAt = 解除时刻 epoch ms
@@ -400,6 +402,12 @@ GET  /api/credits?uid=<uid>&refresh=0|1
                                     //     （不清掉）并随响应一并带回（credits 字段，若有）；
                                     //   · 拉取成功后广播 SSE {kind:"credits", uid}（可选，前端不依赖）。
 GET  /api/history?limit=200     -> 每次尝试一行（对齐 hub 的 /activity/history）
+                                    // 行的 trigger 口径：来自 job.spec.trigger（"schedule" |
+                                    // "manual"），看板「触发」列据此显示 排程/手动 —— 触发方式
+                                    // 住在 spec 上（旧版误读 job 顶层 trigger，真实引擎没有该
+                                    // 字段，曾把排程行全写成 manual）；兼容旧式外壳挂在 job 顶层
+                                    // 的 trigger，非法值/缺失一律按 "manual"，绝不透出第三种拼写。
+                                    // 已写入的旧行不迁移（无法可靠回溯）。
 GET  /api/events                -> SSE：{kind:'job'|'step'|'log'|'scheduler', ...}
 其余 GET /                      -> dashboard/index.html（静态，同源，无构建）
 ```
@@ -528,6 +536,15 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
   `{sent:false,error}` 不抛，runner 记一行日志（「每日活跃：已上报 / 今日已报过 /
   上报失败：…」）继续跑腿，绝不 fail job。上游调用经 `reportEvents` → 全局节流器，
   铁律 4 照常生效。`/api/state` 不新增字段。
+- **时间口径（排程/夜猫窗口，与容器时区无关）**：生产 magpie 容器时区是 **UTC**
+  （`date` 显示 UTC、`TZ` 为空），`new Date().getHours()`/`toDateString()` 读的是宿主
+  时区，会把北京 09:00 读成 1 点。因此**小时窗口（settings.hours）、夜猫子
+  23:00–08:00 窗口、排程「同日同窗口只触发一次」的去重日界一律按北京时间
+  （UTC+8）解释，与容器/宿主时区无关**——实现为 `engine/constants.beijingHour` /
+  `beijingDateKey`（UTC 毫秒 +8h 后取 UTC 分量），与 `engine/daily.beijingDayKey`、
+  credits 的「naive 时间按 +08:00 解析」同一口径。`settings.hours` 的数字含义不变，
+  仍是北京小时；`lastFired.json` 旧键（宿主时区口径）不做迁移，键形不同互不命中，
+  最坏只多触发一个窗口，绝不清空用户文件。
 - `first_buddy` 是 `task_type==='auto'`：不许进接取批次，必须先点亮+领奖，否则单任务接取报 `prerequisite not met`。
 - 领奖竞态：上报后等 1.5 s，轮询进度最多 6 次（在涨就再等 2.5 s），没到位就把领奖顺延到下一轮，绝不硬闯。
 - **任务级勾选（`runGrowthTasks` 的 `opts.codes`，§2/§3/§6）**：非空数组 = 只对选中的任务
@@ -570,8 +587,15 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
   原封不动、缺失 code 警告一次；runner 把 `spec.taskCodes[uid]` 原样传到 growth 腿、travel/night
   不受影响、脏输入归一成 null；daemon 把 `/api/run` 的数组/按 uid 对象两种形状归一到
   `taskCodes`（去重/剔非字符串/上限 500/非法忽略）；
-- schedule：窗口判定（09:00/21:00 猫猫旅行，01:00 夜猫，夜猫只认 23:00–08:00；**growth 不在
-  任何排程窗口**——排程只触发 travel/night，growth 只能手动跑）；daemon 读旧 settings.json 时
+- schedule：窗口判定（09:00/21:00 猫猫旅行，01:00 夜猫，夜猫只认 23:00–08:00；
+  **一律按北京时间（UTC+8）解释，与容器时区无关**——测试必须用显式 UTC 时间戳证明
+  `beijingHour(Date.UTC(...,1,0))===9`、UTC 01:00 命中 travel 而绝不能是 night、
+  UTC 17:00（北京次日 01:00）命中 night、`beijingDateKey` 在 UTC 16:00 翻北京日、
+  `dueWindows` 跨北京日边界不重不漏；**growth 不在任何排程窗口**——排程只触发
+  travel/night，growth 只能手动跑）；daemon 回归用假时钟驱动 `checkScheduler`：
+  `hours={travel:[9,21],night:[1]}` 时北京 09:00（UTC 01:00）启动 `legs:["travel"]`、
+  北京 01:00（UTC 17:00）启动 night、同一北京日同窗口只触发一次、跨北京日
+  （UTC 16:00 边界）重新允许；daemon 读旧 settings.json 时
   丢弃 `hours.growth`、`/api/state` 的 hours/nextRuns 无 growth、tick 不触发 growth job、
   手动 `legs:["growth"]` 照常启动；
 - 去重：`expert_5` 五个事件用 5 个不同 id；

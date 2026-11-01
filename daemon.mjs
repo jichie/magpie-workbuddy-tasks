@@ -63,6 +63,9 @@ import {
 } from "./engine/accountio.mjs"
 // 导入/导出路由直接读凭据文件（读-计划-复查-写 的竞态守卫需要原文与哈希）
 import { readAuthDocument } from "./engine/store.mjs"
+// 排程时间口径（CONTRACT §7/§8）：窗口小时与同日去重日界一律北京时间（UTC+8），
+// 与容器时区无关 —— 生产容器是 UTC，getHours() 会把北京 09:00 读成 1 点。
+import { beijingDateKey, beijingHour } from "./engine/constants.mjs"
 
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const VERSION = (() => {
@@ -93,7 +96,7 @@ const DEFAULT_SETTINGS = {
   legs: ["growth", "travel"], // 手动运行未指定 legs 时的默认腿（growth 仍可手动勾选）
   gapMs: 1500, // 账号之间的基础间隔（手动）；排程时 runner 另加 2–5s 抖动
   jitterMs: [2000, 5000], // 排程运行的账号间抖动（交给 runner，见契约 §0.4）
-  hours: { travel: [9, 21], night: [1] }, // 本地小时窗口（只有 travel|night，growth 无窗口）
+  hours: { travel: [9, 21], night: [1] }, // 北京小时窗口 UTC+8（只有 travel|night，growth 无窗口；与容器时区无关）
   host: { chat: "", bill: "", web: "" }, // 留空 = 用 engine/upstream 的默认
 }
 
@@ -811,6 +814,16 @@ export async function startDaemon(opts = {}) {
 
   // ---- 历史（每次尝试一行） ----------------------------------------------
 
+  // 历史 trigger 口径（看板「触发」列）：触发方式住在 job.spec.trigger
+  //（runner.normalizeSpec 已归一为 "schedule" | "manual"）——真实引擎的 job 顶层
+  // 没有 trigger 字段，以前直接读 job.trigger 会把排程行永远写成 manual。兼容
+  // 旧式外壳/假引擎直接挂在顶层的 job.trigger；最终只输出 "schedule" | "manual"
+  // 两种拼写（其余一律按 manual，绝不透出第三种值）。
+  function historyTrigger(job) {
+    const t = job?.spec?.trigger ?? job?.trigger
+    return t === "schedule" ? "schedule" : "manual"
+  }
+
   function appendHistory(job) {
     const steps = Array.isArray(job?.steps) ? job.steps : []
     for (const s of steps) {
@@ -825,7 +838,7 @@ export async function startDaemon(opts = {}) {
         credit: s.credit ?? 0,
         energy: s.energy ?? 0,
         jobId: job.id,
-        trigger: job.trigger ?? "manual",
+        trigger: historyTrigger(job),
       })
     }
     if (history.length > HISTORY_CAP) history = history.slice(-HISTORY_CAP)
@@ -985,14 +998,20 @@ export async function startDaemon(opts = {}) {
       if (!settings.scheduler) return null
       const cur = runner?.current?.() ?? null
       if (cur) return null
-      const d = new Date(nowMs)
-      const h = d.getHours()
+      // 时区口径（CONTRACT §7/§8）：小时窗口按**北京时间（UTC+8）**解释，与容器
+      // 时区无关。生产 magpie 容器是 UTC（date 显示 UTC、TZ 为空），以前用
+      // new Date(nowMs).getHours() 会把北京 09:00 读成 1 点 —— 命中 night 而不是
+      // travel。settings.hours 的数字含义不变，就是北京小时。
+      const h = beijingHour(nowMs)
       const legs = Object.entries(settings.hours)
         .filter(([, hs]) => (Array.isArray(hs) ? hs : []).includes(h))
         .map(([leg]) => leg)
         .filter((leg) => LEGS.includes(leg))
       if (!legs.length) return null
-      const fireKey = `${legs.join("+")}@${h}@${dateKey(d)}`
+      // 同日去重键的日期段 = 北京日期（UTC 16:00 整翻北京日）。旧 lastFired.json
+      // 里的键是宿主时区口径（UTC 容器 = UTC 日期），不做迁移：键形不同互不命中，
+      // 最坏只多触发一个窗口，绝不为此清空用户的 fired 文件。
+      const fireKey = `${legs.join("+")}@${h}@${beijingDateKey(nowMs)}`
       if (fired[fireKey]) return null
       const eligible = eligibleNow()
       if (!eligible.length) {

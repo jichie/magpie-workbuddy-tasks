@@ -629,8 +629,10 @@ describe("生命周期", () => {
       assert.equal((await st.json()).scheduler, true)
 
       const d = new Date()
+      // 排程小时按北京时间（UTC+8）解释（CONTRACT §7/§8）：这里用与引擎相同的
+      // 换算取「当前北京小时」，与 checkScheduler 收到的同一时刻对齐，不依赖宿主时区
+      const hour = new Date(d.getTime() + 8 * 3600 * 1000).getUTCHours()
       const job = h.ticks.checkScheduler(d.getTime())
-      const hour = d.getHours()
       if ([9, 21, 1].includes(hour)) {
         assert.ok(job, `小时 ${hour} 在默认窗口内应触发`)
         assert.ok(job.id)

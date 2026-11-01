@@ -163,12 +163,14 @@ describe("C1：scheduler 安全默认", () => {
     const stateDir = makeSandbox("wb-safe-").dir
     const h = await boot(stateDir)
     try {
-      // 把 travel 窗口钉在当前小时，令「窗口命中」条件必然成立
-      const nowHour = new Date().getHours()
+      // 把 travel 窗口钉在当前**北京小时**（UTC+8：引擎把窗口小时按北京时间解释，
+      // CONTRACT §7/§8），用同一时刻 t0 喂 tick，保证「窗口命中」必然成立且不依赖宿主时区
+      const t0 = Date.now()
+      const nowHour = new Date(t0 + 8 * 3600 * 1000).getUTCHours()
       const st = await post(h.port, "/api/settings", { scheduler: false, hours: { travel: [nowHour] } })
       assert.equal(st.status, 200)
 
-      const job = h.ticks.checkScheduler(Date.now())
+      const job = h.ticks.checkScheduler(t0)
       assert.equal(job, null, "scheduler=false 时 tick 必须返回 null")
       assert.equal(h.runner.current(), null, "绝不启动 job")
       assert.equal(existsSync(join(stateDir, "lastFired.json")), false, "绝不写触发记录")
@@ -182,17 +184,18 @@ describe("C1：scheduler 安全默认", () => {
     const stateDir = makeSandbox("wb-safe-").dir
     const h = await boot(stateDir)
     try {
-      const nowHour = new Date().getHours()
+      // 窗口钉在当前**北京小时**（UTC+8），tick 与取小时用同一时刻 t0，不依赖宿主时区
+      const t0 = Date.now()
+      const nowHour = new Date(t0 + 8 * 3600 * 1000).getUTCHours()
       await post(h.port, "/api/settings", { scheduler: true, hours: { travel: [nowHour] } })
 
-      const d = new Date()
-      const job = h.ticks.checkScheduler(d.getTime())
+      const job = h.ticks.checkScheduler(t0)
       assert.ok(job, "开启 + 窗口命中要触发")
       assert.equal(job.trigger, "schedule")
       assert.ok(job.id)
 
       await waitQuiet(h)
-      assert.equal(h.ticks.checkScheduler(d.getTime() + 1000), null, "同一天同窗口不重复")
+      assert.equal(h.ticks.checkScheduler(t0 + 1000), null, "同一天同窗口不重复")
 
       const fired = JSON.parse(readFileSync(join(stateDir, "lastFired.json"), "utf8"))
       assert.ok(fired.lastCycle, "触发记录落盘（含 lastCycle）")

@@ -116,8 +116,11 @@ describe("旧 settings.json 含 hours.growth 的升级读径", () => {
   test("/api/state 的 settings.hours 与 scheduler.nextRuns 不含 growth；tick 不触发 growth job", async () => {
     const stateDir = makeSandbox("wb-sched-").dir
     keep.push(stateDir)
-    const nowHour = new Date().getHours()
-    // 旧版写盘的形状：growth 窗口钉在当前小时——升级后 tick 绝不能因为它点火
+    // 老版写盘的形状：growth 窗口钉在当前**北京小时**（引擎把窗口小时按北京时间
+    // UTC+8 解释，CONTRACT §7/§8）——升级后 tick 绝不能因为它点火。取「对照触发」
+    // 那一脚的时间戳 t0+1000 来钉窗口，保证跨整点也必然命中。
+    const t0 = Date.now()
+    const nowHour = new Date(t0 + 1000 + 8 * 3600 * 1000).getUTCHours()
     writeFileSync(
       join(stateDir, "settings.json"),
       JSON.stringify({ scheduler: true, hours: { growth: [nowHour], travel: [], night: [] } }),
@@ -135,13 +138,13 @@ describe("旧 settings.json 含 hours.growth 的升级读径", () => {
       )
 
       // tick：当前小时只有（已被丢弃的）growth 窗口 → 不触发任何 job
-      const job = h.ticks.checkScheduler(Date.now())
+      const job = h.ticks.checkScheduler(t0)
       assert.equal(job, null, "growth 窗口被丢弃后，tick 不该触发 growth job")
 
-      // 对照：把 travel 窗口钉在当前小时 → tick 正常触发，且腿是 travel
+      // 对照：把 travel 窗口钉在同一北京小时 → tick 正常触发，且腿是 travel
       const st = await post(h.port, "/api/settings", { hours: { travel: [nowHour] } })
       assert.equal(st.status, 200)
-      const job2 = h.ticks.checkScheduler(Date.now() + 1000)
+      const job2 = h.ticks.checkScheduler(t0 + 1000)
       assert.ok(job2, "travel 窗口命中 → 触发")
       assert.deepEqual(job2.legs, ["travel"])
       await tick()

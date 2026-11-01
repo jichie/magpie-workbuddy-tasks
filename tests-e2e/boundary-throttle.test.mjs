@@ -215,10 +215,12 @@ test("跨边界 A：job 收尾的 finalizeJob→refreshSnapshots 与手动 claim
 // ---- B. 排程 tick 与手动 claim 并发 ----------------------------------------------
 
 test("跨边界 B：排程 tick（checkScheduler→startJob）与手动 claim 并发，全程间隔 ≥1000ms", async () => {
-  // 排程窗口设在当前真实小时的 travel 腿（checkScheduler 用真实墙钟取小时；
-  // growth 已不在排程窗口里——排程只触发 travel/night，growth 只能手动跑）
-  const hour = new Date().getHours();
-  const set = await api.json(api.post("/api/settings", { scheduler: true, hours: { travel: [hour], night: [] } }));
+  // 排程窗口设在当前**北京小时**（UTC+8）的 travel 腿 —— 引擎把窗口小时按北京
+  // 时间解释（CONTRACT §7/§8，与容器时区无关），所以这里也按北京小时取值；
+  // 再带上下一小时，钉死「设置 → 点火」之间跨北京整点也不会偶发不触发。
+  // growth 已不在排程窗口里——排程只触发 travel/night，growth 只能手动跑。
+  const hour = new Date(Date.now() + 8 * 3600 * 1000).getUTCHours();
+  const set = await api.json(api.post("/api/settings", { scheduler: true, hours: { travel: [hour, (hour + 1) % 24], night: [] } }));
   assert.equal(set.status, 200);
   assert.equal(set.data.scheduler, true);
 

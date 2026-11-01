@@ -1,186 +1,284 @@
 # magpie-workbuddy-tasks
 
-把 workbuddy2api-hub 的「国内版成长/积分任务批量自动化」移植成的 magpie 插件：复用你在 magpie 里**已经登录**的 WorkBuddy（国内版，copilot.tencent.com）账号，不填任何密钥，提供本地看板、每日小时窗口排程，以及给任意智能体用的任务工具。
+把 WorkBuddy **国内版**的成长任务、猫猫旅行、夜猫子、每日活跃与积分查询做成 magpie 插件：复用你在 magpie 里已经登录的 WorkBuddy 账号，提供本地看板、北京时间小时排程，以及给任意智能体用的 MCP 工具。**不需要、也不接受任何密钥。**
+
+- 仓库：<https://github.com/jichie/magpie-workbuddy-tasks>
+- 安装：`magpie plugin add github:jichie/magpie-workbuddy-tasks`
+- 只服务国内版 `workbuddy` 账号；国际版 `workbuddy-ai` 不会出现在插件里。
+
+## 快速开始
+
+1. 在已登录 WorkBuddy 国内版的 magpie 上执行 `magpie plugin add github:jichie/magpie-workbuddy-tasks`，并在插件管理里启用。
+2. 打开「WorkBuddy 任务」入口卡，进入看板；首次加载会读取账号与任务快照。
+3. 排程默认是关的。想手动跑：勾选账号和任务腿，点「批量做任务」；只想接取/领奖就用对应按钮。
+4. 任务明细里可勾选任务，批量操作只做选中的；积分列会显示余额，点「明细」看套餐权益包。
 
 ## 它做什么
 
-一轮批量 job（同一时刻只允许一个，第二个请求得 409 `busy`）按账号依次执行，可自由组合三条「腿」：
+一轮批量 job 按账号依次执行（同一时刻只允许一个 job，第二个请求得到 409 `busy`），可自由组合下面的能力：
 
-| 能力 | 对应入口 | 实际行为 |
+| 能力 | 入口 | 实际行为 |
 | --- | --- | --- |
-| **批量接任务** | 看板「立即运行」/ `POST /api/run` / 工具 `workbuddy_tasks_run` | 流水线第一步：把所有未接取的可自动化任务批量接取（上游 20 个一批），复查后仍有未接的自动补接一次 |
-| **批量做任务（接取→点亮→领奖）** | 同上，默认腿 `growth` | 逐任务上报事件点亮、轮询进度（上报后等 1.5s、最多 6 次，在涨再等 2.5s），进度到位才领奖；没到位就把领奖顺延下一轮，绝不硬闯。「浏览资料库」走 web 端元素点击事件点亮（打 web 域 `/v2/report`），其余任务走对话域事件 |
-| **每日活跃（连登）** | 自动（每轮 job 的每个账号开跑前，无需配置） | 每个账号每个**北京日**向计费域上报一条 chat 事件，点亮成长中心的连登。幂等：同一北京日不重发（账本 `state/daily-activity.json`，重启后仍有效）；上报失败只记一行日志，绝不阻断本轮任务 |
-| **只领奖** | 看板单账号「领取」/ `POST /api/task/claim` / 工具 `workbuddy_tasks_claim`；或关掉设置的「自动领奖」（`claim:false`） | 单任务领取；批量运行时也只点亮不领奖 |
-| **猫猫旅行** | 腿 `travel` | 闭环：`arrived` 领奖 → `idle` 取目的地派出（没有 Buddy 就先完成并领取 `first_buddy` 再派）→ `traveling` 如实报告 |
-| **夜猫子** | 腿 `night` | `black_cat` 任务只在本地 23:00–08:00 上报（白天诚实跳过），每天计 1 次、累计 3 天后领奖 |
-| **小时排程** | 看板设置 / `POST /api/settings` | **默认停用**——装好插件不会自动往你的账号上打上游请求，必须在看板里点一次「启用小时窗口排程」才生效。启用后按本地 09:00 与 21:00 跑「猫猫旅行」、01:00 跑「夜猫子」（窗口可改）；守护进程每 30s 检查窗口，同一天同一窗口只触发一次。**成长任务不在排程里**：到点自动跑的都是无任务码的腿，`growth` 只能手动/工具发起 |
-| **任务级勾选** | `POST /api/run` 的 `codes` / 工具 `workbuddy_tasks_run` 的 `codes` | growth 腿只处理选中的任务：只对选中的 code 接取、点亮、领奖，未选中的任务上游状态原封不动；选中的 code 不在任务表里就警告一次并跳过，绝不硬闯。不传 = 全部任务（默认行为不变） |
-| **积分余额与套餐明细** | 看板积分卡片 / `GET /api/credits?uid=<uid>`（`refresh=1` 强制刷新） | 读取国内版账号的积分余额与套餐权益包明细：`剩余 / 总额`、使用百分比、每包的名称/发放原因/创建与到期时间/剩余量，以及最早到期提示。**只读**，不发任何消耗积分的请求。缓存 10 分钟（`state/credits.json`，重启仍在）；批量任务运行中需要拉取时返回 409 `busy` 让路；登录过期会带 `needRelogin:true`。`/api/state` 的账号行带 `credits` 字段（同款缓存的只读投影） |
+| **批量做任务** | 看板「批量做任务」/ `POST /api/run` / 工具 `workbuddy_tasks_run` | 成长任务完整流水线：先做 `auto` 前置 → 批量接取（20 个一批，复查后补接一次）→ 逐个上报事件点亮并轮询进度 → 进度到位才领奖。没到位就把领奖顺延到下一轮，绝不硬闯 |
+| **批量接任务** | 看板「批量接任务」/ `POST /api/task/accept` | 只接取引擎判定 `canAccept` 的任务，不点亮、不领奖。桌面端专属任务可以被接取，但不会伪造进度 |
+| **只领奖** | 看板单账号「领取」/ `POST /api/task/claim` / 工具 `workbuddy_tasks_claim` | 领取单个已完成任务；批量运行时也会按 `claim:false` 只点亮不领奖 |
+| **任务级勾选** | 看板任务明细 / `POST /api/run` 的 `codes` / 工具 `codes` | 按账号勾选任务，批量操作只作用于选中的 code；未勾选 = 全部任务。选中但任务表里不存在的 code 会警告一次并跳过 |
+| **猫猫旅行** | 任务腿 `travel` | `arrived` 领奖 → `idle` 派出（先完成并领取 `first_buddy`）→ `traveling` 如实报告，一次推进一步 |
+| **夜猫子** | 任务腿 `night` | `black_cat` 只在**北京时间 23:00–08:00** 上报，白天诚实跳过；每天计 1 次、累计 3 天 |
+| **每日活跃** | 自动（每个 job 的每个账号开跑前） | 每个账号每个**北京日**往计费域上报一条 chat 事件，点亮成长中心连登。幂等账本 `state/daily-activity.json`，重启后同一天不重发；失败只记日志，不阻断任务 |
+| **积分余额与明细** | 看板积分列 / `GET /api/credits?uid=<uid>` | 只读查询国内版积分余额、每个套餐包的额度/已用/剩余/发放原因/到期时间，以及最早到期提示。看板有「明细」弹窗，可按状态筛选、搜索、排序、强制刷新 |
+| **小时排程** | 看板排程区 / `POST /api/settings` | **默认停用**。启用后按**北京时间** 09:00、21:00 跑「猫猫旅行」，01:00 跑「夜猫子」；同一北京日同一窗口只触发一次。**成长任务不在排程里**，只能手动或工具发起 |
+| **账号导入 / 导出** | 看板「导入 / 导出」/ `/api/accounts/export`、`/api/accounts/import` | 导出 hub 同款 `workbuddy-accounts` JSON；导入走「预览 → 确认写入」两段式，智能合并写回 magpie 的 `plugin-auth.json`，写前自动备份。只同步国内版 |
+| **看板与入口卡** | 守护进程 `:4390` / magpie 插件页 | 账号、任务、积分、实时步骤/SSE、排程、历史；magpie 入口卡显示看板地址，按当前访问 magpie 的主机自动推导 |
 
-安全默认：首次安装后 `settings.json` 不存在或损坏时，一律回落到「排程停用 + 窗口保留」，只读的账号列表不会打上游；只有你手动点「批量做任务」/启用排程，才会产生写操作。
+风控红线（不可配置、不可绕过）：任意两次上游调用之间至少 **1s**；账号之间手动 **1.5s**、排程 **2–5s** 抖动；绝不并行跑成长任务；命中 403 / 11140 后该账号冷却 **120 分钟**，冷却中整轮跳过，绝不换号硬闯。
 
-防风控红线（不可配置、不可绕过）：任何两次上游调用之间至少 1s；账号之间手动 1.5s / 排程 2–5s 抖动；绝不并行跑成长任务。
+任务判定只有一个来源（`engine/taskkind.mjs`）：已知任务按 `TASK_SPECS`；未收录但 `jump_url` 能解出 `expertId=ex_…` 的 `expert_use_*` 任务会钉住该专家 id 点亮；其余未收录、桌面端专属、`unforgeable` 任务一律不伪造进度。
+
+### 看板里有什么
+
+- **账号表**：账号（昵称 / 域名 / uid）、凭据（登录状态、剩余天数）、任务进度、积分余额、参与开关、刷新快照。
+- **任务明细**：展开每个账号的任务表；首列是勾选框，表头和提示条支持全选/半选。**勾选后批量操作只作用于选中任务，不勾选 = 全部。**
+- **积分**：任务进度右侧显示 `剩余 / 总额` 与「明细」按钮；最近 7 天内有套餐到期会显示提醒。
+- **积分明细弹窗**：剩余可用 / 已消耗 / 总额度 / 最近将过期四张卡；额度利用率；套餐包表格（来源、到期倒计时、总额度、已用、剩余、利用率）；筛选「全部 / 有剩余 / 即将到期 / 已用完或过期」；搜索包名/代码/来源；四种排序；「刷新明细」。
+- **批量条**：任务腿（成长 / 旅行 / 夜猫）、自动领奖、批量接任务、只领奖、每日签到、批量做任务。
+- **排程**：启用开关、旅行/夜猫子的小时窗口（北京时间）、下一次运行、风控冷却名单。
+- **历史**：每次尝试一行；「触发」列区分「排程 / 手动」。
+- **实时进度**：SSE 推送步骤与日志；断线自动回退 3 秒轮询。
 
 ## 它刻意不做什么
 
-- **自动签到**：官方 `@magpie-community/opencode-workbuddy-auth` 插件已经拥有 `auth.checkin`（每个北京日一次）。本插件不声明 provider，自然也不实现 `auth.checkin`，只在看板留了一个走计费接口的「每日签到」按钮（`POST /api/checkin`）供偶尔手动补用。
-- **连登管家 / 补签卡 / 抽奖 / 礼包兑换**：用户决策排除在范围外。本插件只做「每日活跃」这一件事点亮连登（见上表：每北京日一条计费域事件，不花任何道具），补签卡/抽奖/兑换一概不碰——引擎只会**读**补签卡余额、抽奖次数等做展示（`fetchGrowthSummary`），绝不花它们——代码里没有任何 makeup-card/lottery-draw/redeem/claim-gift 的调用。
-- **国际版**：纯国内版插件。`workbuddy-ai`（国际版）账号**彻底不出现**：不进账号列表、不进快照/统计、不参与任何任务、默认不导出（`/api/state` 顶层只有 `intlSkipped:{count,note}` 一个只读计数说明去向）；上游本就没有国际版成长任务体系。
-- **不服务对话模型、不声明任何 provider**：本插件没有 `auth`/`config` 钩子，magpie 的「供应商」列表里**不会**出现它（见下文「为什么没有供应商」）。`workbuddy` / `workbuddy-ai` 两个 id 归社区插件，对话链路原封不动。
+- **自动签到**：社区插件 `@magpie-community/opencode-workbuddy-auth` 已有 `auth.checkin`（每个北京日一次）。本插件不声明 provider，也不实现 `auth.checkin`；看板只保留一个走计费接口的「每日签到」按钮（`POST /api/checkin`）供偶尔手动补用。
+- **连登管家 / 补签卡 / 抽奖 / 礼包兑换**：不做。本插件只通过「每日活跃」点亮成长中心连登；补签卡、7/14/28 天兑换、抽奖、礼包兑换一概不碰，也不消耗任何积分或道具。
+- **桌面端专属伪装**：`RichMeow_Chat`、`Buddy_App`、`Buddy_App_QQ` 上游只认真实桌面客户端行为，伪造事件不推进进度。看板只展示它们的深链，任务会停在未完成，这是正常的。
+- **无法自动化的任务**：`wb_wechat_oa_subscribe_task`（需关注公众号满 24 小时）、`Expert_Philanthropy`（真实捐款）不接取、不上报、不领奖。
+- **国际版**：`workbuddy-ai` 不进账号列表、不进快照/统计、不参与任务、默认不导出；`/api/state` 只给一个 `intlSkipped:{count,note}` 计数说明去向。
+- **不服务对话模型、不声明 provider**：没有 `auth`/`config` 钩子，magpie 的「供应商」列表里不会出现本插件，也就没有「未登录」卡和登录按钮。`workbuddy` / `workbuddy-ai` 两个 provider id 始终归社区插件，对话链路不动。
 
-## 账号复用与 token 回写（关键机制）
+## 账号复用与 token 回写
 
-- **读取**：守护进程读 magpie 配置目录下的 `plugin-auth.json`，只认 `workbuddy` / `workbuddy#xxxxxxxx` 键（magpie/OpenCode 多账号键格式）的条目；API key 条目、企业/团队账号（`enterpriseId`）、国际版一律不参与任务——且**国际版条目根本不进列表/统计/导出**（过滤在插件使用侧，`engine/store` 的读取仍保留全量以支持导入合并与 `realm=intl` 备份逃生口）。**从不删除这个文件**——只读它，以及下述回写。
-- **回写**：批量任务启动前若 access token 距到期不足 5 分钟，引擎先刷新，然后**原子回写** `plugin-auth.json`（tmp + rename，POSIX 上 mode 600）：只覆盖 `access / refresh / expires / refreshExpiresAt / domain / tokenType` 六个与刷新结果相关的键，条目里的未知字段与所有兄弟条目（其它 provider、其它账号）原样保留；文件解析失败时拒绝回写而不是覆盖。这保证了「单一凭据血统」：社区插件与我们永远用同一对 token，refresh 轮换不会把对方踢下线——官方插件负责的对话因此不受影响。
-- **坦白说：这是整个插件最脆弱的一环。** 读 `plugin-auth.json` 是 magpie 宿主环境允许的行为，但该文件的位置与格式**不是 magpie 承诺过的公开接口**。如果 magpie 改了它：
-  - *换位置/换文件名* → 我们读不到账号，看板与 `/api/state` 会挂出「找不到账号/读取账号失败」的 notice，任务不跑。没有破坏性后果（没有账号就不会触发回写）。
-  - *改字段格式* → 轻则账号被跳过（读不出 access/uid 的条目不参与）；重则我们的回写写不进 magpie 认的键里，退化为「各刷各的 token」——最坏情况是 refresh 轮换把社区插件挤下线，重新登录一次 WorkBuddy 即可恢复。文件解析失败时我们会拒绝写入，不会损坏 magpie 的数据。
-  - **Opt-out**：在 magpie「插件管理」里停用本插件即可——守护进程 10 秒内读到 `plugins.json` 的 `off:true` 自行退出，之后不再读任何文件（本插件没有申请任何 magpie 权限，`package.json` 的 `permissions` 为空）。也可以按账号关「参与任务」开关，但那只是不拿账号跑任务，账号仍会被读取用于展示。
-- 参与任务的账号范围等价于 hub 的 `task_accounts("cn")`：国内版个人 OAuth 且本插件没关掉任务。看板里可按账号停用/启用（写 `state/accounts.json`）。
+- **读取**：守护进程读 magpie 配置目录下的 `plugin-auth.json`，只认 `workbuddy` / `workbuddy#xxxxxxxx` 键。API key 条目、企业/团队账号（`enterpriseId`）、国际版都不参与任务；国际版在插件使用侧就被过滤掉。
+- **回写**：批量任务开始前，如果 access token 距到期不足 **5 分钟**，引擎先刷新，再**原子回写** `plugin-auth.json`（tmp + rename，POSIX mode 600）。只覆盖 `access / refresh / expires / refreshExpiresAt / domain / tokenType` 六个键；未知字段和其它 provider 的兄弟条目原样保留；文件解析失败时拒绝写入。
+- 这样社区插件和本插件始终用同一对 token，refresh 轮换不会把对方踢下线——官方插件负责的对话不受影响。
+- **这是最脆弱的一环**：`plugin-auth.json` 的位置和格式不是 magpie 承诺的公开接口。magpie 改格式时，最坏情况是登录态需要重新扫码；解析失败我们会拒绝写入，不会损坏 magpie 的数据。
+- **Opt-out**：在 magpie「插件管理」里停用本插件，守护进程 10 秒内读到 `plugins.json` 的 `off:true` 后自行退出，之后不再读任何文件。也可以按账号关「参与任务」，但账号仍会被读取用于展示。
 
-## 安装（GitHub 仓库方式）
+## 账号导入 / 导出
 
-前提：magpie 已安装；且 magpie 里已经登录过 **WorkBuddy（国内版）**账号（`workbuddy` 供应商，由社区插件 `@magpie-community/opencode-workbuddy-auth` 提供）。本插件不需要、也不接受任何密钥。
+看板账号卡片右上角有「导入 / 导出」，也可以直接调 API。
 
-本仓库已完成 `git init` 和干净的初始提交。发布步骤：
+**导出**（`GET /api/accounts/export`）：生成 hub 同款 `workbuddy-accounts` JSON。默认 `secrets=1`，**包含 access/refresh token**，下载文件请妥善保管；`secrets=0` 会删除两个 token 字段。默认只导国内版；显式 `realm=intl` 是 API 层的备份逃生口（看板不提供入口）。`uid=a,b` 可只导指定账号，`download=1` 触发附件下载。
+
+**导入**（`POST /api/accounts/import`）：两段式。
+
+1. **预览**（默认）：只读，返回 `adds / updates / skips / rejects` 和每个账号的原因，绝不写盘；
+2. **确认**（`confirm:true`）：写入 magpie 的 `plugin-auth.json`，写前自动备份，只同步国内版，支持导出信封、裸数组、单账号对象、桌面端凭据和 cockpit snake_case 行。
+
+智能合并规则（按顺序）：
+
+- 导入项没有 `refresh` 而现有有 → **skip**（写进去会削弱续期能力）；
+- 现有 token 尚未过期 → **skip**（绝不把在用的新 token 换成 JSON 里的旧 token）；
+- 现有已过期且导入的 token 更新 → **update**，只改 `access / refresh / expires`，其它字段保留；
+- 其余 → **skip**。
+
+确认写入后，需要在 magpie 插件管理里把 WorkBuddy **关掉再打开**，宿主才会认到新账号。
+
+## 安装
+
+前提：
+
+1. 已安装 magpie；
+2. 已安装社区插件 `@magpie-community/opencode-workbuddy-auth`，并在 magpie 里登录过 **WorkBuddy 国内版**（`workbuddy`）账号。
+
+GitHub 安装：
 
 ```bash
-# 1) 在 GitHub 建一个空仓库（建议同名 magpie-workbuddy-tasks，不要初始化 README）
-#    https://github.com/new
-
-# 2) 推送（替换 <owner>）
-cd magpie-workbuddy-tasks
-git branch -M main
-git remote add origin https://github.com/<owner>/magpie-workbuddy-tasks.git
-git push -u origin main
-
-# 3) 在跑 magpie 的机器上安装
-magpie plugin add github:<owner>/magpie-workbuddy-tasks
+magpie plugin add github:jichie/magpie-workbuddy-tasks
 ```
 
-> **首次 add 若提示 `the plugin's load didn't finish in 20s`**：是冷启动一次性开销（Bun 首次要现场从 npm
-> 拉取 `@opencode-ai/plugin` 供工具注册用，群晖容器实测冷 45.5 s / 热 23 ms，超了宿主 20 s 加载时限），
-> 拉取会在后台完成并进缓存——**再 add 一次或停用→启用一次即可**，详见 install.md 的计时数据。
+首次 `add` 如果提示 `the plugin's load didn't finish in 20s`：这是 Bun 第一次现场拉取 `@opencode-ai/plugin` 的冷启动开销（群晖容器实测冷启动可到 45s，热启动约 23ms）。拉取会在后台完成并进缓存，**再 add 一次，或在插件管理里停用→启用一次**即可。
 
-然后在 magpie 的「插件管理」里**启用**本插件（安装后若未自动启用）。启用后：
+本地文件夹安装（开发/自建）：
 
-- 侧栏「插件」分组会出现「**WorkBuddy 任务**」入口卡（magpie 沙箱页，显示看板地址）。地址按你当前访问 magpie 的主机自动推导（同一主机的 4390 端口），可用插件选项 `dashboardUrl` 覆盖；沙箱不允许弹新窗口：点「打开看板」会先尝试新窗口，被拦时自动复制地址并提示，也可右键链接在新标签页打开。
-- **「供应商」里不会多出任何条目**——本插件不声明 provider，没有也不需要「登录」：任务凭据始终共享读取 magpie 已登录的 workbuddy 账号。若你在旧版本见过「WorkBuddy 任务」供应商卡（显示「未登录」+ 登录按钮），升级后它会消失，这是预期行为（见下文「为什么没有供应商」）。
+```bash
+magpie plugin add /path/to/magpie-workbuddy-tasks
+```
 
-**可发现性**：给 GitHub 仓库打上 `magpie-plugin` topic（仓库页 → About ⚙ → Topics），插件就会出现在 magpie 的「插件 → 发现 → 非官方插件」列表里。
+安装后在 magpie 的「插件管理」里**启用**本插件。启用后：
 
-**更新**：改动推到默认分支即可。magpie 会对比远端提交与本地安装的提交（每 10 分钟最多问一次 GitHub），有差异就在「插件 → 已安装」提示更新，点一下或 `magpie plugin update` 完成更新。固定到某次提交（`github:<owner>/<repo>#<sha>`）的安装不会自动更新。
+- 侧栏「插件」分组出现「**WorkBuddy 任务**」入口卡；看板地址按你访问 magpie 的主机自动推导（同一主机 + 4390 端口），可用插件选项 `dashboardUrl` 覆盖。
+- **「供应商」里不会多出任何条目**。如果从旧版本升级后仍看到「WorkBuddy 任务: 未登录」，那是 magpie 缓存的旧 provider：重启 magpie，或先备份、再从 `plugin-providers.json` / `cache/magpie/providers-state.json` 中删掉 `workbuddy-tasks` 条目即可。
+- 沙箱页不允许弹新窗口：点「打开看板」会先尝试新窗口，被拦时自动复制地址并提示；也可以右键链接「在新标签页中打开」。
 
-**重要——magpie 按「仓库当前代码」直接加载运行**（没有构建步骤：仓库根就是插件根，`package.json` 在根目录，magpie 加载 `index.mjs` 及其引用的 `daemon.mjs`、`lifecycle.mjs`、`engine/`、`dashboard/`、`page/`）。所以这些文件**必须全部提交进仓库**；本仓库没有 dist/构建产物，提交的树就是运行的东西，天然满足。
+**更新**：把改动推到默认分支，magpie 每 10 分钟最多检查一次 GitHub，有更新会在「插件 → 已安装」提示；点更新或执行 `magpie plugin update`。固定到某次提交的安装（`#<sha>`）不会自动更新。
 
-**重载语义**：通过终端执行的 magpie 命令每次都会重新加载插件；但应用内宿主不会热重载——文件夹方式安装时的本地改动、或 GitHub 方式 `magpie plugin update` 之后的代码，需要让宿主重载一次才生效：用 `magpie plugin use <插件名>`（若你的 magpie 版本提供），或最稳妥地在「插件管理」里把本插件**关掉再打开**。
+**重载语义**：magpie 按仓库当前代码直接加载，没有构建步骤。应用内宿主不会热重载；本地改动或 `plugin update` 后，在「插件管理」里把插件**关掉再打开**，或用你的 magpie 版本提供的重载命令。
 
-## 看板与局域网安全（免密钥：如实说明）
+**插件选项**：
 
-- **全部 API 与看板不需要任何密钥**（用户明确要求的免密钥口径）：读状态、启动/停止批量任务、改设置、单账号领奖/接取/签到、开关账号、导入确认写盘、含 token 的账号导出、关停守护进程——一律无需鉴权。
-- 看板默认 `http://127.0.0.1:4390/`。端口被占用时自动顺延（最多 +9，再不行用随机端口），**实际端口写在 `state/daemon.json` 的 `port` 里**（实际绑定的 host 也在同一文件的 `host` 里）。
-- `GET /api/state` 顶层带 `bindHost` / `port` / `reachableHint` 三个字段（`serveUrl` 亦保留），供宿主、CLI 与其他集成拼可点开的看板地址；看板页面本身已移除地址块，不再显示/复制 serveUrl。绑定 `0.0.0.0`/`::` 时 `reachableHint` 明确提示「仅容器网桥/局域网可达，请用 SSH 隧道或局域网地址访问，切勿发布到公网」，否则为空串。
-- `state/daemon.json` 里仍有 `key` 字段（POSIX 上权限 600）——**仅为向后兼容保留**（旧版看板与宿主探测逻辑会读它），不是访问凭据，任何接口都不校验它。旧调用带 `Authorization: Bearer …` 或 `?k=…` 照常工作，新集成不必带。
-- **免密钥意味着**：凡能连上守护进程端口的人（或程序）都可以——
-  - 用你已登录的 WorkBuddy 账号触发批量任务、领奖励、开关账号、改排程窗口；
-  - 通过导入确认接口**写入你的 `plugin-auth.json`**；
-  - 下载含 `accessToken`/`refreshToken` 的账号导出（默认只含国内版；显式 `realm=intl` 才含国际版）；
-  - 关停守护进程（`POST /api/shutdown`）。
-- 因此安全性**完全由网络边界负责**：守护进程默认只绑 `127.0.0.1`，只有本机进程能访问——这是默认安全的原因，不是「安全无虞」。Docker 场景里容器内回环外部不可达，只有把 `options.listenAddress` 设为 `"0.0.0.0"` 才会暴露到容器网桥/局域网。
-- 建议：只在可信的家庭局域网/VPN 内使用；不用时把插件停用或写 `state/control.json` 为 `{"desired":"off"}` 让守护进程退场；**不要把 4390 等端口发布到公网或开放的 LAN**（`-p 0.0.0.0:4390:4390` 这类映射等于把上面那串能力交给全网）。跨机器访问用 SSH 隧道——隧道本身就是鉴权。
-
-  ```bash
-  # 跨机器看板：SSH 隧道（推荐），不开放绑定
-  ssh -L 4390:127.0.0.1:4390 <user>@<跑 magpie 的机器>
-  ```
-
-## 生命周期（诚实的限制）
-
-- 守护进程由插件入口（`index.mjs`）在 **magpie 的插件宿主加载本插件时**拉起（健康探测通过就复用，不健康才 spawn 一个 detached 的 `node daemon.mjs`）。
-- **但宿主是懒加载的**：magpie 首次用到本插件（打开插件页/用到本插件的工具等）才加载它，且插件新增/移除/更新/开关都会重启宿主。所以**启用插件后看板不一定立刻就在**。两个兜底：
-  1. 看板顶栏的「**启动命令**」按钮会显示当前配置下的完整手动启动命令；
-  2. 自己跑：`node daemon.mjs --cfg <magpie 配置目录> --state <state 目录> --port 4390`（state 目录默认就是 `<magpie 配置目录>/workbuddy-tasks/state`，可省略 `--state`）。
-- **守护进程自己跟随 magpie 生死**，不依赖宿主存活：
-  - 每 15s TCP 探测 magpie 网关（`MAGPIE_ADDR`，否则 127.0.0.1:3425 再试 :3430）：**连续 4 次失败（magpie 停了）→ 自行退出**；
-  - 每 10s 读 magpie 的 `plugins.json`：本插件条目 `off:true`（你在插件管理里关了它）→ **10 秒内优雅退出**；再打开后由下次宿主加载或手动命令拉起；
-  - 每 5s 检查 `state/control.json`：`desired:"off"` → 退出（这是看板「停止」按钮与「彻底停止」的机制）；
-  - 由宿主拉起（托管模式）时，`plugins.json` 里条目被移除（插件被卸载）→ 退出。
-- 这就是「**跟随 magpie 启停 + 插件管理里启用/停用即时生效**」的完整闭环：magpie 开它才在，magpie 关它就退，插件管理里的开关两个方向都会生效（关：10 秒内退；开：下次宿主加载时拉起，或用上面的手动命令立刻拉起）。
-- 崩溃重启无僵尸：意图唯一来源是 `control.json`，重复启动会被 `daemon.json` 里的存活 pid + `/api/hello` 健康探测挡下（拒绝双开）。
-
-## 状态都在哪
-
-全部状态都在 `<magpie 配置目录>/workbuddy-tasks/state/`（Docker 里通常是容器内 `/config/magpie/workbuddy-tasks/state/`）：
-
-| 文件 | 内容 |
-| --- | --- |
-| `control.json` | 唯一意图来源：`{"desired":"on"/"off"}`（看板停止/启动按钮写这里） |
-| `settings.json` | 排程开关、窗口小时、默认腿、领奖开关、账号间隔、上游 host 覆盖 |
-| `snapshots.json` | 每账号任务快照（任务表/能量/连署，job 结束或 `?refresh=1` 时刷新） |
-| `history.json` | 每次尝试一行（上限 2000 行） |
-| `accounts.json` | 按账号的「参与任务」开关覆盖（看板 toggle 写入） |
-| `daemon.json` | 守护进程 `pid / port / key / version / startedAt`（0600；`key` 仅为向后兼容保留，不是访问凭据） |
-| `daemon.heartbeat` | 心跳时间戳 |
-| `lastFired.json` | 排程「同一天同窗口只触发一次」的去重记录 |
-| `daily-activity.json` | 每日活跃的幂等账本（`{uid:"YYYY-MM-DD"}`）：同一北京日不重发；文件损坏按空对象起步，顶多重发一条（上游按北京日幂等） |
-| `credits.json` | 积分余额缓存（`{uid: credits}`）：`GET /api/credits` 拉取成功后原子写回，10 分钟内直接回缓存不打上游；文件损坏按空对象起步（下次拉取重写） |
-| `tasks-accounts.json` | 引擎层按账号键的参与开关映射（与 `accounts.json` 口径一致） |
-
-登录凭据 `plugin-auth.json` 在 magpie 配置目录**根部**，由 magpie/社区插件拥有：我们只读它 + 上述原子回写，**从不删除它**。想彻底清掉本插件的痕迹，删 `<magpie 配置目录>/workbuddy-tasks/` 整个目录即可（里面没有登录凭据）。
-
-## 为什么没有供应商（本插件不声明 provider）
-
-本插件**不声明 provider，只提供页面与 MCP 工具**：`index.mjs` 里只有 `tool` 钩子，没有 `auth`/`config` 钩子。所以 magpie 的「供应商」列表里不会有它，也就没有「未登录」卡片和登录按钮可显示——任务凭据始终共享读取 magpie 已登录的 `workbuddy`（国内版）账号，本插件从不收任何密钥。
-
-历史说明：早先版本声明过一个无模型的独立 provider「`workbuddy-tasks`」（`models:{}`）——当时是当作给 magpie 的「加载理由」。但实践里它只有副作用：供应商卡常年显示「未登录」并递上一颗无法真正使用的登录按钮（provider 的授权方法本来就不收密钥），用户不需要也无法为它登录。已移除，连带用量钩子一并下线（用量数字看板与 `workbuddy_tasks_status` 工具都有）。
-
-加载与运行不受影响：
-
-- magpie 仍会加载本插件——`package.json` 里声明了 `magpie.page`（入口卡），而且它不是「只有页面」的插件：`tool` 钩子在，magpie 照样为工具启动插件宿主、执行入口函数，守护进程的 `ensureDaemon` 生命周期照常运转；
-- `workbuddy` / `workbuddy-ai` 两个 provider id 归官方社区插件，本插件从不占用（provider id 撞车才会被改成 `-plugin` 后缀的顾虑也随声明移除而消失）。
+| 选项 | 默认 | 说明 |
+| --- | --- | --- |
+| `dashboardUrl` | 空 | 留空 = 按当前访问 magpie 的主机自动推导 `http(s)://<host>:4390`；显式填写可覆盖 |
+| `listenAddress` | 空 | 守护进程绑定地址；Docker/局域网需要设为 `0.0.0.0` |
 
 ## 智能体工具（MCP）
 
-本插件向 magpie 的 MCP 工具服务注册五个工具，任何接了 `http://127.0.0.1:3425/mcp/magpie/tools` 的智能体（Claude Code、Codex 等）都能用：
+本插件向 magpie 的 MCP 工具服务注册 5 个工具，任何接入 `http://127.0.0.1:3425/mcp/magpie/tools` 的智能体都能用：
 
 | 工具 | 作用 |
 | --- | --- |
 | `workbuddy_tasks_status` | 账号、排程窗口、当前 job、今日收益一览 |
-| `workbuddy_tasks_run` | 启动一轮批量任务（可指定 uids / legs / claim / codes），**立即返回 job id，不等待**；`codes` = 任务级勾选，growth 腿只处理选中的任务 |
-| `workbuddy_tasks_wait` | 轮询某个 job 直到完成或超时（默认 45s、上限 50s），返回进度与结算 |
-| `workbuddy_tasks_list` | 某个账号的任务表（code / 标题 / 接取状态 / 进度 / 奖励） |
-| `workbuddy_tasks_claim` | 单个任务领奖 |
+| `workbuddy_tasks_run` | 启动一轮批量任务，立即返回 job id；参数 `uids?`、`legs?`、`claim?`、`codes?` |
+| `workbuddy_tasks_wait` | 轮询 job 直到完成或超时（默认 45s，上限 50s） |
+| `workbuddy_tasks_list` | 某账号的任务表（code / 标题 / 接取状态 / 进度 / 奖励） |
+| `workbuddy_tasks_claim` | 按 uid + code 领取单个任务 |
 
-每个工具的单次执行上限是 55 秒，装不下一轮跨账号批量，所以它们**只负责启动或轮询**：真正的执行在守护进程里，工具只调守护进程的 HTTP API（先 `run` 拿 job id，再 `wait` 到完成）。批量任务运行中，单账号操作（claim/accept/checkin）会得到 409 `busy`，避免和批量抢限速窗口。
+每个工具单次最多执行 55 秒，装不下一轮跨账号批量，所以它们只负责**启动或轮询**，实际执行在守护进程里。批量任务运行中，单账号操作会得到 409 `busy`，避免抢限速窗口。
+
+## HTTP API
+
+全部接口**不需要密钥**（用户明确要求的局域网自建工具口径），完整字段以 [`docs/CONTRACT.md`](./docs/CONTRACT.md) 为准：
+
+| 方法与路径 | 作用 |
+| --- | --- |
+| `GET /api/hello` | 名称、版本、引擎是否就绪 |
+| `GET /api/state` | 账号、任务快照、积分缓存、排程、当前 job、今日统计、设置、`serveUrl`/`bindHost`/`port`/`intlSkipped` |
+| `POST /api/run` | `{uids?, legs?, claim?, codes?}` 启动 job；`codes` 支持 `string[]` 或 `{[uid]: string[]}` |
+| `POST /api/stop` | 取消当前 job |
+| `POST /api/task/claim` | `{uid, code}` 单任务领奖 |
+| `POST /api/task/accept` | `{uid, codes[]}` 单账号接取 |
+| `POST /api/checkin` | `{uids?}` 手动每日签到（不自动） |
+| `POST /api/settings` | 部分设置：排程开关、北京时间窗口、默认腿、领奖、间隔、host |
+| `POST /api/accounts` | 重新读 `plugin-auth.json`，报告账号增删 |
+| `GET /api/accounts/export` | `?realm=cn 或 intl`、`secrets=0 或 1`、`uid=a,b`、`download=1`；默认国内版、默认含 token |
+| `POST /api/accounts/import` | 预览/确认两段式导入；确认后写 `plugin-auth.json` 并备份 |
+| `POST /api/account/toggle` | `{uid, tasksEnabled}` 参与任务开关 |
+| `GET /api/credits` | `?uid=<uid>&refresh=0 或 1` 积分余额与套餐明细；缓存 10 分钟 |
+| `GET /api/jobs/:id` | 查询某个 job |
+| `GET /api/history` | `?limit=200` 每次尝试一行；`trigger` 为 `schedule` 或 `manual` |
+| `GET /api/events` | SSE：`job` / `step` / `log` / `scheduler` / `accounts` / `credits` |
+| `POST /api/shutdown` | 让守护进程退出 |
+| `GET /` | 看板静态页（同源，无构建） |
+
+`codes` 的两种形状：
+
+- `["task_a", "task_b"]`：对 job 内所有账号生效；
+- `{"uid-a": ["task_a"], "uid-b": ["task_b"]}`：按账号生效，未出现的账号 = 全部任务。
+
+## 排程与时间口径
+
+- **全部按北京时间（UTC+8）** 解释小时窗口、夜猫子窗口、每日活跃日界和积分到期时间；magpie 容器通常跑在 UTC，引擎不读宿主 `getHours()`。
+- 排程**默认停用**。第一次装好不会自动往账号打上游请求，必须你在看板里点一次「启用小时窗口排程」。
+- 默认窗口：旅行 09:00 / 21:00，夜猫子 01:00；数字是北京小时，可在看板修改。
+- **成长任务不在排程里**：自动到点跑的都是无任务码的腿；成长任务只能手动（看板 / `POST /api/run` / 工具），可配合 `codes` 只做选中任务。
+- 守护进程每 30 秒检查一次窗口；同一北京日同一窗口只触发一次（`state/lastFired.json`，日期段是北京日期）。有 job 在跑时让路。
+- 夜猫子 `black_cat` 只在 23:00–08:00 计数，每天 1 次、累计 3 天。
+- 每日活跃在每个 job 的每个账号开跑前执行一次；同一北京日不重发。
+
+## 看板与局域网安全
+
+- 看板默认 `http://127.0.0.1:4390/`。端口被占用时自动顺延（最多 +9，再不行随机端口），实际端口和绑定 host 写在 `state/daemon.json`。
+- 所有 API 与看板**免密钥**：读状态、跑任务、改设置、单账号领奖/接取/签到、开关账号、导入确认写盘、含 token 的账号导出、关停守护进程，一律不需要鉴权。
+- 安全性**完全由网络边界负责**：
+  - 默认只绑 `127.0.0.1`，只有本机进程能访问；
+  - Docker 里只有把 `options.listenAddress` 设为 `"0.0.0.0"` 才会暴露到容器网桥/局域网；
+  - **不要把 4390 发布到公网或开放的 LAN**。能连上端口的人可以触发任务、写入 `plugin-auth.json`、下载含 token 的导出、关停守护进程。
+- 跨机器访问推荐 SSH 隧道（隧道本身就是鉴权）：
+
+  ```bash
+  ssh -L 4390:127.0.0.1:4390 <user>@<跑 magpie 的机器>
+  ```
+
+- `state/daemon.json` 里的 `key` 字段**仅为向后兼容保留**，不是访问凭据，任何接口都不校验；旧调用带 `Authorization: Bearer …` 或 `?k=…` 仍可用。
+
+## 生命周期
+
+- 守护进程由插件入口 `index.mjs` 在 **magpie 插件宿主加载本插件时**拉起：健康探测通过就复用，不健康才 spawn 一个 detached 的 `node daemon.mjs`。
+- magpie 宿主是懒加载的：首次用到本插件（打开插件页 / 用到工具）才加载；插件新增/移除/更新/开关都会重启宿主。启用后看板不一定立刻在，可用看板顶栏「启动命令」或手动启动：
+  
+  ```bash
+  node daemon.mjs --cfg <magpie 配置目录> --state <state 目录> --port 4390
+  ```
+
+- 守护进程自己跟随 magpie：
+  - 每 15s TCP 探测 magpie 网关，连续 4 次失败（magpie 停了）→ 退出；
+  - 每 10s 读 `plugins.json`，本插件 `off:true` → 10 秒内退出；
+  - 每 5s 检查 `state/control.json`，`desired:"off"` → 退出；
+  - 托管模式下插件条目被移除（卸载）→ 退出。
+- 重复启动会被 `daemon.json` 里的存活 pid + `/api/hello` 健康探测挡下，不会双开。
+
+## 状态文件
+
+全部在 `<magpie 配置目录>/workbuddy-tasks/state/`（Docker 通常是 `/config/magpie/workbuddy-tasks/state/`）：
+
+| 文件 | 内容 |
+| --- | --- |
+| `control.json` | 唯一意图来源：`{"desired":"on"/"off"}` |
+| `settings.json` | 排程开关、北京时间窗口、默认腿、领奖、账号间隔、上游 host |
+| `snapshots.json` | 每账号任务快照（job 结束或 `?refresh=` 时刷新） |
+| `history.json` | 每次尝试一行（上限 2000）；`trigger` 为 `schedule`/`manual` |
+| `accounts.json` | 按账号的参与任务开关覆盖 |
+| `tasks-accounts.json` | 引擎层按账号键的参与开关映射 |
+| `daemon.json` | pid / port / host / version / startedAt（`key` 仅兼容保留） |
+| `daemon.heartbeat` | 心跳时间戳 |
+| `lastFired.json` | 排程去重：北京日期 + 窗口 |
+| `daily-activity.json` | 每日活跃幂等账本：`{uid:"YYYY-MM-DD"}` |
+| `credits.json` | 积分余额缓存：`{uid: credits}`，10 分钟 TTL |
+| `hub-imports.json` | 经 JSON 导入的账号台账（`imported` 展示标记） |
+
+登录凭据 `plugin-auth.json` 在 magpie 配置目录**根部**，由 magpie/社区插件拥有：我们只读 + 原子回写，**从不删除**。想彻底清掉本插件痕迹，删 `<magpie 配置目录>/workbuddy-tasks/` 整个目录即可（里面没有登录凭据）。
 
 ## 故障排查
 
 | 症状 | 原因与处理 |
 | --- | --- |
-| 「没有可参与任务的账号」 | 需要 magpie 里已登录国内版 `workbuddy` 的 **OAuth** 账号：API key 账号、企业/团队账号、国际版 `workbuddy-ai` 一律不参与；也可能被看板「参与任务」开关停用了。Docker/自定义安装时多半是守护进程找错了配置目录——给它设 `MAGPIE_CONFIG_DIR` 指向 magpie 配置目录（容器里通常是 `/config/magpie`）后重启。看板「重新扫描账号」或 `POST /api/accounts` 可立即重扫。 |
-| 「任务引擎不可用」（`/api/hello` 的 `ready:false`，`/api/run` 503） | `engine/*.mjs` 缺失或加载失败——GitHub 安装没提交全 `engine/`、或文件损坏。补齐提交后在插件管理里关/开一次重载。 |
-| 步骤失败：「触发风控限制 (403/11140)」 | 上游账号级风控（HTTP 403 或信封 code 11140）。引擎立即停手不重试，把该账号放进 **120 分钟冷却**（`scheduler.holds` 可看解除时间）；冷却中的账号整轮跳过。引擎**绝不**因为风控轮换/替换账号硬闯——等冷却自然解除，或明天再跑。 |
-| 「快照缺任务码」/任务表为空 | 快照只在 job 结束后或 `?refresh=1` 时刷新，刚装好插件时是空的，跑一轮或点「立即运行」后就有。另外：桌面端专属（`DESKTOP_ONLY`）与 `unforgeable` 任务上游只认真实客户端行为，我们只展示它的 `jumpUrl` 深链，不会给它伪造进度——这些任务永远停在「未完成」属正常。 |
-| magpie 跑在 Docker 里 | 配置目录在容器内通常是 `/config/magpie`。给守护进程设 `MAGPIE_CONFIG_DIR=/config/magpie`（`WB_CONFIG_DIR` 亦可）。宿主拉起的守护进程会继承宿主环境变量；手动拉起时记得在容器内/挂载相同路径。 |
-| Windows 注意事项 | 默认配置目录遵循 XDG 约定：`%USERPROFILE%\.config\magpie`（**不是** AppData）。手动启动时给含空格/反斜杠的路径加引号：`node daemon.mjs --cfg "C:\Users\me\.config\magpie"`。chmod 600 在 Windows 上近似空操作（daemon.json 不设权限位）。 |
-| 看板连不上（守护进程没起） | 宿主懒加载 + 插件开关会重启宿主，看板不一定立刻就绪。用看板顶栏「启动命令」显示的命令手动拉起，或自己跑 `node daemon.mjs --cfg <magpie 配置目录> --port 4390`。 |
-| 如何彻底停止/启动 | 停：插件管理里关掉（10 秒内退），或写 `state/control.json` 为 `{"desired":"off"}`（看板也有按钮）。启：插件管理里打开（下次宿主加载时拉起），或手动命令立刻拉起。 |
+| 「没有可参与任务的账号」 | 需要 magpie 里已登录的国内版 `workbuddy` **OAuth 个人账号**；API key、企业/团队、国际版都不参与。也可能是账号被「参与任务」开关停用。Docker 自定义安装时多半是配置目录不对：给守护进程设 `MAGPIE_CONFIG_DIR=/config/magpie` 后重启。看板「重新扫描」或 `POST /api/accounts` 可立即重扫 |
+| 「任务引擎不可用」/ `/api/run` 503 | `engine/*.mjs` 缺失或加载失败；补齐 `engine/` 后在插件管理里关/开一次 |
+| 触发风控限制（403 / 11140） | 账号级风控。引擎立即停手，账号进入 120 分钟冷却（`scheduler.holds` 可看解除时间），冷却中整轮跳过；绝不换号硬闯 |
+| 桌面端专属任务一直未完成 | `RichMeow_Chat` / `Buddy_App` / `Buddy_App_QQ` 上游只认真实桌面行为，插件不会伪造；看板只给深链 |
+| 排程到点没跑 / 跑错腿 | 先确认排程开关已启用；小时是**北京时间**；同一北京日同一窗口已触发过会跳过（`lastFired.json`）；有 job 在跑时让路。成长任务本来就不在排程里 |
+| 历史「触发」显示手动 | 旧版本写入的旧行不会自动回溯；修复后新产生的排程行显示「排程」。手动跑的行始终是「手动」 |
+| 积分显示「未查询」/ 刷新返回 409 | 守护进程会在空闲时拉取；批量任务运行中需要拉取会返回 409，等 job 结束再点「查询/刷新明细」。登录过期会带 `needRelogin:true`，重新登录 WorkBuddy 即可 |
+| 看板连不上 | 宿主懒加载 + 插件开关会重启宿主。用看板顶栏「启动命令」或手动 `node daemon.mjs --cfg <配置目录> --port 4390` |
+| 如何彻底停止 / 启动 | 停：插件管理里关掉（10 秒内退），或写 `state/control.json` `{"desired":"off"}`，或看板「停止守护进程」。启：插件管理里打开，或手动命令 |
+| magpie 跑在 Docker 里 | 配置目录通常是 `/config/magpie`；手动启动时在容器内执行，或确保挂载路径一致 |
+| Windows 路径 | 默认配置目录是 `%USERPROFILE%\.config\magpie`（不是 AppData）；路径含空格/反斜杠要加引号。chmod 600 在 Windows 上近似空操作 |
 
-## 目录速览
+## 目录与测试
 
+```text
+index.mjs        插件入口（5 个 MCP 工具、守护进程生命周期；不声明 provider）
+lifecycle.mjs    守护进程 spawn / 健康探测 / control.json / daemon.json
+daemon.mjs       常驻进程：HTTP 看板 + /api + SSE + 北京时间排程 + 任务调度
+engine/          任务引擎
+  store / accountio        读 plugin-auth.json、导入导出
+  upstream / identity      信封、重试、头族、全局节流
+  tasks / taskkind         成长任务流水线、任务 → kind 判定
+  travel / daily           猫猫旅行、夜猫子、每日活跃
+  runner / schedule        跨账号编排、北京时间窗口
+  credits                  积分余额与套餐明细（只读）
+  constants / fingerprint  上游常量、设备指纹
+dashboard/       看板前端（纯静态，无构建；API 免密钥）
+page/            magpie 沙箱入口卡
+tests/           引擎单元测试（fetch 全 mock）
+tests-shell/     守护进程外壳测试
+tests-e2e/       全链路集成测试（假上游 + 假时钟）
+docs/CONTRACT.md 内部契约（实现必须遵守的接口与红线）
 ```
-index.mjs      插件入口（五个工具、守护进程生命周期；不声明 provider）
-lifecycle.mjs  守护进程 spawn / 健康探测 / control.json / daemon.json 读写
-daemon.mjs     常驻进程：HTTP 看板 + /api + SSE + 小时排程 + 任务调度
-engine/        任务引擎（store 凭据读写 / upstream 信封与重试 / tasks 流水线 /
-               travel 旅行+夜猫 / runner 跨账号编排 / schedule 窗口 / constants 常量）
-dashboard/     本地看板前端（纯静态，无构建；API 免密钥）
-page/          magpie 窗口里的入口卡（沙箱页）
-tests/         引擎单元测试（node --test，fetch 全 mock，零真实网络）
-tests-shell/   守护进程外壳测试；tests-e2e/ 全链路集成测试（假上游 + 假时钟）
-docs/CONTRACT.md  内部契约（实现必须遵守的接口与红线）
+
+```bash
+node --test "tests/**/*.test.mjs" "tests-shell/*.test.mjs" "tests-e2e/*.test.mjs"
 ```
+
+当前 **303 个测试全绿**，全部零真实网络：上游由脚本化假 WorkBuddy 提供，时钟可注入；覆盖限速红线、风控冷却、任务勾选、北京时间排程、积分解析、导入导出、凭据回写等。
+
+## 来源与致谢
+
+- 任务流水线、账号 JSON 导入/导出、积分数据口径参考 [workbuddy2api-hub](https://github.com/ardeyouxipianyi/workbuddy2api-hub)。
+- 「资料库」web 点击点亮与每日活跃参考社区项目 [magpie-workbuddy-growth](https://github.com/connoryang331/magpie-workbuddy-growth)。
+- magpie 插件 API 与沙箱页规范来自 [usemagpie.ai](https://usemagpie.ai/docs/zh/plugins)；账号登录态由 `@magpie-community/opencode-workbuddy-auth` 提供。
+
+本项目与 WorkBuddy / 腾讯、magpie 官方均无隶属关系。
 
 ## 许可
 

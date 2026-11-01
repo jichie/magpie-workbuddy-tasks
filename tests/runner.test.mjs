@@ -78,6 +78,35 @@ test("runner：完整 job（两账号 × growth 腿），状态与结算", async
   assert.ok(bSteps[0].at - aSteps.at(-1).at >= 1500);
 });
 
+test("runner：job 顶层 trigger = 归一后的 spec.trigger（schedule|manual；非法值按 manual）", async () => {
+  const clock = fakeClock(DAY);
+  const backend = simpleBackend(clock);
+  const runner = new JobRunner({
+    accounts: twoAccounts(),
+    now: clock.now,
+    sleep: clock.sleep,
+    fetch: backend.fetchImpl,
+  });
+  // 排程口径（daemon.checkScheduler → startJob 传 trigger:"schedule"）
+  const scheduled = runner.start({ legs: ["growth"], trigger: "schedule" });
+  assert.equal(scheduled.trigger, "schedule", "顶层 trigger 直接可读（/api/jobs、看板不必钻 spec）");
+  assert.equal(scheduled.spec.trigger, "schedule");
+  assert.equal(scheduled.trigger, scheduled.spec.trigger, "顶层与 spec 永远一致（同一份归一值）");
+  await runner.wait(scheduled.id);
+
+  // 缺省 = manual（daemon 手动 /api/run 不传 trigger）
+  const manual = runner.start({ legs: ["growth"] });
+  assert.equal(manual.trigger, "manual");
+  assert.equal(manual.spec.trigger, "manual");
+  await runner.wait(manual.id);
+
+  // 非法值：normalizeSpec 兜底成 manual，绝不透出第三种拼写
+  const bogus = runner.start({ legs: ["growth"], trigger: "bogus" });
+  assert.equal(bogus.trigger, "manual");
+  assert.equal(bogus.spec.trigger, "manual");
+  await runner.wait(bogus.id);
+});
+
 test("runner：两个 start() → 第二个 409", async () => {
   const clock = fakeClock(DAY);
   const backend = simpleBackend(clock);
