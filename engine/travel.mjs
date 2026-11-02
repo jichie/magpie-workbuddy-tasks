@@ -140,6 +140,11 @@ export async function runCatTravel(acct, opts = {}) {
 
 // ---- 夜猫子任务（black_cat，23:00-08:00）----------------------------------------
 
+// 01:00 刚过日切时，上游任务列表可能还没把 black_cat 下发出来（生产实测两账号
+// 同时「未获取到夜猫子任务清单」）。先立即查一次，再按 5s/15s/30s 重试；总计
+// 约 50s，夜间没有其它 job。仍没有就如实跳过，不记失败。
+const NIGHT_DISCOVERY_DELAYS_MS = [0, 5000, 15000, 30000];
+
 // runNightTask(acct, opts) -> {ok, earnedCredit, logs, restricted?}
 // 每日 23:00-08:00 上报 1 次 GLM-5.2 夜间对话事件，每天计 1 次、累计 3 天后
 // 可领奖。白天调用会诚实跳过。
@@ -165,10 +170,21 @@ export async function runNightTask(acct, opts = {}) {
     };
   }
 
-  const tasks = await fetchTasks(acct, opts);
-  const t = tasks.find((x) => x.code === "black_cat") ?? null;
+  // black_cat 可能在日切后稍晚才出现在任务列表里；短暂重试，避免整晚误判失败。
+  let t = null;
+  for (let attempt = 0; attempt < NIGHT_DISCOVERY_DELAYS_MS.length; attempt++) {
+    if (attempt > 0) await ctx.breathe(NIGHT_DISCOVERY_DELAYS_MS[attempt]);
+    const tasks = await fetchTasks(acct, opts);
+    t = tasks.find((x) => x.code === "black_cat") ?? null;
+    if (t) break;
+    push(
+      `[${name}] 夜猫子任务清单未包含 black_cat（第 ${attempt + 1}/${NIGHT_DISCOVERY_DELAYS_MS.length} 次，` +
+      `本次清单 ${tasks.length} 项）`,
+    );
+  }
   if (!t) {
-    return { ok: false, earnedCredit: 0, logs: [`[${name}] 未获取到夜猫子任务清单`] };
+    push(`[${name}] 夜猫子任务今晚未下发，跳过（不是插件故障；可能活动已结束/今日已领/上游日切未完成）`);
+    return { ok: true, earnedCredit: 0, logs };
   }
   if (t.acceptStatus === "claimed") {
     return { ok: true, earnedCredit: 0, logs: [`[${name}] 夜猫子任务已领奖`] };

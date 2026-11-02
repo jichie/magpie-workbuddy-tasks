@@ -47,7 +47,16 @@ export async function fetchTasks(acct, opts = {}) {
   const ctx = ctxOf(opts);
   await ctx.breathe(); // 防风控：任何两次上游调用之间 ≥ gap
   const res = await callJSON(acct, "chat", chatUrl(opts) + "/v2/activity/growth/tasks", { method: "GET" }, opts);
-  if (!res.ok) return [];
+  if (!res.ok) {
+    // 以前这里静默返回 []，夜猫子 01:00 失败时只剩「未获取到清单」一句，分不清
+    // 是网络/信封失败还是列表里确实没有任务。记一行可读原因（不含 token）。
+    ctx.log?.(
+      `拉取任务清单失败：HTTP ${res.status ?? 0}` +
+      `${res.msg ? ` ${String(res.msg).slice(0, 160)}` : ""}` +
+      `${res.restricted ? " (restricted)" : ""}`,
+    );
+    return [];
+  }
   const rawTasks = res.data?.tasks ?? [];
   const tasks = [];
   for (const t of rawTasks) {

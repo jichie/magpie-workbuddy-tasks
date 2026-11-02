@@ -183,6 +183,9 @@ expertNameFromTitle(title) -> string           // 任务标题「」内的专家
 // travel.mjs
 runCatTravel(acct, opts) -> TravelResult
 runNightTask(acct, opts) -> NightResult       // black_cat，23:00–08:00（北京时间）
+                                              // 01:00 清单暂缺 black_cat 时按 5/15/30s
+                                              // 重试（共 4 次、约 50s）；仍没有 → ok:true +
+                                              // 日志「未下发，跳过」，不记失败、不领奖
 
 // runner.mjs
 class JobRunner {

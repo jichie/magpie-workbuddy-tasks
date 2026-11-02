@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { claimTask, buildEvent, reportEvents } from "../engine/tasks.mjs";
+import { claimTask, buildEvent, fetchTasks, reportEvents } from "../engine/tasks.mjs";
 import { runNightTask, runCatTravel } from "../engine/travel.mjs";
 import { fakeClock, localTime, makeAcct, task, wbBackend } from "./helpers.mjs";
 
@@ -159,6 +159,71 @@ test("夜猫子：已领奖 / 企业号 / 国际版", async () => {
   const intl = await runNightTask(makeAcct({ provider: "workbuddy-ai" }), { now: clock.now, sleep: clock.sleep, fetch: backend.fetchImpl });
   assert.equal(intl.ok, false);
 });
+
+test("夜猫子：清单暂缺 black_cat → 5s 重试后继续接取/上报", async () => {
+  const clock = fakeClock(NIGHT);
+  const backend = wbBackend({
+    clock,
+    tasks: [task("black_cat", { target: 3 })],
+    litRules: { chat_request_send: "black_cat" },
+  });
+  const realTasks = backend.state.tasks;
+  const black = realTasks.find((t) => t.task_code === "black_cat");
+  backend.state.tasks = realTasks.filter((t) => t !== black);
+  let firstList = true;
+  const fetchImpl = async (url, init) => {
+    const res = await backend.fetchImpl(url, init);
+    if (firstList && new URL(url).pathname === "/v2/activity/growth/tasks") {
+      firstList = false;
+      backend.state.tasks = realTasks; // 第二次起上游已下发 black_cat
+    }
+    return res;
+  };
+
+  const res = await runNightTask(makeAcct(), {
+    now: clock.now, sleep: clock.sleep, fetch: fetchImpl,
+  });
+  assert.equal(res.ok, true);
+  assert.match(res.logs.join("\n"), /第 1\/4 次/);
+  const lists = backend.calls.filter((c) => c.path === "/v2/activity/growth/tasks");
+  assert.ok(lists.length >= 2);
+  assert.ok(lists[1].at - lists[0].at >= 5000, "缺失后至少等 5s 再重试");
+  assert.equal(backend.state.acceptCalls, 1, "重试拿到任务后照常接取");
+  assert.ok(backend.state.reports.length >= 1, "照常上报夜间事件");
+});
+
+test("夜猫子：4 次重试都没有 black_cat → 如实跳过，不记失败", async () => {
+  const clock = fakeClock(NIGHT);
+  const backend = wbBackend({ clock, tasks: [] });
+  const res = await runNightTask(makeAcct(), {
+    now: clock.now, sleep: clock.sleep, fetch: backend.fetchImpl,
+  });
+  assert.equal(res.ok, true, "任务未下发不是失败");
+  assert.match(res.logs.join("\n"), /第 4\/4 次/);
+  assert.match(res.logs.join("\n"), /未下发，跳过/);
+  const lists = backend.calls.filter((c) => c.path === "/v2/activity/growth/tasks");
+  assert.equal(lists.length, 4, "共查 4 次");
+  assert.equal(backend.state.acceptCalls, 0);
+  assert.equal(backend.state.reports.length, 0);
+  assert.deepEqual(backend.state.claims, []);
+  assert.ok(lists[1].at - lists[0].at >= 5000);
+  assert.ok(lists[2].at - lists[1].at >= 15000);
+  assert.ok(lists[3].at - lists[2].at >= 30000);
+});
+
+test("fetchTasks：失败时日志带 HTTP 原因", async () => {
+  const clock = fakeClock(DAY);
+  const logs = [];
+  const fetchImpl = async () => ({ status: 500, text: async () => JSON.stringify({ code: 500, msg: "boom" }) });
+  const tasks = await fetchTasks(makeAcct(), {
+    now: clock.now, sleep: clock.sleep, fetch: fetchImpl,
+    log: (l) => typeof l === "string" && logs.push(l),
+  });
+  assert.deepEqual(tasks, []);
+  assert.match(logs.join("\n"), /拉取任务清单失败/);
+  assert.match(logs.join("\n"), /HTTP 500/);
+});
+
 
 test("猫猫旅行：arrived → 领奖 +20", async () => {
   const clock = fakeClock(DAY);
