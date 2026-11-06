@@ -212,3 +212,29 @@ test("新活动任务 spec（hub 937c179）：workstation_expert 钉死 Workspac
   assert.equal(s7.reward, 100);
   assert.equal(s7.name, "PC灵感功能");
 });
+
+test("Buddy_App 5 连：5 条 buddyapp_* 事件 + 桌面指纹（2026-11-06 实测口径）", () => {
+  const chain = evList("buddy5");
+  assert.deepEqual(chain.map((e) => e.eventCode), [
+    "buddyapp_discover_click",
+    "buddyapp_show",
+    "buddyapp_enter_click",
+    "buddyapp_auth_confirm_click",
+    "buddyapp_bindaccount_skip_click",
+  ]);
+  for (const e of chain) {
+    assert.equal(e.userId, "uid-X");
+    assert.equal(e.ideType, "WorkBuddy");
+    assert.equal(e.ideVersion, "5.5.6");
+    assert.equal(e.extName, "workbuddy-desktop");
+    assert.equal(e.timezone, "Asia/Shanghai");
+    assert.ok(e.machineId && e.sessionId, "桌面指纹必须带 machineId/sessionId");
+    if (["buddyapp_discover_click", "buddyapp_auth_confirm_click", "buddyapp_bindaccount_skip_click"].includes(e.eventCode)) {
+      assert.equal(e.buddyId, "cb_y5Dy46tPQGGWtueMxXbe");
+      assert.equal(e.buddyName, "企鹅教师助手");
+    }
+  }
+  assert.equal(chain[2].elementId, "growth_buddy");
+  assert.equal(chain[2].position, 2);
+  assert.equal(chain[2].isFirstPage, "1");
+});

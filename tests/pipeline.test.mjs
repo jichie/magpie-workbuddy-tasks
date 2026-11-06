@@ -154,6 +154,26 @@ test("流水线：选中的任务已领奖时不谎报全部完成", async () =>
   assert.ok(!logs.join("\n").includes("全部完成"), "没有新收益时不能谎报全部完成");
 });
 
+test("流水线：Buddy_App 5 连上报（桌面头）并领奖", async () => {
+  const clock = fakeClock(localTime(2026, 9, 15, 10, 0));
+  const backend = wbBackend({
+    clock,
+    tasks: [task("Buddy_App", { status: "accepted", current: 0, target: 1, reward: 100 })],
+    litRules: { buddyapp_enter_click: "Buddy_App" },
+  });
+  const res = await runGrowthTasks(makeAcct(), {
+    now: clock.now, sleep: clock.sleep, fetch: backend.fetchImpl,
+    log: () => {}, gap: GAP, codes: ["Buddy_App"],
+  });
+  assert.equal(res.ok, true);
+  assert.equal(res.earnedCredit, 100);
+  assert.ok(res.claimed >= 1);
+  const report = backend.calls.find((c) => c.path === "/v2/report");
+  assert.ok(report, "必须有 /v2/report");
+  assert.equal(report.body.length, 5, "Buddy_App 一次上报 5 条事件");
+  assert.equal(report.headers["User-Agent"], "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1");
+});
+
 test("流水线：任意两次上游调用间隔 ≥ 1000ms（假时钟断言）", async () => {
   const { backend, promise } = fullRun();
   await promise;

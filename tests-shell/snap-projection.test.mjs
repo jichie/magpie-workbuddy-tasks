@@ -97,7 +97,7 @@ describe("P0-2：snapTask 投影（真实形态 19 项）", () => {
       Library_read: { desktopOnly: false, unforgeable: false, reason: "", canAccept: false, canLight: true, pinnedExpertId: "" },
       Expert_lighthouse: { desktopOnly: false, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "ex_2cvvUZQhDyeJ" },
       Hp_Appearance: { desktopOnly: false, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "" },
-      Buddy_App: { desktopOnly: true, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "" },
+      Buddy_App: { desktopOnly: false, unforgeable: false, reason: "", canAccept: false, canLight: true, pinnedExpertId: "" },
       wb_wechat_oa_subscribe_task: { desktopOnly: false, unforgeable: true, reason: "需在微信关注「腾讯 WorkBuddy」公众号满 24 小时", canAccept: false, canLight: false, pinnedExpertId: "" },
       WorkBuddy_Valorant: { desktopOnly: false, unforgeable: false, reason: "", canAccept: true, canLight: false, pinnedExpertId: "ex_xQHHD1u5Jkua" },
       expert_use_maidehao: { desktopOnly: false, unforgeable: false, reason: "", canAccept: true, canLight: false, pinnedExpertId: "ex_GDl31WahyIH0" },
@@ -178,11 +178,10 @@ describe("P0-2：snapTask 投影（真实形态 19 项）", () => {
     assert.equal(byCode.get("first_buddy").canLight, true, "auto 任务 not_accepted 即可点亮")
     assert.equal(byCode.get("first_buddy").canAccept, false, "auto 任务永不给接取结论")
 
-    // desktopOnly 只剩 Buddy_App 一家：就算 not_accepted 也只能接、不能点亮
-    //（RichMeow 已移出 DESKTOP_ONLY：接取后可经 6 条桌面会话事件链点亮）
+    // desktop-only 只剩 Buddy_App_QQ（不在本 fixture）；Buddy_App 已实测 5 连可点亮
     const buddy = byCode.get("Buddy_App")
-    assert.equal(buddy.desktopOnly, true, "Buddy_App desktopOnly 与状态无关")
-    assert.equal(buddy.canLight, false, "Buddy_App 不可点亮（伪造事件不推进）")
+    assert.equal(buddy.desktopOnly, false, "Buddy_App 已移出 DESKTOP_ONLY")
+    assert.equal(buddy.canLight, true, "accepted 的 Buddy_App 可经 5 连点亮")
     const richmeow = byCode.get("RichMeow_Chat")
     assert.equal(richmeow.desktopOnly, false, "RichMeow 不再是 desktop-only（6 连事件链已实现）")
     // Library_read 已改走 web 点击事件点亮（引擎 reportLibraryEvent）：不再是

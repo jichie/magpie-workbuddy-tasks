@@ -123,8 +123,9 @@ export const TASK_SPECS = {
 // RichMeow_Chat（RichMeow）也已移出：hub 937c179 证实用 6 条桌面会话事件链
 //（agent_task_created → … → agent_task_completed）可以点亮，见 tasks.buildEvent
 // 的 kind:"richmeow" 分支。
+// Buddy_App 也已移出：connoryang 的 5 连（buddyapp_*）+ 桌面指纹在 2026-11-06
+// 本机实测可推进 0→1 并领奖；Buddy_App_QQ 先保留 desktop-only（同一链但未单独实测）。
 export const DESKTOP_ONLY_TASKS = {
-  Buddy_App: "在桌面端左上角「发现应用」进入任意一个 Buddy 应用",
   Buddy_App_QQ: "在桌面端「发现应用」进入「企鹅教师助手」",
 };
 

@@ -256,6 +256,34 @@ export async function reportLibraryEvent(acct, opts = {}) {
   return !!res.ok;
 }
 
+// reportBuddy5Events(acct, events, opts) -> boolean
+// Buddy 5 连的专用上报：桌面 UA/头族（connoryang 的 desktopHeaders 口径）。
+// 2026-11-06 实测：这 5 条事件 + 桌面指纹一次上报 → code 0、进度 0→1、可领奖。
+export async function reportBuddy5Events(acct, events, opts = {}) {
+  const ctx = ctxOf(opts);
+  await ctx.breathe();
+  const uid = String(acct?.uid ?? "");
+  const base = chatUrl(opts);
+  const list = Array.isArray(events) ? events : [events];
+  const res = await callJSON(
+    acct, "chat", base + "/v2/report",
+    {
+      method: "POST",
+      body: JSON.stringify(list),
+      headers: {
+        "Content-Type": "application/json;charset=UTF-8",
+        "User-Agent": "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1",
+        "X-Domain": base,
+        "X-Product": "SaaS",
+        "X-Request-ID": deriveId(uid, "req") + String(Math.floor(ctx.now()) % 1000000),
+        "X-User-Id": uid,
+      },
+    },
+    opts,
+  );
+  return !!res.ok;
+}
+
 // ---- 领奖 --------------------------------------------------------------------
 
 // claimTask(acct, code, opts) -> {ok, credit, energy, via, reason, restricted?}
@@ -341,6 +369,32 @@ export function buildEvent(acct, kind, idx = 0, expert = null, opts = {}) {
       conversationId: cid, requestId: rid,
       schedule: { type: "recurring", rrule: "FREQ=WEEKLY;BYDAY=FR;BYHOUR=9;BYMINUTE=0" },
       prompt: "每周五自动整理本周工作", userId: uid };
+  }
+  // Buddy 应用（Buddy_App / Buddy_App_QQ）：5 条桌面埋点链（connoryang
+  // magpie-workbuddy-growth 的 desktopBuddy5Sequence，2026-11-06 本机实测
+  // code 0、进度 0→1、领奖 +100）。事件体必须带桌面指纹（machineId/sessionId/
+  // ideVersion 等），并配合 reportBuddy5Events 的桌面头上报。
+  if (kind === "buddy5") {
+    const nick = acct.nickname || "";
+    const buddyId = "cb_y5Dy46tPQGGWtueMxXbe";
+    const buddyName = "企鹅教师助手";
+    const fp = {
+      timezone: "Asia/Shanghai", reportDelay: 2000, userId: uid,
+      username: nick, userNickname: nick, product: "SaaS",
+      releaseDate: 1789036585355, commit: "5f9692923c93033111c51ad7b003eb80204a9b75",
+      ideName: "WorkBuddy", ideType: "WorkBuddy", ideVersion: "5.5.6",
+      machineId: deriveId(uid, "machine"), sessionId: deriveId(uid, "session"),
+      extName: "workbuddy-desktop", extVersion: "5.5.6",
+      os: "win32", arch: "x64", osVersion: "10.0.26220", cpuCores: 20, memorySize: 24,
+      timestamp: now, presentAt: now,
+    };
+    return [
+      { ...fp, eventCode: "buddyapp_discover_click", mode: "LOCAL", buddyId, buddyName },
+      { ...fp, eventCode: "buddyapp_show", elementId: "growth_buddy", elementName: buddyName, position: 2 },
+      { ...fp, eventCode: "buddyapp_enter_click", elementId: "growth_buddy", elementName: buddyName, position: 2, isFirstPage: "1" },
+      { ...fp, eventCode: "buddyapp_auth_confirm_click", mode: "LOCAL", buddyId, buddyName },
+      { ...fp, eventCode: "buddyapp_bindaccount_skip_click", mode: "LOCAL", buddyId, buddyName },
+    ];
   }
   // RichMeow（RichMeow_Chat，桌面端发起 1 次对话）：hub 937c179 的 6 条
   // 桌面会话事件链，必须一次性上报整条链才会推进；字段逐字对齐 hub 的
@@ -527,10 +581,12 @@ export async function progressTask(acct, t, logs, opts = {}) {
         expert = [pid, pnm];
       }
       const ev = buildEvent(acct, kind, i, expert, { now: ctx.now });
-      // playbook 等事件链构造器返回数组：一次 report 带上整条链（cta_click +
-      // prompt_send），其余 kind 仍是单事件数组 —— 上游对两条都记进度。
+      // playbook / RichMeow / Buddy 连链构造器返回数组：一次 report 带上整条链；
+      // Buddy 5 连还要走专用桌面头（reportBuddy5Events），其余 kind 用通用 chat 上报。
       const list = Array.isArray(ev) ? ev : [ev];
-      ok = await reportEvents(acct, list, opts);
+      ok = kind === "buddy5"
+        ? await reportBuddy5Events(acct, list, opts)
+        : await reportEvents(acct, list, opts);
     }
     if (!ok) reportOk = false;
     if (i < need - 1) await ctx.breathe();

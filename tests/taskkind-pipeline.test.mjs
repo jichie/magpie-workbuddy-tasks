@@ -175,14 +175,15 @@ test("流水线：19 项真实形态 + 1 项未收录 —— 接取批次 codes 
     assert.equal(e.expertType, "agent");
     assert.ok(e.userId);
   }
-  // 未收录/unforgeable/claimed 的任务零上报；Library_read（accepted）改走 web
-  // 点击事件点亮（reportLibraryEvent），是 5 个专家事件之外唯一的一条 —— 详见
-  // tests/library-webclick.test.mjs 的逐字段断言。
+  // 未收录/unforgeable/claimed 的任务零上报；Library_read（accepted）走 web
+  // 点击事件；Buddy_App（accepted）走 5 条 buddyapp_* 桌面事件链。
   assert.equal(expertEvents.length, 5);
   const libEvents = backend.state.reports.filter((e) => e.eventCode === "web_element_click");
   assert.equal(libEvents.length, 1, "Library_read 恰好发一条 web 点击事件");
   assert.equal(libEvents[0].elementId, "library_doc_intro_click");
-  assert.equal(backend.state.reports.length, 6, "除 5 个专家事件 + 1 条资料库 web 点击外没有其它伪造事件");
+  const buddyEvents = backend.state.reports.filter((e) => String(e.eventCode).startsWith("buddyapp_"));
+  assert.equal(buddyEvents.length, 5, "Buddy_App 一次上报 5 条事件");
+  assert.equal(backend.state.reports.length, 11, "5 个专家 + 1 条资料库 + 5 条 Buddy 链");
   // Library_read 的事件打 web 域（www.workbuddy.cn/v2/report），不是 chat 域
   const libReportCall = backend.calls.find((c) => c.path === "/v2/report" && String(c.body?.[0]?.eventCode) === "web_element_click");
   assert.ok(libReportCall, "web 点击事件确有发出");

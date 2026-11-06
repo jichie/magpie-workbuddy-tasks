@@ -4,6 +4,7 @@
 
 - 仓库：<https://github.com/jichie/magpie-workbuddy-tasks>
 - 安装：`magpie plugin add github:jichie/magpie-workbuddy-tasks`
+- 当前版本：**0.3.1**（[更新日志](./CHANGELOG.md)）
 - 只服务国内版 `workbuddy` 账号；国际版 `workbuddy-ai` 不会出现在插件里。
 
 ## 快速开始
@@ -47,8 +48,9 @@
 | **只领奖** | 看板单账号「领取」/ `POST /api/task/claim` / 工具 `workbuddy_tasks_claim` | 领取单个已完成任务；批量运行时也会按 `claim:false` 只点亮不领奖 |
 | **任务级勾选** | 看板任务明细 / `POST /api/run` 的 `codes` / 工具 `codes` | 按账号勾选任务，批量操作只作用于选中的 code；未勾选 = 全部任务。选中但任务表里不存在的 code 会警告一次并跳过 |
 | **猫猫旅行** | 任务腿 `travel` | `arrived` 领奖 → `idle` 派出（先完成并领取 `first_buddy`）→ `traveling` 如实报告，一次推进一步 |
+| **桌面任务链** | 成长腿自动 | `RichMeow_Chat` 走 6 条桌面会话事件链、`Buddy_App` 走 5 条 `buddyapp_*` 事件、`Library_read` 走 web 点击；`Buddy_App_QQ` 仍按桌面端专属跳过 |
 | **Buddy 盲盒** | 任务腿 `buddy` | 用积累的**成长能量**开盲盒：`quota` 读出 `affordable`（还能开几个）与 `max_open_count`（单次上限），一次 `open` 批量开启 `min(affordable, max_open_count)` 个。**会消耗成长能量**；不领积分、不计入收益结算。能量不足时如实跳过（不发开盒请求）。腿顺序在 `travel` 之前：开出的 Buddy 可被随后的旅行使用 |
-| **微信小程序链式任务** | 成长腿内自动（`mpTasks:false` 可关）+ 快照/看板（0.3.0 起） | `Sequential_Tasks_1–6` + `school_season` 走**小程序埋点链路**（专属标头 + `WorkBuddy_MP` 事件指纹），接取/点亮/领奖一次完成；`codes` 勾选同样生效。**0.3.0 起进任务快照/看板**：快照刷新会在 web 清单之后用小程序头族再拉一份 MP 清单，只补充 web 清单里没有的 code（同一 code 以 web 为准）；单账号「接取 / 领取」对 MP code 自动改走小程序头族。注意 `workstation_expert`、`Sequential_Tasks_7` 等仍是 web 侧规格任务，等上游下发才出现 |
+| **微信小程序链式任务** | 成长腿内自动（`mpTasks:false` 可关）+ 快照/看板（0.3.1 起） | `Sequential_Tasks_1–6` + `school_season` 走**小程序埋点链路**（专属标头 + `WorkBuddy_MP` 事件指纹），接取/点亮/领奖一次完成；`codes` 勾选同样生效。**0.3.1 起进任务快照/看板**：快照刷新会在 web 清单之后用小程序头族再拉一份 MP 清单，只补充 web 清单里没有的 code（同一 code 以 web 为准）；单账号「接取 / 领取」对 MP code 自动改走小程序头族。注意 `workstation_expert`、`Sequential_Tasks_7` 等仍是 web 侧规格任务，等上游下发才出现 |
 | **夜猫子** | 任务腿 `night` | `black_cat` 只在**北京时间 23:00–08:00** 上报，白天诚实跳过；每天计 1 次、累计 3 天。01:00 清单暂缺 `black_cat` 时会按 5/15/30s 重试约 50s；仍没有就如实跳过（不记失败） |
 | **每日活跃** | 自动（每个 job 的每个账号开跑前） | 每个账号每个**北京日**往计费域上报一条 chat 事件，点亮成长中心连登。幂等账本 `state/daily-activity.json`，重启后同一天不重发；失败只记日志，不阻断任务 |
 | **积分余额与明细** | 看板积分列 / `GET /api/credits?uid=<uid>` | 只读查询国内版积分余额、每个套餐包的额度/已用/剩余/发放原因/到期时间，以及最早到期提示。看板有「明细」弹窗，可按状态筛选、搜索、排序、强制刷新 |
@@ -75,7 +77,7 @@
 
 - **自动签到**：社区插件 `@magpie-community/opencode-workbuddy-auth` 已有 `auth.checkin`（每个北京日一次）。本插件不声明 provider，也不实现 `auth.checkin`；看板只保留一个走计费接口的「每日签到」按钮（`POST /api/checkin`）供偶尔手动补用。
 - **连登管家 / 补签卡 / 抽奖 / 礼包兑换**：不做。本插件只通过「每日活跃」点亮成长中心连登；补签卡、7/14/28 天兑换、抽奖、礼包兑换一概不碰，也不消耗任何积分或道具。
-- **桌面端专属伪装**：`Buddy_App`、`Buddy_App_QQ` 上游只认真实桌面客户端行为，伪造事件不推进进度。看板只展示它们的深链，任务会停在未完成，这是正常的。`RichMeow_Chat`（RichMeow，桌面对话事件链）已不在此列：hub 937c179 证实**一次上报 6 条桌面会话事件链**（`agent_task_created → chat_message_send → chat_request_send → chat_message_response → chat_request_response → agent_task_completed`，timestamp 依次 +20）即可点亮，引擎已实现（`buildEvent` 的 `richmeow` 分支）。
+- **桌面端专属伪装**：只剩 `Buddy_App_QQ` 仍按真实桌面行为处理（看板只给深链，任务停在未完成）。`RichMeow_Chat`（RichMeow）已用 **6 条桌面会话事件链**点亮；`Buddy_App` 已用 **5 条 `buddyapp_*` 事件 + 桌面指纹**实测通过（2026-11-06：进度 0→1、领奖 +100）；`Library_read` 走 web 点击事件。三者都已从 `DESKTOP_ONLY_TASKS` 移出。
 - **无法自动化的任务**：`wb_wechat_oa_subscribe_task`（需关注公众号满 24 小时）、`Expert_Philanthropy`（真实捐款）不接取、不上报、不领奖。
 - **国际版**：`workbuddy-ai` 不进账号列表、不进快照/统计、不参与任务、默认不导出；`/api/state` 只给一个 `intlSkipped:{count,note}` 计数说明去向。
 - **不服务对话模型、不声明 provider**：没有 `auth`/`config` 钩子，magpie 的「供应商」列表里不会出现本插件，也就没有「未登录」卡和登录按钮。`workbuddy` / `workbuddy-ai` 两个 provider id 始终归社区插件，对话链路不动。
@@ -241,7 +243,7 @@ magpie plugin add /path/to/magpie-workbuddy-tasks
 | 「没有可参与任务的账号」 | 需要 magpie 里已登录的国内版 `workbuddy` **OAuth 个人账号**；API key、企业/团队、国际版都不参与。也可能是账号被「参与任务」开关停用。Docker 自定义安装时多半是配置目录不对：给守护进程设 `MAGPIE_CONFIG_DIR=/config/magpie` 后重启。看板「重新扫描」或 `POST /api/accounts` 可立即重扫 |
 | 「任务引擎不可用」/ `/api/run` 503 | `engine/*.mjs` 缺失或加载失败；补齐 `engine/` 后在插件管理里关/开一次 |
 | 触发风控限制（403 / 11140） | 账号级风控。引擎立即停手，账号进入 120 分钟冷却（`scheduler.holds` 可看解除时间），冷却中整轮跳过；绝不换号硬闯 |
-| 桌面端专属任务一直未完成 | `Buddy_App` / `Buddy_App_QQ` 上游只认真实桌面行为，插件不会伪造；看板只给深链。`RichMeow_Chat`（RichMeow）已可自动点亮（6 条桌面会话事件链） |
+| 桌面端专属任务一直未完成 | 目前只剩 `Buddy_App_QQ` 仍按真实桌面行为处理，看板只给深链。`Buddy_App`（5 连）、`RichMeow_Chat`（RichMeow 6 连）和 `Library_read`（web 点击）已可自动点亮 |
 | 排程到点没跑 / 跑错腿 | 先确认排程开关已启用；小时是**北京时间**；同一北京日同一窗口已触发过会跳过（`lastFired.json`）；有 job 在跑时让路。成长任务本来就不在排程里 |
 | 夜猫子显示「未下发，跳过」 | 上游当晚没有下发 `black_cat`（活动已结束、今日已领或日切未完成）。01:00 会先重试 4 次约 50s；仍没有就按跳过处理，不是插件故障 |
 | 小程序任务接取失败：`task locked until …` | 小程序链式任务按天解锁：完成前一个任务后，下一个任务次日才可接。日志会显示锁定日期，到日期再跑即可 |
@@ -279,7 +281,15 @@ docs/CONTRACT.md 内部契约（实现必须遵守的接口与红线）
 node --test "tests/**/*.test.mjs" "tests-shell/*.test.mjs" "tests-e2e/*.test.mjs"
 ```
 
-当前 **341 个测试全绿**，全部零真实网络：上游由脚本化假 WorkBuddy 提供，时钟可注入；覆盖限速红线、风控冷却、任务勾选、北京时间排程、Buddy 盲盒、小程序链式任务、积分解析、导入导出、凭据回写等。
+当前 **343 个测试全绿**，全部零真实网络：上游由脚本化假 WorkBuddy 提供，时钟可注入；覆盖限速红线、风控冷却、任务勾选、北京时间排程、Buddy 盲盒、小程序链式任务、积分解析、导入导出、凭据回写等。
+
+## 更新日志
+
+完整记录见 [CHANGELOG.md](./CHANGELOG.md)。最近的版本：
+
+- **0.3.1**（2026-11-06）：`Buddy_App` 5 连自动化；小程序任务进快照/看板、可勾选/接取/领奖；接取失败原因与「没有新收益」文案修正。
+- **0.3.0**（2026-11-06）：Buddy 盲盒独立腿；小程序链式任务执行；RichMeow 6 连；playbook 双事件与新任务规格。
+- **0.2.0**（2026-11-01）：积分余额/套餐明细；每日活跃连登；任务级勾选；北京时间排程。
 
 ## 来源与致谢
 

@@ -351,10 +351,11 @@ GET  /api/state                 -> {serveUrl, bindHost, port, reachableHint,
                                     // 前端据此渲染，不要再用 jumpUrl 非空猜「需桌面端完成」——
                                     // 真实数据 19 项全部有非空 jumpUrl）：
                                     //   desktopOnly —— DESKTOP_ONLY_TASKS 命中
-                                    //     （Buddy_App/Buddy_App_QQ 这类伪造事件不推进、
+                                    //     （目前只剩 Buddy_App_QQ 这类伪造事件不推进、
                                     //     领奖必 400 的；Library_read 已改走 web 点击
-                                    //     事件点亮、RichMeow_Chat（RichMeow）已改走
-                                    //     6 条桌面会话事件链点亮，均**不在**此列），
+                                    //     事件、RichMeow 已改走 6 条桌面会话事件链、
+                                    //     Buddy_App 已改走 5 条 buddyapp_* 桌面事件链，
+                                    //     均**不在**此列），
                                     //     与 jumpUrl 形状无关
                                     //   unforgeable / reason —— 已有语义沿用（spec.unforgeable；
                                     //     未收录任务也是 unforgeable:true + reason:"未收录任务"）
@@ -598,8 +599,10 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
   `redemption_status` 同层；data 顶层没有 days/streakDays 键）。连登为 0 是真实值
   （`streak.days` 与 `month_total_days` 是两个字段，前者才是连登天数）。
   daemon 快照读同一路径，不做多拼写回退链。
-- DESKTOP_ONLY 任务（`Buddy_App`/`Buddy_App_QQ`）与 `unforgeable`
+- DESKTOP_ONLY 任务（目前只剩 `Buddy_App_QQ`）与 `unforgeable`
   （`wb_wechat_oa_subscribe_task`/`Expert_Philanthropy`）不上报、接不上，只展示 `jump_url`。
+  **`Buddy_App` 不在此列**（2026-11-06 实测）：5 条 `buddyapp_*` 事件 + 桌面指纹一次上报，
+  进度 0→1 并领奖 +100，见 `buildEvent` 的 `kind:"buddy5"` 与 `reportBuddy5Events`。
   **`Library_read` 不在此列**（2026-11 修正）：它由 web 端的一次元素点击事件点亮 ——
   `engine/tasks.reportLibraryEvent` 向 **web 域** `webBase()/v2/report` 发一条
   `web_element_click`（数组包一层），字段逐字为：
@@ -694,9 +697,10 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
 - 资料库（Library_read）：reportLibraryEvent 的事件字段/头逐字断言（web 域、
   Referer/UA/X-User-Id 覆盖、Authorization 保留）；callJSON 的 init.headers 合并
   —— 大小写敏感覆盖、Authorization 不可被覆盖（精确大小写与小写两种写法都剥掉）；
-  流水线 0/1 → web 点击 → 进度 0→1 → 领奖；desktopOnly 投影只剩 Buddy_App/Buddy_App_QQ
-  两条，Library_read desktopOnly=false、accepted 可点亮，RichMeow desktopOnly=false、
-  接取后可点亮（6 连）；
+  流水线 0/1 → web 点击 → 进度 0→1 → 领奖；desktopOnly 投影只剩 Buddy_App_QQ
+  一条，Library_read desktopOnly=false、accepted 可点亮，RichMeow desktopOnly=false、
+  接取后可点亮（6 连），Buddy_App desktopOnly=false、accepted 可点亮（5 连、
+  专用桌面头上报）；
 - RichMeow（RichMeow_Chat，kind:"richmeow"）：buildEvent 恰好 6 条链事件、
   顺序与 timestamp（+20 步进）钉死；整条链**一次 report** 发完；流水线里
   agent_task_completed 推进进度 → 领奖成功；snapTask 投影接取后 canLight=true；

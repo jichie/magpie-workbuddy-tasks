@@ -181,10 +181,13 @@ test("resolveTaskKind：canAccept/canLight 状态矩阵（六类任务 × 四种
       assert.equal(rk.canLight, grid[i][1], `${label} @ ${status} canLight`);
     });
   }
-  // desktopOnly 标记本身与状态无关：只剩 Buddy 两兄弟
-  //（Library_read 已改走 web 点击、RichMeow 已改走 6 条桌面会话事件链）
-  assert.equal(resolveTaskKind({ code: "Buddy_App", jumpUrl: "workbuddy://home" }).desktopOnly, true);
+  // desktopOnly 标记本身与状态无关：只剩 Buddy_App_QQ 一家
+  //（Buddy_App 已用 5 连桌面埋点实测打通；Library_read/RichMeow 也已移出）
+  assert.equal(resolveTaskKind({ code: "Buddy_App", jumpUrl: "workbuddy://home" }).desktopOnly, false);
   assert.equal(resolveTaskKind({ code: "Buddy_App_QQ", jumpUrl: "workbuddy://home" }).desktopOnly, true);
+  const buddy = resolveTaskKind({ code: "Buddy_App", jumpUrl: "", acceptStatus: "accepted", taskType: "single" });
+  assert.equal(buddy.kind, "buddy5");
+  assert.equal(buddy.canLight, true, "Buddy_App 5 连已可点亮");
   assert.equal(resolveTaskKind({ code: "RichMeow_Chat", jumpUrl: "" }).desktopOnly, false);
   const rich = resolveTaskKind({ code: "RichMeow_Chat", jumpUrl: "", acceptStatus: "accepted", taskType: "single" });
   assert.equal(rich.kind, "richmeow");
