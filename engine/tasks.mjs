@@ -25,6 +25,7 @@ import {
 } from "./constants.mjs";
 import { deriveId } from "./fingerprint.mjs";
 import { defaultNow } from "./identity.mjs";
+import { MP_TASK_CODES, runMiniProgramTasks } from "./miniprogram.mjs"; // 小程序链式任务（CONTRACT §7）
 import { resolveTaskKind } from "./taskkind.mjs"; // 任务 → kind 解析（CONTRACT §2/§7，唯一判断源）
 import { runCatTravel } from "./travel.mjs"; // 循环引用（travel 需要 tasks 的流水线件）；ESM 函数声明提升下安全
 import {
@@ -295,6 +296,8 @@ export async function claimTask(acct, code, opts = {}) {
 //
 // expert: [expert_id, expert_name] —— 专家/团队类事件必须每次使用不同的 id，
 // 上游按 (eventCode, id) 去重，重复 id 不会推进任务进度。
+// 多数 kind 返回单个事件对象；playbook 返回**双事件数组**（cta_click + prompt_send），
+// progressTask 对数组与单事件都能处理（见下）。
 export function buildEvent(acct, kind, idx = 0, expert = null, opts = {}) {
   const now = Math.floor(opts.now ? opts.now() : defaultNow());
   const cid = `wb-task-${now}-${idx}`;
@@ -339,11 +342,60 @@ export function buildEvent(acct, kind, idx = 0, expert = null, opts = {}) {
       schedule: { type: "recurring", rrule: "FREQ=WEEKLY;BYDAY=FR;BYHOUR=9;BYMINUTE=0" },
       prompt: "每周五自动整理本周工作", userId: uid };
   }
+  // RichMeow（RichMeow_Chat，桌面端发起 1 次对话）：hub 937c179 的 6 条
+  // 桌面会话事件链，必须一次性上报整条链才会推进；字段逐字对齐 hub 的
+  // build_desktop_chat_events（timestamp 依次 +20/+40/+60/+80/+100）。
+  if (kind === "richmeow") {
+    const nick = acct.nickname || "";
+    const mid = `msg-${now}-${idx}`;
+    const base = { userId: uid, userNickname: nick };
+    return [
+      { ...base, eventCode: "agent_task_created", timestamp: now,
+        source: "LOCAL", name: "working", task_target: "local", mode: "craft",
+        requestModelId: "fast-model", requestModelName: "fast-model",
+        has_repo: false, repo_type: "none", workspace_type: "empty",
+        has_connector: false, connector_types: [], has_mention: false, mention_types: [],
+        has_template: false, action: "", template_name: "", has_expert: false,
+        expert_id: "", expert_name: "", expert_industry_id: "", has_skill: false,
+        skill_names: [], conversationId: cid, messageId: mid, buddyId: "", buddyName: "" },
+      { ...base, eventCode: "chat_message_send", timestamp: now + 20,
+        messageId: mid + "-ast", historyCount: 0, isContextTruncated: false,
+        currentStepCount: 1, traceId: rid, rootRequestId: rid, parentConversationId: cid,
+        agentName: "cli", agentType: "main" },
+      { ...base, eventCode: "chat_request_send", timestamp: now + 40,
+        inputLength: 24, isPlan: false, isAutoExecuteTerminal: false, isAutoModify: false,
+        codebaseEnable: false, maxToken: 0, maxSteps: 500, temperature: 0, maxRetries: 0,
+        mentionContexts: [], knowledgeId: [], knowledgeName: [], codebaseId: "",
+        mentionContextCount: 0, command: "", recommendId: "", skillId: "", skillCount: 0,
+        totalCount: 0, traceId: rid, rootRequestId: rid, parentConversationId: cid,
+        conversationId: cid, messageId: mid, agentName: "cli", agentType: "main" },
+      { ...base, eventCode: "chat_message_response", timestamp: now + 60,
+        messageId: mid + "-resp", conversationId: cid, requestId: rid, agentName: "cli" },
+      { ...base, eventCode: "chat_request_response", timestamp: now + 80,
+        conversationId: cid, requestId: rid, requestModelId: "fast-model",
+        requestModelName: "fast-model", toolCallCount: 0, inputToken: 6, outputToken: 12,
+        duration: 50, agentName: "cli" },
+      { ...base, eventCode: "agent_task_completed", timestamp: now + 100,
+        conversationId: cid, messageId: mid, status: "success" },
+    ];
+  }
+  // playbook（灵感案例）是**双事件链**（hub 937c179，2026-11 实测口径）：先
+  // cta_click（点开「打工人小账本」文档卡片）再 prompt_send（发送提示词），两个
+  // 事件一起上报才推进进度。返回数组，progressTask 会展开成一次 report 发两条。
   if (kind === "playbook") {
-    return { eventCode: "playbook_prompt_send", timestamp: now, reportDelay: 0,
-      id: "worker-ledger-freedom-dashboard", name: "打工人小账本",
-      type: "other", promptLength: 10, isOfficial: 1,
-      source: "discover", conversationId: cid, requestId: rid, userId: uid };
+    return [
+      { eventCode: "playbook_cta_click", timestamp: now, reportDelay: 0,
+        id: "worker-ledger-freedom-dashboard", name: "打工人小账本",
+        type: "document", categoryId: "", categoryName: "",
+        source: "discover", position: 0, conversationId: cid,
+        requestId: rid, messageId: rid, userId: uid },
+      { eventCode: "playbook_prompt_send", timestamp: now + 50, reportDelay: 0,
+        id: "worker-ledger-freedom-dashboard", name: "打工人小账本",
+        type: "document", categoryId: "", categoryName: "",
+        promptLength: 30, isOfficial: 1, source: "discover",
+        conversationId: cid, requestId: rid, messageId: rid,
+        skills: "", skillNames: "", userId: uid },
+    ];
   }
   if (kind === "skin") {
     return { eventCode: "appearance_skin_apply", timestamp: now, reportDelay: 0,
@@ -374,6 +426,15 @@ export async function progressTask(acct, t, logs, opts = {}) {
   const rk = resolveTaskKind(t);
   const spec = rk.spec;
   const name = spec?.name || t.title || code;
+
+  // 小程序链式任务（0.3.0 起会经快照进看板，但执行链路在 miniprogram 模块）：
+  // 绝不走 web 的事件构造/上报/领奖 —— buildEvent 没有 "mp" 分支，硬闯只会发出
+  // heartbeat 或错误头族。防御性跳过：正常 web 清单不会出现 MP-only 任务，万一
+  // 出现（上游串台），这里兜底，runGrowthTasks 2b 的小程序链路会用正确的头族处理。
+  if (rk.kind === "mp") {
+    logs.push(`⏭ 任务 [${name}] 小程序任务由小程序链路处理, 跳过 web 事件构造`);
+    return { credit: 0, energy: 0, lit: 0, claimed: 0 };
+  }
 
   // 未收录任务（TASK_SPECS 没有、jump_url 也派生不出专家 id）：引擎没有任何
   // 合法的事件构造方式 —— 不接取、不上报、不领奖，诚实标注（P0-1）。
@@ -466,7 +527,10 @@ export async function progressTask(acct, t, logs, opts = {}) {
         expert = [pid, pnm];
       }
       const ev = buildEvent(acct, kind, i, expert, { now: ctx.now });
-      ok = await reportEvents(acct, [ev], opts);
+      // playbook 等事件链构造器返回数组：一次 report 带上整条链（cta_click +
+      // prompt_send），其余 kind 仍是单事件数组 —— 上游对两条都记进度。
+      const list = Array.isArray(ev) ? ev : [ev];
+      ok = await reportEvents(acct, list, opts);
     }
     if (!ok) reportOk = false;
     if (i < need - 1) await ctx.breathe();
@@ -531,11 +595,13 @@ function selectedCodeSet(codes) {
 }
 
 // runGrowthTasks(acct, opts) -> GrowsResult
-// opts: {gap=1000, claim=true, codes?: string[], log(fn), sleep(fn), now(fn), fetch, signal}
+// opts: {gap=1000, claim=true, codes?: string[], mpTasks?: boolean, log(fn), sleep(fn), now(fn), fetch, signal}
 //   opts.codes —— 任务级勾选：非空数组时只对选中的任务接取/点亮/领奖；未选中
 //   的任务完全不动作（不接取、不上报、不轮询、不领奖）。每次 fetchTasks 之后
-//   都按选中集合过滤；选中但任务表里没有的 code 记一次警告并跳过，绝不硬闯。
+//   都按选中集合过滤；选中但任务表里没有的 code 记一次警告并跳过，绝不硬闯
+//  （MP 专属任务除外——它们由小程序链路处理，见 engine/miniprogram.mjs）。
 //   空数组/未传 = 全部任务（旧行为）。
+//   opts.mpTasks —— 显式 false 关闭 2b 的小程序链式任务（缺省开启）。
 // GrowsResult: {ok, logs, earnedCredit, credit, energy, lit, claimed, restricted?}
 export async function runGrowthTasks(acct, opts = {}) {
   const ctx = makeCtx(opts);
@@ -579,7 +645,9 @@ export async function runGrowthTasks(acct, opts = {}) {
   const scope = (list) => (selected ? list.filter((t) => selected.has(t.code)) : list);
   if (selected) {
     emit(`仅处理选中的 ${selected.size} 项任务`);
-    const missing = [...selected].filter((c) => !tasks.some((t) => t.code === c));
+    // 缺失警告只对 web 任务表校验：MP 专属任务（Sequential_Tasks_1–6 +
+    // school_season）永远不出现在 web 清单里，由 2b 的小程序链路处理，不误报。
+    const missing = [...selected].filter((c) => !tasks.some((t) => t.code === c) && !MP_TASK_CODES.has(c));
     if (missing.length) {
       emit(
         `! 选中的 ${missing.length} 项任务不在任务表中，本轮跳过: ${missing.slice(0, 5).join(", ")}` +
@@ -661,6 +729,26 @@ export async function runGrowthTasks(acct, opts = {}) {
     }
   }
 
+  // 2b. 微信小程序链式任务（Sequential_Tasks_1–6 + school_season，CONTRACT §7）：
+  //     独立的小程序埋点链路（MP_HEADERS / mpBase / MP_REPORT_HEADERS），在普通
+  //     任务处理完、猫猫旅行之前执行；日志与收益并入本腿。opts.mpTasks === false
+  //     可整体关闭；opts.codes 勾选时只处理选中的 MP 交集（交集为空则一次上游
+  //     都不发）。异常只记日志，绝不中断后面的旅行与结算。
+  if (opts.mpTasks !== false) {
+    try {
+      const mp = await runMiniProgramTasks(acct, run);
+      totals.credit += mp.earnedCredit || 0;
+      totals.lit += mp.lit || 0;
+      totals.claimed += mp.claimed || 0;
+      for (const line of mp.logs ?? []) emit(line);
+      if (mp.restricted) {
+        return { ok: false, restricted: true, logs, earnedCredit: totals.credit, ...totals };
+      }
+    } catch (err) {
+      emit(`! 小程序成长任务执行异常: ${String(err?.message || err).slice(0, 160)}`);
+    }
+  }
+
   // 3. 顺手检查猫猫旅行
   const trRes = await runCatTravel(acct, run);
   if (trRes.msg) {
@@ -673,7 +761,12 @@ export async function runGrowthTasks(acct, opts = {}) {
 
   // 4. 结算（hub 会顺带刷新积分余额，这里以能量余额回显代之）
   const energy = await fetchEnergy(acct, run);
-  emit(`🎉 全部完成！本次累计新增到账: +${totals.credit} 积分（当前能量 ${energy}）`);
+  const acted = totals.lit + totals.claimed;
+  if (totals.credit > 0 || acted > 0) {
+    emit(`🎉 本轮结束：新增到账 +${totals.credit} 积分（点亮 ${totals.lit}、领取 ${totals.claimed}；当前能量 ${energy}）`);
+  } else {
+    emit(`本轮结束：没有新的收益（+0 积分；选中的任务可能已领奖、未接取或当前不可做；当前能量 ${energy}）`);
+  }
   return { ok: true, logs, earnedCredit: totals.credit, ...totals };
 }
 

@@ -39,7 +39,7 @@ import {
   writeControl,
 } from "./lifecycle.mjs"
 
-const VERSION = "0.2.0"
+const VERSION = "0.3.0"
 const TOOL_PREFIX = "workbuddy_tasks" // 契约 §6 的工具名前缀（magpie 还会加上插件短名前缀）
 
 // 本文件自己的目录（daemon.mjs 与它同目录）
@@ -129,7 +129,7 @@ function fmtJob(j) {
   lines.push(`结算：+${t.credit ?? 0} 积分 · +${t.energy ?? 0} 能量 · 点亮 ${t.tasksLit ?? 0} · 领取 ${t.tasksClaimed ?? 0}`)
   for (const s of steps.slice(-20)) {
     const name = s.nickname || s.uid
-    const leg = s.leg === "growth" ? "成长" : s.leg === "travel" ? "旅行" : s.leg === "night" ? "夜猫" : s.leg
+    const leg = s.leg === "growth" ? "成长" : s.leg === "buddy" ? "盲盒" : s.leg === "travel" ? "旅行" : s.leg === "night" ? "夜猫" : s.leg
     lines.push(`  ${s.state === "ok" ? "✓" : s.state === "fail" ? "✗" : s.state === "skip" ? "－" : "…"} ${name} ${leg}：${s.detail || s.state}${s.credit ? `（+${s.credit} 积分${s.energy ? ` +${s.energy} 能量` : ""}）` : ""}`)
   }
   if (steps.length > 20) lines.push(`  … 其余 ${steps.length - 20} 步略`)
@@ -251,10 +251,10 @@ export const WorkBuddyTasksPlugin = async (input, options) => {
         // 启动批量任务：立即返回 job id，不等待（55 s 装不下一轮批量）
         [`${TOOL_PREFIX}_run`]: runTool({
           description:
-            "启动一轮 WorkBuddy 任务（成长任务/猫猫旅行/夜猫子），立即返回 job id，不等待完成。用 workbuddy_tasks_wait 轮询进度。同一时刻只能跑一个批量任务。可用 codes 只勾选部分成长任务。",
+            "启动一轮 WorkBuddy 任务（成长任务/Buddy 盲盒/猫猫旅行/夜猫子），立即返回 job id，不等待完成。用 workbuddy_tasks_wait 轮询进度。同一时刻只能跑一个批量任务。可用 codes 只勾选部分成长任务。",
           args: {
             uids: optArr().describe("要跑的账号 uid 列表；不填 = 全部可参与账号"),
-            legs: optArr().describe("任务腿：growth（成长）、travel（猫猫旅行）、night（夜猫子）；不填 = 设置里的默认"),
+            legs: optArr().describe("任务腿：growth（成长）、buddy（Buddy 盲盒，消耗成长能量）、travel（猫猫旅行）、night（夜猫子）；不填 = 设置里的默认"),
             claim: optBool().describe("完成后自动领奖，默认跟随设置"),
             codes: optArr().describe(
               "任务 code 列表（workbuddy_tasks_list 里可以看到）；growth 腿只对这些任务接取/点亮/领奖，对所有选中账号生效；不填 = 全部任务",

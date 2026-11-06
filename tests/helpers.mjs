@@ -53,6 +53,12 @@ function cloneTask(t) {
 // - chatClaimAlways400: chat 域领奖永远 400（测 web 回退）；
 // - restrictedUids: 这些 uid 一律 403/code 11140；
 // - refreshTokens: 刷新路由按序吐 {accessToken, ...}。
+// - buddyQuota: {affordable, max_open_count}（Buddy 盲盒配额，缺省 affordable 0）；
+//   buddyOpenResponse: 开盒响应信封（缺省 code 0 + data.buddies）；buddyOpens
+//   记录每次开盒请求体。
+// - mpOnly: 这批 task_code 只出现在小程序标头的清单里（X-Client-Platform:
+//   miniprogram 的 GET /v2/activity/growth/tasks 只回它们；web 清单不回）——
+//   模拟真实环境「web 清单与 MP 清单是两份」的口径。
 export function wbBackend(opts = {}) {
   const clock = opts.clock;
   const calls = [];
@@ -70,6 +76,10 @@ export function wbBackend(opts = {}) {
     restrictedUids: new Set(opts.restrictedUids ?? []),
     refreshTokens: [...(opts.refreshTokens ?? [])],
     webClaims: 0,
+    buddyQuota: opts.buddyQuota ?? { affordable: 0, max_open_count: 1 },
+    buddyOpenResponse: opts.buddyOpenResponse ?? { code: 0, data: { buddies: ["布丁猫"] } },
+    buddyOpens: [],
+    mpOnly: new Set(opts.mpOnly ?? []),
   };
   const find = (code) => state.tasks.find((t) => t.task_code === code);
   const respond = (status, body) => ({ status, text: async () => JSON.stringify(body) });
@@ -100,17 +110,21 @@ export function wbBackend(opts = {}) {
     }
 
     if (u.pathname === "/v2/activity/growth/tasks") {
-      const tasks = state.tasks.map((t) => ({
-        task_code: t.task_code,
-        title: t.title,
-        description: t.description,
-        jump_url: t.jump_url,
-        accept_status: t.accept_status,
-        task_type: t.task_type,
-        progress: { current: t.current, target: t.target },
-        reward_credit: t.reward_credit,
-        reward_energy: t.reward_energy,
-      }));
+      // mpOnly：小程序标头的清单只回 MP 任务，web 清单不含它们（真实两份清单口径）
+      const isMPFetch = headers["X-Client-Platform"] === "miniprogram";
+      const tasks = state.tasks
+        .filter((t) => (isMPFetch ? state.mpOnly.has(t.task_code) : !state.mpOnly.has(t.task_code)))
+        .map((t) => ({
+          task_code: t.task_code,
+          title: t.title,
+          description: t.description,
+          jump_url: t.jump_url,
+          accept_status: t.accept_status,
+          task_type: t.task_type,
+          progress: { current: t.current, target: t.target },
+          reward_credit: t.reward_credit,
+          reward_energy: t.reward_energy,
+        }));
       return respond(200, { code: 0, data: { tasks } });
     }
 
@@ -170,6 +184,18 @@ export function wbBackend(opts = {}) {
 
     if (u.pathname === "/v2/activity/growth/energy") {
       return respond(200, { code: 0, data: { balance: 42 } });
+    }
+
+    if (u.pathname === "/v2/activity/growth/buddy/quota") {
+      return respond(200, {
+        code: 0,
+        data: { affordable: state.buddyQuota.affordable, max_open_count: state.buddyQuota.max_open_count },
+      });
+    }
+
+    if (u.pathname === "/v2/activity/growth/buddy/open") {
+      state.buddyOpens.push(body);
+      return respond(200, state.buddyOpenResponse);
     }
 
     if (u.pathname === "/activity/growth/buddy/travel/status") {

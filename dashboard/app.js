@@ -55,7 +55,7 @@ const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
 // ---- 文案映射（领域词汇对齐 daemon/engine 与 CONTRACT） -----------------------
 
-const LEG_NAMES = { growth: "成长任务", travel: "猫猫旅行", night: "夜猫子" };
+const LEG_NAMES = { growth: "成长任务", buddy: "Buddy 盲盒", travel: "猫猫旅行", night: "夜猫子" };
 const ACCEPT_NAMES = {
   not_accepted: "未接取",
   accepted: "已接取",
@@ -589,6 +589,15 @@ export function taskFlags(t) {
   };
 }
 
+// 微信小程序任务识别（纯展示：只决定任务行「小程序」徽章，不参与勾选 / 接取 / 领奖门控）。
+// MP 专属任务码口径与 engine/miniprogram.mjs 的 isMPCode 一致：Sequential_Tasks_ 前缀，
+// 或校园日 school_season。后端把 MP-only 任务并入快照后，前端据此标注执行通道。
+// 导出仅为 Node 下单元验证；浏览器里 <script type="module"> 不受影响。
+export function isMPTask(t) {
+  const code = String(t?.code ?? "");
+  return code === "school_season" || code.startsWith("Sequential_Tasks_");
+}
+
 // 领奖门控（维持既有口径）：acceptStatus==="completed"，或进度已达标（current>=target>0）。
 // 已领奖（claimed）的不再给按钮 —— 真实快照里 11 项 claimed 都是 1/1，不排除会长出
 // 11 个必然失败的按钮。缺码时不给按钮（无从 POST）。
@@ -692,7 +701,7 @@ async function claimOne(uid, code, btn) {
 // ---- 任务级勾选（只收窄批量操作，不影响单任务「接取 / 领奖」按钮） -----------------
 // state.taskSel = { [uid]: Set(code) }：按账号保存勾选的任务码，只存在内存里。
 // · 跨 renderAll()/快照刷新保留；某账号的集合清空时删掉该键（不勾选 = 全部任务）。
-// · 无 code 的行不可勾选（无从提交）；勾选不影响 travel / night 腿（它们没有任务码）。
+// · 无 code 的行不可勾选（无从提交）；勾选不影响 buddy / travel / night 腿（它们没有任务码）。
 // · 批量请求只把「有勾选」的 uid 放进 body.codes，未出现的账号 = 全部任务。
 
 function pickedSet(uid) {
@@ -889,9 +898,15 @@ function taskRow(a, t) {
 
   actions.append(jumpCell(t));
 
-  // 任务列标注：桌面端徽章 ⇐ desktopOnly === true；无法自动化徽章 ⇐ unforgeable === true
+  // 任务列标注：小程序徽章 ⇐ code 命中 MP 口径（Sequential_Tasks_ 前缀 / school_season）；
+  // 桌面端徽章 ⇐ desktopOnly === true；无法自动化徽章 ⇐ unforgeable === true
   //（附 reason 原文）；pinnedExpertId 非空时给一个等宽短串（次要信息，全值在 title）。
   const marks = [];
+  if (isMPTask(t)) {
+    const b = badge("小程序", "badge-quiet");
+    b.title = "通过微信小程序埋点链路执行";
+    marks.push(b);
+  }
   if (f.desktopOnly) {
     const b = badge("需在桌面端完成", "badge-warn");
     b.title = "引擎判定：伪造事件不推进、领奖必失败，只能在本机桌面 App 完成";
@@ -2191,7 +2206,7 @@ function updateSelectionUI() {
   if (noElig && !offline) {
     $("#btnRun").title = "没有可参与任务的账号";
   } else if (totalPickedCount() > 0) {
-    $("#btnRun").title = "完整流水线：接取 → 点亮（上报进度）→ 领奖；只做各账号勾选的任务（旅行/夜猫子腿不受影响）";
+    $("#btnRun").title = "完整流水线：接取 → 点亮（上报进度）→ 领奖；只做各账号勾选的任务（旅行/夜猫子/Buddy 腿不受影响）";
   } else {
     $("#btnRun").title = "完整流水线：接取 → 点亮（上报进度）→ 领奖";
   }
@@ -2367,13 +2382,13 @@ function withBusy(fn) {
 async function runFull() {
   const legs = selectedLegs();
   if (!legs.length) {
-    toast("请至少勾选一条任务腿（成长任务 / 猫猫旅行 / 夜猫子）。", "warn");
+    toast("请至少勾选一条任务腿（成长任务 / Buddy 盲盒 / 猫猫旅行 / 夜猫子）。", "warn");
     return;
   }
   await withBusy(async () => {
     const uids = [...state.selected];
     // 任务级勾选按 uid 提交：只有「该账号有勾选」的 uid 进 codes，未出现的账号 = 全部任务。
-    // travel / night 腿没有任务码，后端会忽略 codes，不受勾选影响。
+    // buddy / travel / night 腿没有任务码，后端会忽略 codes，不受勾选影响。
     const codes = selectionBody(targetAccounts());
     const picked = selectionCount(codes);
     const body = { legs, claim: $("#claimToggle").checked };
@@ -3128,8 +3143,9 @@ function renderScheduler() {
   const settings = d.settings ?? {};
 
   setChecked($("#schedEnabled"), sch.enabled);
-  // 小时窗口只保留猫猫旅行 / 夜猫子；settings.hours.growth 即使老后端还带也一律忽略。
+  // 小时窗口只保留 Buddy 盲盒 / 猫猫旅行 / 夜猫子；settings.hours.growth 即使老后端还带也一律忽略。
   const hours = settings.hours ?? {};
+  setVal($("#hoursBuddy"), (hours.buddy ?? []).join(","));
   setVal($("#hoursTravel"), (hours.travel ?? []).join(","));
   setVal($("#hoursNight"), (hours.night ?? []).join(","));
   setChecked($("#defClaim"), settings.claim);
@@ -3208,8 +3224,10 @@ function parseHoursInput(v) {
 }
 
 async function saveHours() {
-  // 排程只服务两条无任务码的腿；成长任务已从排程里移除（手工运行仍可选它）。
+  // 排程服务三条无任务码的腿；成长任务已从排程里移除（手工运行仍可选它）。
+  // buddy 留空 = []（不排程）；该腿会消耗成长能量，是否真正开盒由后端决定。
   const hours = {
+    buddy: parseHoursInput($("#hoursBuddy").value),
     travel: parseHoursInput($("#hoursTravel").value),
     night: parseHoursInput($("#hoursNight").value),
   };
@@ -3226,7 +3244,7 @@ async function saveDefaults() {
   // 顶部 .leg-check 是唯一选择源：「保存默认」保存的就是此刻顶部的勾选。
   const legs = selectedLegs();
   if (!legs.length) {
-    toast("请至少勾选一条任务腿（成长任务 / 猫猫旅行 / 夜猫子）。", "warn");
+    toast("请至少勾选一条任务腿（成长任务 / Buddy 盲盒 / 猫猫旅行 / 夜猫子）。", "warn");
     return;
   }
   const gapMs = Number($("#gapMs").value);

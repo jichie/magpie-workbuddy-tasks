@@ -12,6 +12,11 @@ const acct = makeAcct({ uid: "uid-X" });
 function ev(kind, opts = {}) {
   return buildEvent(acct, kind, opts.idx ?? 0, opts.expert ?? null, { now: clock.now });
 }
+// playbook 返回双事件数组；统一成数组便于断言。
+function evList(kind, opts = {}) {
+  const e = ev(kind, opts);
+  return Array.isArray(e) ? e : [e];
+}
 
 test("每种 kind 的 eventCode 与必填字段", () => {
   const cases = [
@@ -22,7 +27,6 @@ test("每种 kind 的 eventCode 与必填字段", () => {
     ["lighthouse", "expert_actual_use", ["expertType"]],
     ["skill", "skill_info", ["skillId", "name"]],
     ["automation", "automated_task_create_suc", ["name", "type", "source", "modelId", "modelIsThinking", "schedule", "prompt"]],
-    ["playbook", "playbook_prompt_send", ["id", "name", "type", "promptLength", "isOfficial", "source"]],
     ["skin", "appearance_skin_apply", ["action", "source", "id", "vipLevel", "series", "type", "name"]],
     ["chat", "chat_request_send", ["mode", "conversationId", "requestId", "inputLength", "requestModelId", "requestModelName", "isPlan", "agentName", "agentType"]],
     ["glmchat", "chat_request_send", []],
@@ -36,9 +40,47 @@ test("每种 kind 的 eventCode 与必填字段", () => {
   }
 });
 
+test("playbook：双事件链（cta_click + prompt_send，hub 937c179 口径）", () => {
+  const [cta, send] = evList("playbook");
+  // 除 playbook 外都是单事件：数组只属于事件链构造器
+  assert.equal(evList("chat").length, 1);
+
+  assert.equal(cta.eventCode, "playbook_cta_click");
+  assert.equal(cta.timestamp, NOW);
+  assert.equal(cta.reportDelay, 0);
+  assert.equal(cta.id, "worker-ledger-freedom-dashboard");
+  assert.equal(cta.name, "打工人小账本");
+  assert.equal(cta.type, "document");
+  assert.equal(cta.source, "discover");
+  assert.equal(cta.position, 0);
+  assert.equal(cta.categoryId, "");
+  assert.equal(cta.categoryName, "");
+  assert.equal(cta.conversationId, `wb-task-${NOW}-0`);
+  assert.equal(cta.requestId, `wb-task-${NOW}-0-req`);
+  assert.equal(cta.messageId, `wb-task-${NOW}-0-req`);
+  assert.equal(cta.userId, "uid-X");
+
+  assert.equal(send.eventCode, "playbook_prompt_send");
+  assert.equal(send.timestamp, NOW + 50, "prompt_send 比 cta_click 晚 50ms");
+  assert.equal(send.id, "worker-ledger-freedom-dashboard");
+  assert.equal(send.name, "打工人小账本");
+  assert.equal(send.type, "document");
+  assert.equal(send.promptLength, 30);
+  assert.equal(send.isOfficial, 1);
+  assert.equal(send.source, "discover");
+  assert.equal(send.conversationId, cta.conversationId);
+  assert.equal(send.requestId, cta.requestId);
+  assert.equal(send.messageId, cta.messageId);
+  assert.equal(send.skills, "");
+  assert.equal(send.skillNames, "");
+  assert.equal(send.userId, "uid-X");
+});
+
 test("userId 必在（缺了服务端 200 但静默丢弃）", () => {
   for (const kind of ["canvas", "template", "expert", "team", "lighthouse", "skill", "automation", "playbook", "skin", "chat", "glmchat", "cat", "whatever"]) {
-    assert.equal(ev(kind).userId, "uid-X", kind);
+    const list = evList(kind);
+    assert.ok(list.length >= 1, kind);
+    for (const e of list) assert.equal(e.userId, "uid-X", `${kind} 的 ${e.eventCode ?? "?"}`);
   }
 });
 
@@ -96,4 +138,77 @@ test("id 池容量与首元素（去重轮换的弹药）", () => {
   const ids = new Set(EXPERT_ID_POOL.map(([id]) => id));
   assert.equal(ids.size, EXPERT_ID_POOL.length); // 池内本身无重复
   assert.ok(ids.has("ex_2cvvUZQhDyeJ")); // 轻量云专家也在专家池里
+});
+
+test("RichMeow：6 条桌面会话事件链（agent_task_created → … → agent_task_completed）", () => {
+  const chain = evList("richmeow");
+  // 恰好 6 条、顺序钉死（hub build_desktop_chat_events 口径）；整条链一次上报
+  const codes = chain.map((e) => e.eventCode);
+  assert.deepEqual(codes, [
+    "agent_task_created",
+    "chat_message_send",
+    "chat_request_send",
+    "chat_message_response",
+    "chat_request_response",
+    "agent_task_completed",
+  ]);
+
+  // timestamp 依次 +20（0/20/40/60/80/100）
+  for (let i = 0; i < chain.length; i++) {
+    assert.equal(chain[i].timestamp, NOW + 20 * i, `第 ${i} 条 timestamp = NOW+${20 * i}`);
+  }
+
+  // 公共字段：全部带 userId/userNickname（缺了服务端 200 但静默丢弃）
+  for (const e of chain) {
+    assert.equal(e.userId, "uid-X", e.eventCode);
+    assert.equal(e.userNickname, "测试账号", e.eventCode);
+  }
+
+  // conversationId / requestId / messageId 同链一致（同一会话的 6 条事件）
+  const cid = `wb-task-${NOW}-0`;
+  const rid = `${cid}-req`;
+  const created = chain[0];
+  assert.equal(created.source, "LOCAL");
+  assert.equal(created.conversationId, cid);
+  assert.equal(created.messageId, `msg-${NOW}-0`);
+  assert.equal(created.requestModelId, "fast-model");
+  const send = chain[1];
+  assert.equal(send.messageId, `msg-${NOW}-0-ast`);
+  assert.equal(send.traceId, rid);
+  assert.equal(send.rootRequestId, rid);
+  assert.equal(send.parentConversationId, cid);
+  const reqSend = chain[2];
+  assert.equal(reqSend.inputLength, 24);
+  assert.equal(reqSend.conversationId, cid);
+  assert.equal(reqSend.messageId, `msg-${NOW}-0`);
+  const resp = chain[3];
+  assert.equal(resp.messageId, `msg-${NOW}-0-resp`);
+  assert.equal(resp.conversationId, cid);
+  const reqResp = chain[4];
+  assert.equal(reqResp.requestModelId, "fast-model");
+  assert.equal(reqResp.inputToken, 6);
+  assert.equal(reqResp.outputToken, 12);
+  // 最后一条推进任务：status=success，conversationId/messageId 与首条一致
+  const done = chain[5];
+  assert.equal(done.status, "success");
+  assert.equal(done.conversationId, cid);
+  assert.equal(done.messageId, `msg-${NOW}-0`);
+});
+
+test("新活动任务 spec（hub 937c179）：workstation_expert 钉死 WorkspaceBuilder、Sequential_Tasks_7 走 playbook", () => {
+  const ws = TASK_SPECS.workstation_expert;
+  assert.deepEqual(ws.expert, ["WorkspaceBuilder", "工作台搭建师"]);
+  assert.equal(ws.kind, "expert");
+  assert.equal(ws.target, 1);
+  assert.equal(ws.reward, 100);
+  // 钉死的专家 id 注入 buildEvent 后原样出现在事件里
+  const e = ev("expert", { expert: ws.expert });
+  assert.equal(e.id, "WorkspaceBuilder");
+  assert.equal(e.expertTitle, "工作台搭建师");
+
+  const s7 = TASK_SPECS.Sequential_Tasks_7;
+  assert.equal(s7.kind, "playbook");
+  assert.equal(s7.target, 1);
+  assert.equal(s7.reward, 100);
+  assert.equal(s7.name, "PC灵感功能");
 });

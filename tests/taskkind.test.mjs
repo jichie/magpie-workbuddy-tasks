@@ -12,6 +12,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { deriveExpertIdFromJumpUrl, expertNameFromTitle, resolveTaskKind } from "../engine/taskkind.mjs";
+import { MP_TASK_SPECS } from "../engine/miniprogram.mjs";
 import { fetchTasks } from "../engine/tasks.mjs";
 import { fakeClock, localTime, makeAcct, task, wbBackend } from "./helpers.mjs";
 
@@ -180,12 +181,14 @@ test("resolveTaskKind：canAccept/canLight 状态矩阵（六类任务 × 四种
       assert.equal(rk.canLight, grid[i][1], `${label} @ ${status} canLight`);
     });
   }
-  // desktopOnly 标记本身与状态无关：只剩 RichMeow/Buddy 三兄弟
-  //（Library_read 已改走 web 点击事件点亮，不再属于 DESKTOP_ONLY —— 见
-  // engine/constants.DESKTOP_ONLY_TASKS 注释与 tests/library-webclick.test.mjs）
+  // desktopOnly 标记本身与状态无关：只剩 Buddy 两兄弟
+  //（Library_read 已改走 web 点击、RichMeow 已改走 6 条桌面会话事件链）
   assert.equal(resolveTaskKind({ code: "Buddy_App", jumpUrl: "workbuddy://home" }).desktopOnly, true);
   assert.equal(resolveTaskKind({ code: "Buddy_App_QQ", jumpUrl: "workbuddy://home" }).desktopOnly, true);
-  assert.equal(resolveTaskKind({ code: "RichMeow_Chat", jumpUrl: "" }).desktopOnly, true);
+  assert.equal(resolveTaskKind({ code: "RichMeow_Chat", jumpUrl: "" }).desktopOnly, false);
+  const rich = resolveTaskKind({ code: "RichMeow_Chat", jumpUrl: "", acceptStatus: "accepted", taskType: "single" });
+  assert.equal(rich.kind, "richmeow");
+  assert.equal(rich.canLight, true, "RichMeow 6 连已可点亮");
   // Library_read：spec 命中即点亮路径 —— desktopOnly=false、accepted 可点亮
   const lib = resolveTaskKind({ code: "Library_read", jumpUrl: "workbuddy://library", acceptStatus: "accepted", taskType: "single" });
   assert.equal(lib.desktopOnly, false, "Library_read 不再是 desktop-only");
@@ -246,4 +249,62 @@ test("fetchTasks：未收录/派生任务的 unforgeable+reason 落到规范 Tas
     "acceptStatus", "code", "description", "jumpUrl", "progress",
     "reason", "rewardCredit", "rewardEnergy", "taskType", "title", "unforgeable",
   ]);
+});
+
+test("resolveTaskKind：小程序任务（MP_TASK_SPECS / Sequential_Tasks_ 前缀）→ source:mp、kind:mp", () => {
+  // MP_TASK_SPECS 命中：spec 用 MP 条目（name/target/reward），判断字段收敛
+  const mp = resolveTaskKind({
+    code: "Sequential_Tasks_1",
+    title: "完成 1 次对话",
+    acceptStatus: "not_accepted",
+    taskType: "single",
+  });
+  assert.equal(mp.source, "mp");
+  assert.equal(mp.kind, "mp");
+  assert.equal(mp.spec, MP_TASK_SPECS.Sequential_Tasks_1);
+  assert.equal(mp.desktopOnly, false);
+  assert.equal(mp.unforgeable, false);
+  assert.equal(mp.reason, "");
+  assert.equal(mp.acceptible, true);
+  assert.equal(mp.lightable, true);
+  assert.equal(mp.pinnedExpertId, "");
+  assert.equal(mp.canAccept, true, "not_accepted → 可接取");
+  assert.equal(mp.canLight, false, "not_accepted → 不可点亮");
+
+  const accepted = resolveTaskKind({ code: "Sequential_Tasks_1", acceptStatus: "accepted", taskType: "single" });
+  assert.equal(accepted.canAccept, false);
+  assert.equal(accepted.canLight, true, "accepted → 小程序链路可点亮");
+
+  for (const status of ["completed", "claimed"]) {
+    const s = resolveTaskKind({ code: "school_season", acceptStatus: status, taskType: "single" });
+    assert.equal(s.canAccept, false, `${status} → 不可接取`);
+    assert.equal(s.canLight, false, `${status} → 不可点亮`);
+    assert.equal(s.source, "mp");
+  }
+
+  // Sequential_Tasks_ 前缀兼容缝（不在 MP_TASK_SPECS）：spec 为 null，其余照常
+  const future = resolveTaskKind({ code: "Sequential_Tasks_9", acceptStatus: "not_accepted", taskType: "single" });
+  assert.equal(future.source, "mp");
+  assert.equal(future.kind, "mp");
+  assert.equal(future.spec, null);
+  assert.equal(future.canAccept, true);
+
+  // MP code 即使带专家 jump_url 也走 MP 分支（MP 优先于 jump_url 派生）
+  const withJump = resolveTaskKind({
+    code: "Sequential_Tasks_2",
+    jumpUrl: jumpOf("ex_GDl31WahyIH0"),
+    acceptStatus: "not_accepted",
+    taskType: "single",
+  });
+  assert.equal(withJump.source, "mp");
+  assert.equal(withJump.pinnedExpertId, "");
+
+  // 优先级不破坏：Sequential_Tasks_7 在 TASK_SPECS（web playbook）→ 绝不被 MP 前缀抢走
+  const s7 = resolveTaskKind({ code: "Sequential_Tasks_7", acceptStatus: "not_accepted", taskType: "single" });
+  assert.equal(s7.source, "spec");
+  assert.equal(s7.kind, "playbook");
+  // 未收录 code 的 jump_url 派生也不受影响
+  const derived = resolveTaskKind({ code: "expert_use_new", jumpUrl: jumpOf("ex_NewDer1ved0"), acceptStatus: "not_accepted", taskType: "single" });
+  assert.equal(derived.source, "jump_url");
+  assert.equal(derived.pinnedExpertId, "ex_NewDer1ved0");
 });

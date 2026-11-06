@@ -94,6 +94,16 @@ export const TASK_SPECS = {
     expert: ["ex_xQHHD1u5Jkua", "无畏契约拼豆专家"],
     name: "体验「无畏契约拼豆专家」",
   },
+  // 活动任务（hub 937c179）：工作台搭建师。事件 id 是这个专家的真实 id
+  //（上游按 (eventCode, id) 去重，id 不对则进度永远不动）；注意 id 不是 ex_ 形态。
+  workstation_expert: {
+    kind: "expert", target: 1, reward: 100,
+    expert: ["WorkspaceBuilder", "工作台搭建师"],
+    name: "工作台搭建师",
+  },
+  // PC 灵感功能（web 侧的 Sequential_Tasks 系列成员）：playbook 双事件链
+  //（cta_click + prompt_send，见 tasks.buildEvent 的 "playbook" 分支）。
+  Sequential_Tasks_7: { kind: "playbook", target: 1, reward: 100, name: "PC灵感功能" },
   wb_wechat_oa_subscribe_task: {
     unforgeable: true, reward: 100,
     reason: "需在微信关注「腾讯 WorkBuddy」公众号满 24 小时",
@@ -110,8 +120,10 @@ export const TASK_SPECS = {
 // 注：Library_read 曾在此列（生产两账号长期「已接取 0/1」）——后经参考实现
 // 证实它可以由 web 端的一次元素点击事件点亮（web_element_click，见
 // tasks.reportLibraryEvent），已移出本表（TASK_SPECS 的 kind:"library" 接管）。
+// RichMeow_Chat（RichMeow）也已移出：hub 937c179 证实用 6 条桌面会话事件链
+//（agent_task_created → … → agent_task_completed）可以点亮，见 tasks.buildEvent
+// 的 kind:"richmeow" 分支。
 export const DESKTOP_ONLY_TASKS = {
-  RichMeow_Chat: "在桌面端发起 1 次对话",
   Buddy_App: "在桌面端左上角「发现应用」进入任意一个 Buddy 应用",
   Buddy_App_QQ: "在桌面端「发现应用」进入「企鹅教师助手」",
 };

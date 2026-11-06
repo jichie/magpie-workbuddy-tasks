@@ -27,7 +27,10 @@ magpie-workbuddy-tasks/
     tasks.mjs            # 成长任务：列表/接取/上报/领奖 + run_growth_tasks 流水线
     taskkind.mjs         # 任务 → kind 解析（P0-1）：jump_url 派生专家 id、未收录标注、
                          # canAccept/canLight/pinnedExpertId 收敛结论（唯一判断源）
+    miniprogram.mjs      # 微信小程序链式任务（Sequential_Tasks_1–6 + school_season）：
+                         # MP_HEADERS / mpBase / MP_REPORT_HEADERS 专属埋点链路
     travel.mjs           # 猫猫旅行闭环 + 夜猫子任务
+    buddy.mjs            # Buddy 盲盒腿（quota → 批量 open；不领积分不加 credit）
     daily.mjs            # 每日活跃上报（点亮成长中心连登；uid→北京日幂等）
     credits.mjs          # 积分余额 + 套餐权益包明细（只读；fetchCredits）
     runner.mjs           # 跨账号批量编排、job 状态与日志、并发闸门
@@ -108,11 +111,39 @@ reportLibraryEvent(acct) -> boolean
   // engine/tasks.mjs；callJSON 的 init.headers 支持**大小写敏感**合并自定义头，
   // 唯 Authorization 不可被覆盖（凭据头，无论大小写怎么写都保留引擎的值）。
 claimTask(acct, code) -> {ok, credit, energy, via /*'chat'|'web'*/, reason}
-buildEvent(acct, kind, idx) -> object
+buildEvent(acct, kind, idx) -> object | object[]
+  // 多数 kind 返回单事件对象；**playbook 返回双事件数组**（playbook_cta_click +
+  // playbook_prompt_send，hub 937c179 口径）、**richmeow 返回 6 条桌面会话事件
+  // 数组**（RichMeow_Chat：agent_task_created → chat_message_send →
+  // chat_request_send → chat_message_response → chat_request_response →
+  // agent_task_completed，timestamp 依次 +20，agentName:"cli"）——progressTask
+  // 对数组与单事件都收（`Array.isArray(ev) ? ev : [ev]`，一次 report 发整条链）。
 runGrowthTasks(acct, opts) -> GrowsResult
   // opts.codes?: string[] —— 任务级勾选（§3/§6/§7）：非空数组 = 只对选中任务
-  // 接取/点亮/领奖；每次 fetchTasks 后都按选中集合过滤；缺失 code 警告跳过；
-  // 未传/空数组 = 全部任务（旧行为）
+  // 接取/点亮/领奖；每次 fetchTasks 后都按选中集合过滤；缺失 code 警告跳过
+  //（MP 专属任务除外——它们由小程序链路处理，不误报）；未传/空数组 = 全部任务
+  // opts.mpTasks?: boolean —— 显式 false 关闭 2b 的小程序链式任务（缺省开启）
+
+// miniprogram.mjs —— 微信小程序链式任务（runGrowthTasks 2b 自动调用，普通任务
+// 处理完、猫猫旅行之前；0.3.0 起 MP 专属任务还经 refreshSnapshots 并入快照/看板、
+// 经 /api/task/accept|claim 的 isMPCode 分流被单账号操作）
+MP_HEADERS / MP_REPORT_HEADERS / MP_TASK_SPECS / MP_TASK_CODES  // 常量（§7）
+isMPCode(code) -> boolean            // MP_TASK_SPECS 命中或 Sequential_Tasks_ 前缀
+mpBase(uid, nick, nowMs) -> object   // WorkBuddy_MP 埋点指纹（每条 MP 事件都要合并）
+fetchMPTasks(acct, opts) -> MP Task[]        // GET growth/tasks，MP_HEADERS，规范 camelCase
+acceptMPTasks(acct, codes, opts) -> {ok, accepted[], failed[], msg, restricted?}
+claimMPTask(acct, code, opts) -> {ok, credit, energy, reason, restricted?}  // 400 → web 回退
+reportMPEvents(acct, events, opts) -> boolean  // mpBase 合并 + MP_REPORT_HEADERS，chat 域 /v2/report
+runMiniProgramTasks(acct, opts) -> {ok, logs, earnedCredit, lit, claimed, restricted?}
+  // opts.codes 非空 = 只处理选中的 MP 交集；交集为空连清单都不拉（零上游）
+
+// buddy.mjs —— Buddy 盲盒腿（独立腿，LEG_ORDER 在 travel 之前）
+runBuddyOpen(acct, opts) -> {ok, opened, name?, logs, restricted?}
+  // GET /v2/activity/growth/buddy/quota 读 affordable/max_open_count；
+  // affordable<=0 → ok:true +「成长能量不足以开启 Buddy 盲盒」（不发 open）；
+  // count = min(affordable, max(1, max_open_count))，POST open body
+  // {count, client_token: randomUUID()}；解析 data.buddy|name|buddies（数组 join）。
+  // **不领积分、不加 credit**（结果无 credit 字段）；403/11140 → restricted 透传。
 
 // daily.mjs
 beijingDayKey(nowMs) -> "YYYY-MM-DD"      // 北京日键（UTC+8；UTC 16:00 翻日）
@@ -164,16 +195,21 @@ tierFromSummary(data) -> {paid,package,packageCode,protectedPrice,trial}|null
 
 // taskkind.mjs —— 任务 → kind 解析（fetchTasks 的 unforgeable/reason、流水线的
 // 接取/点亮决策、daemon.snapTask 的 6 个下发字段，全部出自这里的唯一判断源）
-resolveTaskKind(t) -> { source: "spec"|"jump_url"|"none", kind, spec,
+resolveTaskKind(t) -> { source: "spec"|"mp"|"jump_url"|"none", kind, spec,
                         desktopOnly, desktopReason, unforgeable, reason,
                         acceptible, lightable /*kind 级（不含状态）*/,
                         canAccept, canLight /*收敛结论（含状态）*/,
                         pinnedExpertId, expertName }
   // 输入是规范 Task（容忍 raw 拼写）；只读 code/jumpUrl/acceptStatus/taskType/title
-  // 优先级：① TASK_SPECS 命中（钉死 id 不被 jump_url 覆盖）
-  //        ② 未命中但 jump_url 能解出 expertId=ex_… → expert 类可点亮，
+  // 优先级：① TASK_SPECS 命中（钉死 id 不被 jump_url 覆盖；Sequential_Tasks_7
+  //          在此表 → 永远轮不到 MP 前缀分支）
+  //        ② MP_TASK_SPECS 命中或 Sequential_Tasks_ 前缀 → source:"mp"、kind:"mp"、
+  //          spec 用 MP 条目（name/target/reward），desktopOnly/unforgeable=false，
+  //          canAccept=not_accepted、canLight=accepted（执行在 miniprogram 模块的
+  //          小程序头族链路；0.3.0 起进快照/看板与单账号 accept/claim 分流）
+  //        ③ 未命中但 jump_url 能解出 expertId=ex_… → expert 类可点亮，
   //          事件 id 钉在解析出的 id 上（expertType=agent，沿用 expert_actual_use）
-  //        ③ 未命中且派生不出 → unforgeable:true + reason:"未收录任务"，
+  //        ④ 未命中且派生不出 → unforgeable:true + reason:"未收录任务"，
   //          绝不进接取批次（防「接了一大堆却一项不亮、领奖报 task not completed」）
 deriveExpertIdFromJumpUrl(jumpUrl) -> string  // URL 解码后取 expertId=ex_…；解不出 ""
 expertNameFromTitle(title) -> string           // 任务标题「」内的专家名（事件展示字段）
@@ -189,11 +225,14 @@ runNightTask(acct, opts) -> NightResult       // black_cat，23:00–08:00（北
 
 // runner.mjs
 class JobRunner {
-  start(spec) -> job        // spec: {uids[], legs:['growth','travel','night'], claim,
+  start(spec) -> job        // spec: {uids[], legs:['growth','buddy','travel','night'], claim,
                             //       trigger:'manual'|'schedule',
                             //       taskCodes:{uid:string[]}|null}  // 任务级勾选（§3）：
                             //       growth 腿把 taskCodes[uid] 作为 opts.codes 传给
                             //       runGrowthTasks；null/缺 uid/空清单 = 全部任务。
+                            //       腿顺序固定 growth→buddy→travel→night（buddy 在
+                            //       travel 前，开出的 Buddy 可被旅行使用），spec.legs
+                            //       是这个顺序的子集；buddy/travel/night 腿没有任务码。
                             //       归一化在两处设防：daemon.startJob（API 边界，§3）
                             //       与 runner.normalizeSpec（直接构造 runner 的调用方）
   get(id) -> Job            // Job: {id, state:'queued|running|done|error', startedAt, endedAt,
@@ -270,10 +309,12 @@ GET  /api/state                 -> {serveUrl, bindHost, port, reachableHint,
                                     scheduler:{enabled,nextRuns[[leg,hour]],lastCycle,
                                                holds:[{uid,nickname,releasedAt}]},
                                     job:Job|null, stats:{creditsToday,energyToday,runs},
-                                    settings:{claim,legs,gapMs,hours:{travel,night},host:{chat,bill,web}}}
-                                    // hours 只有 travel|night 两个键（排程不再触发 growth，§7/§8）；
-                                    // 旧 settings.json 里的 hours.growth 在读取时丢弃。legs
-                                    // （手动默认腿）仍可含 growth。
+                                    settings:{claim,legs,gapMs,hours:{buddy,travel,night},host:{chat,bill,web}}}
+                                    // hours 只有 buddy|travel|night 三个键（排程不再触发
+                                    // growth，§7/§8）；旧 settings.json 里的 hours.growth
+                                    // 在读取时丢弃。buddy 默认 []（开盲盒消耗成长能量，
+                                    // 默认不排程，用户显式配了小时才自动跑）。legs
+                                    //（手动默认腿）仍可含 growth。
                                     // bindHost/port/reachableHint：守护进程真实绑定的 host 与端口
                                     // （host 来自 daemon.json，由 daemon 心跳写入；port 为实际绑定端口，
                                     // 被占用顺延后可能与配置值不同）。bindHost 为 0.0.0.0/:: 时
@@ -310,9 +351,10 @@ GET  /api/state                 -> {serveUrl, bindHost, port, reachableHint,
                                     // 前端据此渲染，不要再用 jumpUrl 非空猜「需桌面端完成」——
                                     // 真实数据 19 项全部有非空 jumpUrl）：
                                     //   desktopOnly —— DESKTOP_ONLY_TASKS 命中
-                                    //     （RichMeow_Chat/Buddy_App/Buddy_App_QQ 这类
-                                    //     伪造事件不推进、领奖必 400 的；Library_read
-                                    //     已改走 web 点击事件点亮，**不在**此列），
+                                    //     （Buddy_App/Buddy_App_QQ 这类伪造事件不推进、
+                                    //     领奖必 400 的；Library_read 已改走 web 点击
+                                    //     事件点亮、RichMeow_Chat（RichMeow）已改走
+                                    //     6 条桌面会话事件链点亮，均**不在**此列），
                                     //     与 jumpUrl 形状无关
                                     //   unforgeable / reason —— 已有语义沿用（spec.unforgeable；
                                     //     未收录任务也是 unforgeable:true + reason:"未收录任务"）
@@ -474,6 +516,46 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
   `GET {chat}/activity/growth/streak`、`GET {chat}/activity/growth/heatmap`、
   `POST {chat}/activity/growth/makeup-cards/use`、`GET .../lottery/summary`、`POST .../lottery/draw`、`POST .../redeem`、
   猫猫：`GET .../buddy/travel/status|config`、`POST .../buddy/travel/depart`（body `{location_id}`）、`POST .../buddy/travel/claim`。
+- **Buddy 盲盒（engine/buddy.mjs，独立腿，消耗成长能量）**：
+  `GET {chat}/v2/activity/growth/buddy/quota` → `data.affordable`（还能开几个）/
+  `data.max_open_count`（单次上限）；`affordable<=0` → ok:true +「成长能量不足以开启
+  Buddy 盲盒」，**绝不发 open**。`count = min(affordable, max(1, max_open_count))`，
+  `POST {chat}/v2/activity/growth/buddy/open` body `{count, client_token:<randomUUID>}`；
+  成功解析 `data.buddy || data.name || data.buddies`（数组 join）。**不领积分、不加
+  credit**——本腿的产物只有 logs/opened。403/11140 → restricted 透传（runner 记冷却）。
+  腿顺序在 travel 之前（开出的 Buddy 可被旅行使用）；排程窗口可配但默认
+  `hours.buddy=[]`（不给明确授权绝不自动花能量）。
+- **微信小程序链式任务（engine/miniprogram.mjs，Sequential_Tasks_1–6 + school_season）**：
+  清单/接取/领奖走同一批 growth 端点但带 **MP_HEADERS**（`X-Client-Platform:
+  miniprogram` + MicroMessenger UA）；事件上报打 chat 域 `/v2/report` 但头 = chat
+  头族 + **MP_REPORT_HEADERS**（`X-Client-Product: workbuddy-mp`、
+  `X-Client-Platform: mp-weixin`、`X-Platform: wechatmp`、`X-Client-Version: 2.4.0`），
+  事件体逐条合并 **mpBase**（`ideType:"WorkBuddy_MP"`、`extName:"workbuddy-mp"`、
+  `platform:"mini_program"`、`machineId:"mp-<uid 前 16 位|guest>"`、
+  `timezone:"Asia/Shanghai"`、`os:"android"/osVersion:"14"/arch:"arm64"`、userId/
+  userNickname/timestamp）。per-code 事件（hub 937c179 逐字）：1/3/6/school =
+  `chat_request_send`（`agentName:"mp"`、`agentType:"main"`、带
+  `codebuddy.session_id`/`codebuddy.conversation_request_id` 点键名）；2 =
+  `expert_actual_use`（id/name `WorkspaceBuilder`、`expertTitle:"工作台搭建师"`、
+  `type:"send_message"`、`extVersion:"2.2.8"`）；4 = `automated_task_create_suc`
+  （`mode:"CLOUD"`、`name:"每日任务提醒"`、`scheduleType:"daily"`）；5 = chat_request_send
+  + `requestModelId:"glm-5.2"`/`requestModelName:"GLM-5.2"`。整个 need 的事件一次
+  report 发完（不逐条轮询进度），等 1.5s 直接领，领不到顺延下轮。web 侧的
+  `Sequential_Tasks_7`（PC灵感功能，playbook 双事件）在 TASK_SPECS，不在 MP_TASK_SPECS。
+  **小程序任务进任务快照/看板（0.3.0 起，生产实测 MP 清单 12 项含
+  Sequential_Tasks_1）**：daemon.refreshSnapshots 在 web fetchTasks 之后用
+  `fetchMPTasks`（MP_HEADERS）再拉一份 MP 清单，**只合并 web 清单里没有的 code**
+  （同一 code 以 web 清单为准，绝不重复/覆盖 web 状态）；MP 拉取失败只记日志，
+  不影响 web 快照。判定走 taskkind 的 `source:"mp"` 分支（MP_TASK_SPECS 命中或
+  `Sequential_Tasks_` 前缀 → kind:"mp"、desktopOnly/unforgeable=false、
+  canAccept=not_accepted、canLight=accepted，TASK_SPECS/jump_url 优先级不变——
+  Sequential_Tasks_7 永远是 playbook）。单账号操作同样分流：`/api/task/accept`
+  按 `isMPCode` 把 codes 分成 web/MP 两组分别用 `acceptTasks`/`acceptMPTasks`
+  （结果合并，形状不变）；`/api/task/claim` 对 MP code 用 `claimMPTask`，否则
+  `claimTask`。引擎侧防御：tasks.progressTask 对 kind:"mp" 一律跳过 web 事件构造
+  （「小程序任务由小程序链路处理」）。runGrowthTasks 2b 在普通任务之后、猫猫旅行
+  之前调用（批量执行链路不变），`opts.mpTasks===false` 可关，`opts.codes` 勾选只
+  处理 MP 交集（交集为空连清单都不拉），缺失警告用 `MP_TASK_CODES` 过滤防误报。
 - 计费侧：`POST {bill}/billing/meter/claim-gift|claim-compensation`、`POST {bill}/v2/billing/meter/daily-checkin`、
   `POST {chat}/v2/billing/meter/checkin-activity-status`。
 - **积分余额（只读，engine/credits.mjs，wb_accounts._fetch_credits_cn_detailed 口径）**：
@@ -489,19 +571,23 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
 - 刷新：`POST {chat} + engine/constants.REFRESH_PATH`，头 `X-Refresh-Token`、`X-Auth-Refresh-Source: workbuddy`、`X-Domain`；响应 `data.accessToken`(+轮换的 `data.refreshToken`)，可能嵌套 `data.data`。
 - 事件必须有 `userId`（缺了服务端 200 但静默丢弃）。
 - 进度只在**已接取**任务上累计；专家/团队事件按 `(eventCode,id)` 去重 → 必须轮换 id 池；
-  `WorkBuddy_Valorant` 钉死真实 id `ex_xQHHD1u5Jkua`，`Expert_lighthouse` 钉 `ex_2cvvUZQhDyeJ`。
+  `WorkBuddy_Valorant` 钉死真实 id `ex_xQHHD1u5Jkua`，`Expert_lighthouse` 钉 `ex_2cvvUZQhDyeJ`，
+  `workstation_expert` 钉 `WorkspaceBuilder`（工作台搭建师；hub 937c179，id 不是 ex_ 形态）。
 - **未收录任务（P0-1）**：上游会返回 TASK_SPECS 之外的任务（2026-10-31 实测每账号
   19 项里有 5 项不在 specs，其中 4 个 `expert_use_*` + 若干随版本漂移的 活动 任务）。
   处理规则（engine/taskkind.resolveTaskKind，优先级从高到低）：
   1. TASK_SPECS 命中 → 沿用 spec（`Expert_lighthouse`/`WorkBuddy_Valorant` 的 jump_url
      只有 `workbuddy://expert`，不含 expertId —— 钉死常量仍是唯一来源，绝不被 jump_url 覆盖）；
-  2. 未命中但 `jump_url` 解出 `expertId=ex_…`（`expert_use_*` 一族：URL 编码的 deeplink
+  2. MP_TASK_SPECS 命中或 `Sequential_Tasks_` 前缀 → 小程序链式任务（0.3.0 起进快照/
+     看板）：`source:"mp"`、`kind:"mp"`，desktopOnly/unforgeable=false，接取/点亮结论
+     按状态收敛；执行与领奖在 miniprogram 模块的小程序头族链路（见下）；
+  3. 未命中但 `jump_url` 解出 `expertId=ex_…`（`expert_use_*` 一族：URL 编码的 deeplink
      查询串里，如 `…launch/?deeplink=workbuddy%3A%2F%2Fexperts%3FexpertId%3Dex_GDl31WahyIH0
      &buddy_type=workbuddy`）→ 视为 expert 类可点亮任务，**事件 id 必须钉在解析出的 id 上**
      （上游按 `(eventCode,id)` 去重，池子里的通用 id 对它不推进进度 —— Valorant 同款坑），
      `expertType` 用 `agent`，事件其余字段沿用 `expert_actual_use` 形状；专家名从任务
      标题「」内提取（仅展示字段，进度只看 id）；
-  3. 未命中且派生不出 → `unforgeable:true` + `reason:"未收录任务"`：不接取、不上报、
+  4. 未命中且派生不出 → `unforgeable:true` + `reason:"未收录任务"`：不接取、不上报、
      不领奖，**绝不放进批量接取批次**（否则「接了一大堆却一项不亮、领奖报
      task not completed」）；`desktopOnly`/`canAccept`/`canLight`/`pinnedExpertId`
      随 daemon 投影下发给前端（§3）。
@@ -512,7 +598,7 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
   `redemption_status` 同层；data 顶层没有 days/streakDays 键）。连登为 0 是真实值
   （`streak.days` 与 `month_total_days` 是两个字段，前者才是连登天数）。
   daemon 快照读同一路径，不做多拼写回退链。
-- DESKTOP_ONLY 任务（`RichMeow_Chat`/`Buddy_App`/`Buddy_App_QQ`）与 `unforgeable`
+- DESKTOP_ONLY 任务（`Buddy_App`/`Buddy_App_QQ`）与 `unforgeable`
   （`wb_wechat_oa_subscribe_task`/`Expert_Philanthropy`）不上报、接不上，只展示 `jump_url`。
   **`Library_read` 不在此列**（2026-11 修正）：它由 web 端的一次元素点击事件点亮 ——
   `engine/tasks.reportLibraryEvent` 向 **web 域** `webBase()/v2/report` 发一条
@@ -595,18 +681,25 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
   `beijingHour(Date.UTC(...,1,0))===9`、UTC 01:00 命中 travel 而绝不能是 night、
   UTC 17:00（北京次日 01:00）命中 night、`beijingDateKey` 在 UTC 16:00 翻北京日、
   `dueWindows` 跨北京日边界不重不漏；**growth 不在任何排程窗口**——排程只触发
-  travel/night，growth 只能手动跑）；daemon 回归用假时钟驱动 `checkScheduler`：
-  `hours={travel:[9,21],night:[1]}` 时北京 09:00（UTC 01:00）启动 `legs:["travel"]`、
+  buddy/travel/night，growth 只能手动跑；buddy 默认空窗口（`hours.buddy=[]`，
+  显式配置才排程）；daemon 回归用假时钟驱动 `checkScheduler`：
+  `hours={buddy:[],travel:[9,21],night:[1]}` 时北京 09:00（UTC 01:00）启动
+  `legs:["travel"]`、
   北京 01:00（UTC 17:00）启动 night、同一北京日同窗口只触发一次、跨北京日
   （UTC 16:00 边界）重新允许；daemon 读旧 settings.json 时
   丢弃 `hours.growth`、`/api/state` 的 hours/nextRuns 无 growth、tick 不触发 growth job、
-  手动 `legs:["growth"]` 照常启动；
+  手动 `legs:["growth"]` 照常启动；buddy 显式配小时后 nextRuns 含 buddy、tick 触发
+  `legs:["buddy"]` job；
 - 去重：`expert_5` 五个事件用 5 个不同 id；
 - 资料库（Library_read）：reportLibraryEvent 的事件字段/头逐字断言（web 域、
   Referer/UA/X-User-Id 覆盖、Authorization 保留）；callJSON 的 init.headers 合并
   —— 大小写敏感覆盖、Authorization 不可被覆盖（精确大小写与小写两种写法都剥掉）；
-  流水线 0/1 → web 点击 → 进度 0→1 → 领奖；desktopOnly 投影只剩 RichMeow/Buddy
-  三条，Library_read desktopOnly=false、accepted 可点亮；
+  流水线 0/1 → web 点击 → 进度 0→1 → 领奖；desktopOnly 投影只剩 Buddy_App/Buddy_App_QQ
+  两条，Library_read desktopOnly=false、accepted 可点亮，RichMeow desktopOnly=false、
+  接取后可点亮（6 连）；
+- RichMeow（RichMeow_Chat，kind:"richmeow"）：buildEvent 恰好 6 条链事件、
+  顺序与 timestamp（+20 步进）钉死；整条链**一次 report** 发完；流水线里
+  agent_task_completed 推进进度 → 领奖成功；snapTask 投影接取后 canLight=true；
 - 每日活跃：北京日键 UTC+8 翻日；同一北京日第二次不重发（skipped）、跨日（注入
   now）再发；失败不落账不回调不抛；请求打计费域 /v2/report 且事件含 userId；经
   spacer；runner 每账号开跑前一次、失败不阻断腿；daemon 持久化
@@ -617,6 +710,13 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
   批次）、快照 energy/streak 只认 data.balance / data.streak.days（毒键不误读）；
 - store：回写只改 access/refresh/expires，保留未知字段，产出合法 JSON 且权限 600；
 - runner：两个 `start()` → 第二个 409；`stop()` 能在步骤边界中止；
+- Buddy 盲盒（engine/buddy.mjs）：quota/open 两跳的批量口径（count=min）、能量
+  不足零开盒请求、restricted 透传、不领积分；runner 腿顺序 growth→buddy→travel→night
+  （乱序入参归一、未知腿剔除）、buddy 步骤 detail=最后一条日志且 credit=0；
+- 小程序链式任务（engine/miniprogram.mjs）：MP 头族与 mpBase 逐字断言、per-code
+  事件族（1/3/6/school/2/4/5；Sequential_Tasks_7 无事件）、claimed/completed/
+  not_accepted 三态、codes 交集过滤（交集为空零上游）、≥1s 节流、runGrowthTasks
+  集成（2b 顺序、收益并入 totals、mpTasks=false 关闭、MP code 不误报缺失）；
 - 沙箱卫生：测试 temp 沙箱一律走 `tests/helpers.mjs` 的 `makeSandbox()`（用完即删 + after/exit 兜底），跑完套件 temp 不残留 `wb-*` 沙箱（`tests/sandbox-hygiene.test.mjs` 钉死）。
 
 ## 9. 账号 JSON 导入 / 导出（hub 移植口径；engine/accountio.mjs）

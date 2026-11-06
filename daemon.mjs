@@ -48,9 +48,14 @@ import {
 // 任务 → kind 解析（P0-1/P0-2）：snapTask 下发给前端的 6 个判断字段全部出自
 // engine 的这个唯一判断源（纯函数、零请求；与 engine/tasks.fetchTasks 同一口径，
 // 见 docs/CONTRACT.md §2/§3）。静态导入：taskkind.mjs 与 constants.mjs 一样是
-// 插件自带、无网络依赖的模块 —— 缺文件与 lifecycle.mjs 缺失同级（整个模块装不上），
-// 不属于 engine/* 的可选降级范畴。
+// 插件自带、无网络依赖的模块（它 import 的 miniprogram.mjs 也只是静态表 +
+// 纯函数）—— 缺文件与 lifecycle.mjs 缺失同级（整个模块装不上），不属于
+// engine/* 的可选降级范畴。
 import { resolveTaskKind } from "./engine/taskkind.mjs"
+// 小程序任务判定（0.3.0）：/api/task/accept 与 /api/task/claim 按 isMPCode 把
+// 请求分流到 web 头族或小程序头族（engine/miniprogram.mjs）——快照里现在既有
+// web 清单任务也有 MP 清单任务，同一个端点必须两条链路都能操作。
+import { isMPCode } from "./engine/miniprogram.mjs"
 // 账号 JSON 导入/导出（契约 §9）：静态导入与 taskkind 同级 —— 纯函数模块、
 // 只依赖 node: 内置与 engine/store.mjs，缺文件属于整个模块装不上的范畴。
 import {
@@ -70,25 +75,27 @@ import { beijingDateKey, beijingHour } from "./engine/constants.mjs"
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const VERSION = (() => {
   try {
-    return String(JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf8")).version || "0.2.0")
+    return String(JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf8")).version || "0.3.0")
   } catch {
-    return "0.2.0"
+    return "0.3.0"
   }
 })()
 
-const LEGS = ["growth", "travel", "night"]
-const LEG_NAMES = { growth: "成长任务", travel: "猫猫旅行", night: "夜猫子" }
+const LEGS = ["growth", "buddy", "travel", "night"]
+const LEG_NAMES = { growth: "成长任务", buddy: "Buddy 盲盒", travel: "猫猫旅行", night: "夜猫子" }
 const HISTORY_CAP = 2000
 
 // 积分缓存的有效期（GET /api/credits，CONTRACT §3）：缓存年龄小于它且未要求
 // refresh 时直接返回缓存，绝不发上游。导出供测试对齐。
 export const CREDITS_TTL_MS = 10 * 60 * 1000
 
-// 排程小时窗口只认这两条腿（契约 §7/§8）：到点自动跑的都是无任务码、零写入
-// 风险的腿；growth 刻意不在排程里（engine/schedule.SCHEDULE_WINDOWS 同口径），
-// 只能手动发起（看板「立即运行」/ POST /api/run / 工具，可配合 codes 勾选）。
+// 排程小时窗口只认这三条腿（契约 §7/§8）：到点自动跑的都是无任务码的腿；
+// growth 刻意不在排程里（engine/schedule.SCHEDULE_WINDOWS 同口径），只能手动
+// 发起（看板「立即运行」/ POST /api/run / 工具，可配合 codes 勾选）。
+// buddy 默认**不排程**（DEFAULT_SETTINGS.hours.buddy=[]）：开盲盒消耗成长能量，
+// 不给明确授权就绝不自动花；用户在看板/设置里为它配了小时窗口才会自动跑。
 // 手动运行不受此限制——LEGS 仍含 growth，settings.legs 默认也仍含 growth。
-const SCHEDULE_HOURS_LEGS = ["travel", "night"]
+const SCHEDULE_HOURS_LEGS = ["buddy", "travel", "night"]
 
 const DEFAULT_SETTINGS = {
   scheduler: false, // 小时窗口排程总开关：默认停用，须由用户在看板里显式点一次「启用排程」才生效
@@ -96,13 +103,16 @@ const DEFAULT_SETTINGS = {
   legs: ["growth", "travel"], // 手动运行未指定 legs 时的默认腿（growth 仍可手动勾选）
   gapMs: 1500, // 账号之间的基础间隔（手动）；排程时 runner 另加 2–5s 抖动
   jitterMs: [2000, 5000], // 排程运行的账号间抖动（交给 runner，见契约 §0.4）
-  hours: { travel: [9, 21], night: [1] }, // 北京小时窗口 UTC+8（只有 travel|night，growth 无窗口；与容器时区无关）
+  // 北京小时窗口 UTC+8（只有 buddy|travel|night 可配窗口，growth 无窗口；与容器
+  // 时区无关）。buddy 默认空 = 不排程，避免排程自动消耗成长能量开盲盒。
+  hours: { buddy: [], travel: [9, 21], night: [1] },
   host: { chat: "", bill: "", web: "" }, // 留空 = 用 engine/upstream 的默认
 }
 
-// normalizeScheduleHours(raw) -> {travel:number[], night:number[]}（导出供测试）
-// 键限制为 travel|night（growth/未知键丢弃），每条腿只留 0–23 的整数并去重升序。
-// 输入不是对象时返回空腿表（调用方先与 DEFAULT_SETTINGS.hours 合并，缺键由此兜底）。
+// normalizeScheduleHours(raw) -> {buddy:number[], travel:number[], night:number[]}
+//（导出供测试）键限制为 buddy|travel|night（growth/未知键丢弃），每条腿只留
+// 0–23 的整数并去重升序。输入不是对象时返回空腿表（调用方先与
+// DEFAULT_SETTINGS.hours 合并，缺键由此兜底）。
 export function normalizeScheduleHours(raw) {
   const src = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}
   const out = {}
@@ -475,13 +485,17 @@ export function computeServeUrl({ hostHeader, publicUrl, bindHost, port } = {}) 
 // ---- 引擎装载（engine/* 由另一个 agent 编写；缺失时全部优雅降级） ---------
 
 async function loadEngine(log) {
-  const eng = { store: null, runner: null, tasks: null, upstream: null, errors: [] }
+  const eng = { store: null, runner: null, tasks: null, upstream: null, credits: null, miniprogram: null, errors: [] }
   const want = [
     ["store", "./engine/store.mjs"],
     ["runner", "./engine/runner.mjs"],
     ["tasks", "./engine/tasks.mjs"],
     ["upstream", "./engine/upstream.mjs"],
     ["credits", "./engine/credits.mjs"],
+    // 小程序链式任务（0.3.0）：tasks.mjs 本就静态 import 它（缺文件时 tasks 也
+    // 加载不了），这里单独登记是为了快照合并（fetchMPTasks）与 accept/claim
+    // 分流（acceptMPTasks/claimMPTask）能拿到具名模块引用。
+    ["miniprogram", "./engine/miniprogram.mjs"],
   ]
   for (const [name, spec] of want) {
     try {
@@ -584,7 +598,7 @@ export async function startDaemon(opts = {}) {
   // 只有 POST /api/settings（校验 boolean）或看板开关能显式打开。
   settings.scheduler = settings.scheduler === true
   settings.claim = settings.claim === true
-  // 排程小时窗口只认 travel|night（本版起 growth 不再由排程触发）：旧
+  // 排程小时窗口只认 buddy|travel|night（本版起 growth 不再由排程触发）：旧
   // settings.json 里的 hours.growth 在这里丢弃，未知键一律不收，缺的键补默认。
   // （growth 仍可手动跑：settings.legs / POST /api/run 的 legs 不受影响。）
   settings.hours = normalizeScheduleHours({ ...DEFAULT_SETTINGS.hours, ...(settings.hours ?? {}) })
@@ -774,6 +788,25 @@ export async function startDaemon(opts = {}) {
         try {
           await sleepFn(1000) // 限速红线：与上一轮上游调用（可能是刚结束的 job）之间 ≥1s
           const tasks = await fetchTasks(acct, engineOpts())
+          // 小程序清单合并（0.3.0）：web 清单之后用小程序头族再拉一份 MP 清单，
+          // **只补 web 清单里没有的 code**（Sequential_Tasks_1–6 + school_season
+          // 这类 MP 专属任务）——同一 code 以 web 清单为准，绝不重复/覆盖 web
+          // 状态。MP 拉取失败只记日志，不影响 web 快照（宁可少一项，不拖垮整份）。
+          let merged = Array.isArray(tasks) ? tasks : []
+          const fetchMPTasks = engine?.miniprogram?.fetchMPTasks
+          if (typeof fetchMPTasks === "function") {
+            try {
+              await sleepFn(1000) // 限速红线：与 fetchTasks 之间 ≥1s
+              const mpTasks = await fetchMPTasks(acct, engineOpts())
+              if (Array.isArray(mpTasks) && mpTasks.length) {
+                const have = new Set(merged.map((t) => t.code))
+                const mpOnly = mpTasks.filter((t) => t?.code && !have.has(t.code))
+                if (mpOnly.length) merged = [...merged, ...mpOnly]
+              }
+            } catch (e) {
+              log(`[snapshot] ${uid} 小程序清单拉取失败（不影响 web 快照）：${shortErr(e)}`)
+            }
+          }
           let energy
           let days
           const up = engine?.upstream
@@ -795,7 +828,7 @@ export async function startDaemon(opts = {}) {
           //（projectSnapshot → snapTask），引擎侧判断演进后老缓存也能读出新结论
           snapshots[uid] = {
             snapVersion: SNAP_VERSION,
-            tasks: (Array.isArray(tasks) ? tasks : []).map(cacheTask),
+            tasks: merged.map(cacheTask),
             energy: energy ?? snapshots[uid]?.energy ?? null,
             streak: days ?? snapshots[uid]?.streak ?? null,
             days: days ?? snapshots[uid]?.days ?? null,
@@ -1160,11 +1193,16 @@ export async function startDaemon(opts = {}) {
   }
 
   async function doClaim(uid, code) {
-    const fn = engine?.tasks?.claimTask
+    const c = String(code || "")
+    // 引擎能力检查在最前（与旧口径一致：「任务引擎不可用」先于账号/参数校验）；
+    // MP code 要求 miniprogram.claimMPTask，web code 要求 tasks.claimTask。
+    const fn = isMPCode(c) ? engine?.miniprogram?.claimMPTask : engine?.tasks?.claimTask
     if (typeof fn !== "function") throw new Error(engineErrorsText())
     const acct = accountByUid(uid)
     if (!acct) throw new Error(`找不到账号 ${uid}（重新扫描账号或检查 plugin-auth.json）`)
-    const r = await fn(acct, String(code || ""), engineOpts())
+    // 小程序任务（0.3.0 起进快照）领奖走小程序头族（MP_HEADERS），web 回退语义
+    // 由 claimMPTask 自带；返回形状与 web 领奖一致（MP 模块无 via 字段 → 空串）。
+    const r = await fn(acct, c, engineOpts())
     return {
       ok: !!r?.ok,
       credit: r?.credit ?? 0,
@@ -1175,18 +1213,39 @@ export async function startDaemon(opts = {}) {
   }
 
   async function doAccept(uid, codes) {
-    const fn = engine?.tasks?.acceptTasks
-    if (typeof fn !== "function") throw new Error(engineErrorsText())
+    const list = (Array.isArray(codes) ? codes : []).map(String).filter(Boolean)
+    // 引擎能力检查在最前（与旧口径一致）：按 isMPCode 分流（0.3.0）后，MP 组要求
+    // miniprogram.acceptMPTasks，其余（含空列表的旧口径）要求 tasks.acceptTasks。
+    const web = list.filter((c) => !isMPCode(c))
+    const mp = list.filter((c) => isMPCode(c))
+    const needWeb = mp.length ? web.length > 0 : true
+    if (
+      (needWeb && typeof engine?.tasks?.acceptTasks !== "function") ||
+      (mp.length && typeof engine?.miniprogram?.acceptMPTasks !== "function")
+    ) {
+      throw new Error(engineErrorsText())
+    }
     const acct = accountByUid(uid)
     if (!acct) throw new Error(`找不到账号 ${uid}`)
-    const list = (Array.isArray(codes) ? codes : []).map(String).filter(Boolean)
     if (!list.length) throw new Error("codes 不能为空")
-    const r = await fn(acct, list, engineOpts())
-    return {
-      accepted: r?.accepted ?? [],
-      already: r?.already ?? [],
-      failed: (r?.failed ?? []).map((f) => (typeof f === "string" ? f : { ...f, reason: scrub(f?.reason ?? "") })),
+    // web 清单任务走 tasks.acceptTasks（chat 头族），小程序任务走
+    // miniprogram.acceptMPTasks（MP_HEADERS）；两边结果合并，返回形状不变
+    //（accepted/already/failed）。注意 MP 模块把 already_accepted 并进 accepted
+    //（无独立 already 数组），合并后 MP 侧不贡献 already。
+    const out = { accepted: [], already: [], failed: [] }
+    if (web.length) {
+      const r = await engine.tasks.acceptTasks(acct, web, engineOpts())
+      out.accepted.push(...(r?.accepted ?? []))
+      out.already.push(...(r?.already ?? []))
+      out.failed.push(...(r?.failed ?? []))
     }
+    if (mp.length) {
+      const r = await engine.miniprogram.acceptMPTasks(acct, mp, engineOpts())
+      out.accepted.push(...(r?.accepted ?? []))
+      out.failed.push(...(r?.failed ?? []))
+    }
+    out.failed = out.failed.map((f) => (typeof f === "string" ? f : { ...f, reason: scrub(f?.reason ?? "") }))
+    return out
   }
 
   async function doCheckin(uids) {
@@ -1746,9 +1805,9 @@ export async function startDaemon(opts = {}) {
         const [a, b] = body.jitterMs.map(Number)
         if (Number.isFinite(a) && Number.isFinite(b)) settings.jitterMs = [Math.max(0, a), Math.max(a, b)]
       }
-      // 排程小时窗口只收 travel|night（growth 不再由排程触发，写进来也丢弃）。
-      // 非数组值沿用旧行为「忽略该键」；数组值统一走 normalizeScheduleHours 的
-      // 同款校验：0–23 整数、去重升序。
+      // 排程小时窗口只收 buddy|travel|night（growth 不再由排程触发，写进来也
+      // 丢弃）。非数组值沿用旧行为「忽略该键」；数组值统一走
+      // normalizeScheduleHours 的同款校验：0–23 整数、去重升序。
       if (body.hours && typeof body.hours === "object" && !Array.isArray(body.hours)) {
         const merged = { ...settings.hours }
         for (const leg of SCHEDULE_HOURS_LEGS) {

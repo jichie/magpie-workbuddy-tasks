@@ -127,7 +127,10 @@ describe("P2 单元：缓存形态重投影 === 直接刷新投影（幂等）",
     // 旧 8 键（无版本戳）→ 重投影出确定的判断字段
     const legacy = projectSnapshot({ tasks: [ok8()], energy: 42, streak: 7, days: 7, updatedISO: "2026-10-30T08:00:00.000Z" })
     assert.ok(legacy, "旧缓存可无损重建 → 不判过期")
-    assert.equal(legacy.tasks[0].desktopOnly, true)
+    // RichMeow 已移出 DESKTOP_ONLY（6 条桌面会话事件链可点亮）：not_accepted
+    // → 可接取、不可点亮（desktopOnly=false 与状态无关）
+    assert.equal(legacy.tasks[0].desktopOnly, false)
+    assert.equal(legacy.tasks[0].canAccept, true)
     assert.equal(legacy.tasks[0].canLight, false)
     assert.equal(legacy.energy, 42)
     assert.equal(legacy.updatedISO, "2026-10-30T08:00:00.000Z")
@@ -278,8 +281,9 @@ describe("P2 集成：旧版 8 键缓存被新版读出 —— 6 个判断字段
         for (const k of JUDGMENT_KEYS) assert.notEqual(t[k], undefined, `${t.code}.${k} 不得是 undefined`)
       }
       const byCode = new Map(snap.tasks.map((t) => [t.code, t]))
-      // desktopOnly 与 jumpUrl 形状无关（真实数据 19/19 都有非空 jumpUrl，前端不许按它猜）
-      assert.equal(byCode.get("RichMeow_Chat").desktopOnly, true)
+      // desktopOnly 与 jumpUrl 形状无关（真实数据 19/19 都有非空 jumpUrl，前端不许按它猜）；
+      // RichMeow 已移出 DESKTOP_ONLY：not_accepted → 可接取（升级读由引擎重算，不是缓存旧值）
+      assert.equal(byCode.get("RichMeow_Chat").desktopOnly, false)
       assert.equal(byCode.get("RichMeow_Chat").canAccept, true)
       assert.equal(byCode.get("RichMeow_Chat").canLight, false)
       // pinnedExpertId 从缓存 jumpUrl 由引擎解析器重算（不是前端猜的）

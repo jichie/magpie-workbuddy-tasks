@@ -12,16 +12,23 @@
 // 解析优先级：
 //   1. TASK_SPECS 命中 → 用现有 spec（最高优先；Valorant / lighthouse 的
 //      jump_url 只有 workbuddy://expert，钉死常量仍是唯一来源，绝不被
-//      jump_url 覆盖）；
-//   2. 未命中但 jump_url 能解出 expertId=ex_… → 视为 expert 类可点亮任务，
+//      jump_url 覆盖；web 侧的 Sequential_Tasks_7 也在本表，playbook 双事件，
+//      绝不被 MP 前缀分支抢走）；
+//   2. MP_TASK_SPECS 命中或 Sequential_Tasks_ 前缀 → 小程序链式任务（0.3.0
+//      起进快照/看板）：source:"mp"、kind:"mp"，接取/点亮结论按状态收敛，
+//      执行由 miniprogram 模块的小程序头族链路承担（见 tasks.progressTask
+//      的 kind:"mp" 防御分支与 daemon /api/task/accept|claim 的分流）；
+//   3. 未命中但 jump_url 能解出 expertId=ex_… → 视为 expert 类可点亮任务，
 //      事件 id 钉在解析出的 id 上（expertType=agent，沿用 expert_actual_use）；
-//   3. 未命中且派生不出 → unforgeable:true + reason:"未收录任务"：不接取、
+//   4. 未命中且派生不出 → unforgeable:true + reason:"未收录任务"：不接取、
 //      不上报、不领奖（否则「接了一大堆却一项不亮、领奖报 task not completed」）。
 //
-// 本模块零依赖副作用：只 import constants 的静态表，绝不发请求；daemon 的
-// snapTask 与 engine 流水线共用这里，保证下发给前端的判断与引擎行为一致。
+// 本模块零网络副作用：只 import 静态表（miniprogram.mjs 的 MP_TASK_SPECS /
+// isMPCode 也是纯表 + 纯函数），绝不发请求；daemon 的 snapTask 与 engine 流水线
+// 共用这里，保证下发给前端的判断与引擎行为一致。
 
 import { DESKTOP_ONLY_TASKS, TASK_SPECS } from "./constants.mjs";
+import { MP_TASK_SPECS, isMPCode } from "./miniprogram.mjs";
 
 // lighthouse 的钉死专家（wb_tasks.build_event 的同款常量；CONTRACT §7）。
 export const LIGHTHOUSE_EXPERT = ["ex_2cvvUZQhDyeJ", "腾讯轻量云专家"];
@@ -61,9 +68,11 @@ export function expertNameFromTitle(title) {
 // taskType/title 五个字段，绝不发请求。
 //
 // 返回：
-//   source          "spec" | "jump_url" | "none"
-//   kind            buildEvent 的事件族（"expert" 等）；未收录为 null
-//   spec            TASK_SPECS 条目（source==="spec" 时），否则 null
+//   source          "spec" | "mp" | "jump_url" | "none"
+//   kind            buildEvent 的事件族（"expert"/"richmeow" 等；MP 任务为
+//                   "mp"——由 miniprogram 模块按 code 生成事件；未收录为 null）
+//   spec            TASK_SPECS / MP_TASK_SPECS 条目（source==="spec"|"mp" 时），
+//                   否则 null
 //   desktopOnly     DESKTOP_ONLY_TASKS 命中（伪造事件不推进、领奖必 400）
 //   desktopReason   desktopOnly 的说明文案（DESKTOP_ONLY_TASKS 的值，否则 ""）
 //   unforgeable     不可自动化（spec.unforgeable 或 未收录任务）
@@ -114,7 +123,36 @@ export function resolveTaskKind(t) {
     };
   }
 
-  // 2. 未收录但 jump_url 解得出专家 id → expert 类可点亮，事件 id 钉死。
+  // 2. 小程序链式任务（0.3.0 起进快照/看板）：MP_TASK_SPECS 命中（Sequential_
+  //    Tasks_1–6 + school_season）或 Sequential_Tasks_ 前缀（hub 兼容缝）。它们
+  //    不在 web 清单里（生产两账号实测 web 19 项均不含），由 miniprogram 模块
+  //    用小程序头族（MP_HEADERS / MP_REPORT_HEADERS / mpBase）接取/点亮/领奖；
+  //    spec 用 MP spec（name/target/reward，上游裸字段常缺这些）。desktopOnly /
+  //    unforgeable 恒 false，接取/点亮结论与 spec 分支同口径按状态收敛。
+  //    注意 Sequential_Tasks_7 在 TASK_SPECS（web 侧 playbook）——上面的分支 1
+  //    已经返回，永远轮不到这里，jump_url 优先级不变。
+  if (code && isMPCode(code)) {
+    const spec = Object.hasOwn(MP_TASK_SPECS, code) ? MP_TASK_SPECS[code] : null;
+    return {
+      source: "mp",
+      kind: "mp",
+      spec,
+      desktopOnly: false,
+      desktopReason: "",
+      unforgeable: false,
+      reason: "",
+      acceptible: true,
+      lightable: true,
+      pinnedExpertId: "",
+      expertName: "",
+      canAccept: !isAuto && status === "not_accepted",
+      canLight: isAuto
+        ? status === "not_accepted" || status === "accepted"
+        : status === "accepted",
+    };
+  }
+
+  // 3. 未收录但 jump_url 解得出专家 id → expert 类可点亮，事件 id 钉死。
   const derived = deriveExpertIdFromJumpUrl(t?.jumpUrl ?? t?.jump_url);
   if (derived) {
     const autoOk = status === "not_accepted" || status === "accepted";
@@ -135,7 +173,7 @@ export function resolveTaskKind(t) {
     };
   }
 
-  // 3. 未收录且派生不出：诚实标注，绝不接取/上报/领奖。
+  // 4. 未收录且派生不出：诚实标注，绝不接取/上报/领奖。
   return {
     source: "none",
     kind: null,

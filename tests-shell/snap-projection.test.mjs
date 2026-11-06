@@ -93,7 +93,7 @@ describe("P0-2：snapTask 投影（真实形态 19 项）", () => {
     // code → 判断字段全表（与引擎流水线的接取/点亮决策同源同值）
     const expected = {
       playbook_prompt: { desktopOnly: false, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "" },
-      RichMeow_Chat: { desktopOnly: true, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "" },
+      RichMeow_Chat: { desktopOnly: false, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "" },
       Library_read: { desktopOnly: false, unforgeable: false, reason: "", canAccept: false, canLight: true, pinnedExpertId: "" },
       Expert_lighthouse: { desktopOnly: false, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "ex_2cvvUZQhDyeJ" },
       Hp_Appearance: { desktopOnly: false, unforgeable: false, reason: "", canAccept: false, canLight: false, pinnedExpertId: "" },
@@ -155,6 +155,7 @@ describe("P0-2：snapTask 投影（真实形态 19 项）", () => {
         expert_use_shangjia_xuanchuan: "accepted",
         expert_use_bowangwang: "accepted",
         chat_5: "accepted",
+        RichMeow_Chat: "accepted", // RichMeow 已可经 6 连点亮：接取后即可点亮
         first_buddy: "not_accepted", // auto：未接取也可点亮
       }[t.task_code]
       return flip ? { ...t, accept_status: flip } : t
@@ -169,6 +170,7 @@ describe("P0-2：snapTask 投影（真实形态 19 项）", () => {
       "expert_use_shangjia_xuanchuan",
       "expert_use_bowangwang",
       "chat_5",
+      "RichMeow_Chat",
     ]) {
       assert.equal(byCode.get(code).canLight, true, `${code} accepted → 可点亮`)
       assert.equal(byCode.get(code).canAccept, false)
@@ -176,12 +178,13 @@ describe("P0-2：snapTask 投影（真实形态 19 项）", () => {
     assert.equal(byCode.get("first_buddy").canLight, true, "auto 任务 not_accepted 即可点亮")
     assert.equal(byCode.get("first_buddy").canAccept, false, "auto 任务永不给接取结论")
 
-    // desktopOnly 只剩两兄弟：就算 not_accepted 也只能接、不能点亮
-    for (const code of ["RichMeow_Chat", "Buddy_App"]) {
-      const s = byCode.get(code)
-      assert.equal(s.desktopOnly, true, `${code} desktopOnly 与状态无关`)
-      assert.equal(s.canLight, false, `${code} 不可点亮（伪造事件不推进）`)
-    }
+    // desktopOnly 只剩 Buddy_App 一家：就算 not_accepted 也只能接、不能点亮
+    //（RichMeow 已移出 DESKTOP_ONLY：接取后可经 6 条桌面会话事件链点亮）
+    const buddy = byCode.get("Buddy_App")
+    assert.equal(buddy.desktopOnly, true, "Buddy_App desktopOnly 与状态无关")
+    assert.equal(buddy.canLight, false, "Buddy_App 不可点亮（伪造事件不推进）")
+    const richmeow = byCode.get("RichMeow_Chat")
+    assert.equal(richmeow.desktopOnly, false, "RichMeow 不再是 desktop-only（6 连事件链已实现）")
     // Library_read 已改走 web 点击事件点亮（引擎 reportLibraryEvent）：不再是
     // desktop-only，accepted 状态即可点亮（真实形态 19 项里它就是 accepted）
     assert.equal(byCode.get("Library_read").desktopOnly, false, "Library_read 不再是 desktop-only")

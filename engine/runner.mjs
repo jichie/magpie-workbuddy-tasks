@@ -5,10 +5,12 @@
 //
 // 同一时刻只允许 1 个 job（current() 全局闸门；第二个 start() 抛 409）。
 // 账号与账号之间按 trigger 间隔（manual 1.5 s / schedule 2–5 s 抖动，见
-// schedule.accountGapMs）；腿的顺序固定 growth → travel → night，spec.legs
-// 是这个顺序的子集。spec.taskCodes（{uid: string[]} | null，任务级勾选）只在
-// growth 腿生效。stop() 只在步骤边界生效（abort 信号在腿/账号之间检查）。
+// schedule.accountGapMs）；腿的顺序固定 growth → buddy → travel → night（buddy
+// 在 travel 前：开出的 Buddy 可被随后一轮旅行使用），spec.legs 是这个顺序的
+// 子集。spec.taskCodes（{uid: string[]} | null，任务级勾选）只在 growth 腿生效。
+// stop() 只在步骤边界生效（abort 信号在腿/账号之间检查）。
 
+import { runBuddyOpen } from "./buddy.mjs";
 import { DEFAULT_GAP_MS, REFRESH_LEAD_MS, RESTRICTED_COOLDOWN_MS } from "./constants.mjs";
 import { reportDailyActivity } from "./daily.mjs"; // 每日活跃（点亮成长中心连登，CONTRACT §7）
 import { uuidHex } from "./fingerprint.mjs";
@@ -18,7 +20,7 @@ import { runGrowthTasks } from "./tasks.mjs";
 import { runCatTravel, runNightTask } from "./travel.mjs";
 import { clock, refreshAccount } from "./upstream.mjs";
 
-const LEG_ORDER = ["growth", "travel", "night"];
+const LEG_ORDER = ["growth", "buddy", "travel", "night"];
 
 // 任务级勾选（CONTRACT §2/§3）每个账号清单的上限与 daemon.startJob 同款。
 const TASK_CODES_CAP = 500;
@@ -47,7 +49,7 @@ function normalizeTaskCodes(raw) {
 function normalizeSpec(spec = {}) {
   const legs = (Array.isArray(spec.legs) && spec.legs.length ? spec.legs : [...LEG_ORDER])
     .filter((l) => LEG_ORDER.includes(l))
-    .sort((a, b) => LEG_ORDER.indexOf(a) - LEG_ORDER.indexOf(b)); // 顺序固定 growth→travel→night
+    .sort((a, b) => LEG_ORDER.indexOf(a) - LEG_ORDER.indexOf(b)); // 顺序固定 growth→buddy→travel→night
   return {
     uids: Array.isArray(spec.uids) && spec.uids.length ? [...spec.uids] : null,
     legs: legs.length ? legs : [...LEG_ORDER],
@@ -322,11 +324,12 @@ export class JobRunner {
             signal: ctrl.signal,
             // 任务级勾选（CONTRACT §3）：growth 腿把该账号的选中清单作为
             // opts.codes 传给 runGrowthTasks；未勾选（taskCodes=null）、该账号
-            // 不在映射里或清单为空 → undefined = 全部任务（旧行为）。travel/
-            // night 腿没有任务码，不传。
+            // 不在映射里或清单为空 → undefined = 全部任务（旧行为）。buddy/
+            // travel/night 腿没有任务码，不传。
             ...(leg === "growth" && job.spec.taskCodes ? { codes: job.spec.taskCodes[acct.uid] } : {}),
           };
           if (leg === "growth") res = await runGrowthTasks(acct, legOpts);
+          else if (leg === "buddy") res = await runBuddyOpen(acct, legOpts);
           else if (leg === "travel") res = await runCatTravel(acct, legOpts);
           else res = await runNightTask(acct, legOpts);
         } catch (err) {
@@ -348,6 +351,7 @@ export class JobRunner {
         } else if (leg === "travel") {
           detail = res?.msg || (ok ? "完成" : "失败");
         } else {
+          // buddy / night 腿返回 logs：步骤 detail 取最后一条人读日志
           detail = (res?.logs ?? []).slice(-1)[0] || (ok ? "完成" : "失败");
         }
         this._finishStep(job, step, ok ? "ok" : "fail", detail, credit, energy);

@@ -1,14 +1,16 @@
 // tests-shell/schedule-no-growth.test.mjs —— 排程去掉「成长任务」（CONTRACT §7/§8）外壳回归。
 //
-// 排程小时窗口只认 travel|night：
-//   - engine/schedule.SCHEDULE_WINDOWS 只有 09:00/21:00 travel、01:00 night；
-//   - daemon 的 DEFAULT_SETTINGS.hours = { travel:[9,21], night:[1] }；
+// 排程小时窗口只认 buddy|travel|night：
+//   - engine/schedule.SCHEDULE_WINDOWS 只有 09:00/21:00 travel、01:00 night
+//     （buddy 默认无窗口：开盲盒消耗成长能量，默认不自动跑）；
+//   - daemon 的 DEFAULT_SETTINGS.hours = { buddy:[], travel:[9,21], night:[1] }；
 //   - 旧 settings.json 里遗留的 hours.growth 在读取时丢弃（/api/state 的
 //     scheduler.nextRuns 与 settings.hours 都不再出现 growth），tick 因此不会
 //     触发 growth job；
-//   - POST /api/settings 的 hours 只收 travel|night（写 growth 也不报错、不生效）；
+//   - POST /api/settings 的 hours 只收 buddy|travel|night（写 growth 也不报错、
+//     不生效；buddy 显式配了小时才会排程）；
 //   - 手动运行不受影响：POST /api/run {legs:["growth"]} 照常启动 growth job
-//     （LEGS 常量与 settings.legs 默认值都仍含 growth）。
+//     （LEGS 常量含 growth|buddy|travel|night，settings.legs 默认也仍含 growth）。
 
 import { test, describe, after } from "node:test"
 import assert from "node:assert/strict"
@@ -93,16 +95,17 @@ const post = (port, path, body) =>
 const tick = (ms = 80) => new Promise((r) => setTimeout(r, ms))
 
 describe("normalizeScheduleHours（纯函数）", () => {
-  test("growth 与未知键丢弃、0–23 整数去重升序、非法输入落空表", () => {
-    // 旧 settings.json 的形状：growth 原样存在 → 归一后消失
-    assert.deepEqual(normalizeScheduleHours({ growth: [9], travel: [21, 9, 9], night: [1, "x", 24, -1] }), {
+  test("growth 与未知键丢弃、0–23 整数去重升序、非法输入落空表（buddy 键保留）", () => {
+    // 旧 settings.json 的形状：growth 原样存在 → 归一后消失；buddy 是合法键
+    assert.deepEqual(normalizeScheduleHours({ growth: [9], travel: [21, 9, 9], night: [1, "x", 24, -1], buddy: [3, 3, "y", 25] }), {
+      buddy: [3],
       travel: [9, 21],
       night: [1],
     })
-    assert.deepEqual(normalizeScheduleHours({ growth: [1, 2, 3] }), { travel: [], night: [] })
-    assert.deepEqual(normalizeScheduleHours(null), { travel: [], night: [] })
-    assert.deepEqual(normalizeScheduleHours([9, 21]), { travel: [], night: [] })
-    assert.deepEqual(normalizeScheduleHours({ travel: "9,21" }), { travel: [], night: [] })
+    assert.deepEqual(normalizeScheduleHours({ growth: [1, 2, 3] }), { buddy: [], travel: [], night: [] })
+    assert.deepEqual(normalizeScheduleHours(null), { buddy: [], travel: [], night: [] })
+    assert.deepEqual(normalizeScheduleHours([9, 21]), { buddy: [], travel: [], night: [] })
+    assert.deepEqual(normalizeScheduleHours({ travel: "9,21" }), { buddy: [], travel: [], night: [] })
   })
 })
 
@@ -130,7 +133,7 @@ describe("旧 settings.json 含 hours.growth 的升级读径", () => {
     try {
       const s = await (await get(h.port, "/api/state")).json()
       assert.equal(s.scheduler.enabled, true)
-      assert.deepEqual(Object.keys(s.settings.hours).sort(), ["night", "travel"], "hours 键限制为 travel|night")
+      assert.deepEqual(Object.keys(s.settings.hours).sort(), ["buddy", "night", "travel"], "hours 键限制为 buddy|travel|night")
       assert.ok(!JSON.stringify(s.settings.hours).includes("growth"), "settings.hours 不含 growth")
       assert.ok(
         !s.scheduler.nextRuns.some(([leg]) => leg === "growth"),
@@ -153,37 +156,62 @@ describe("旧 settings.json 含 hours.growth 的升级读径", () => {
     }
   })
 
-  test("POST /api/settings 的 hours 只收 travel|night（growth 写进来不生效、不落盘）", async () => {
+  test("POST /api/settings 的 hours 只收 buddy|travel|night（growth 写进来不生效、不落盘；buddy 可配）", async () => {
     const stateDir = makeSandbox("wb-sched-").dir
     keep.push(stateDir)
     const h = await boot(stateDir)
     try {
-      const st = await post(h.port, "/api/settings", { hours: { growth: [3], travel: [5], night: [2] } })
+      const st = await post(h.port, "/api/settings", { hours: { growth: [3], travel: [5], night: [2], buddy: [7] } })
       assert.equal(st.status, 200)
       const body = await st.json()
-      assert.deepEqual(Object.keys(body.hours).sort(), ["night", "travel"])
+      assert.deepEqual(Object.keys(body.hours).sort(), ["buddy", "night", "travel"])
       assert.deepEqual(body.hours.travel, [5])
       assert.deepEqual(body.hours.night, [2])
+      assert.deepEqual(body.hours.buddy, [7], "buddy 窗口可显式配置")
       assert.ok(!JSON.stringify(body.hours).includes("growth"), "响应的 hours 不含 growth")
 
       const onDisk = JSON.parse(readFileSync(join(stateDir, "settings.json"), "utf8"))
       assert.ok(!("growth" in (onDisk.hours ?? {})), "落盘的 settings.json 不含 growth")
-      assert.deepEqual(onDisk.hours, { travel: [5], night: [2] })
+      assert.deepEqual(onDisk.hours, { buddy: [7], travel: [5], night: [2] })
     } finally {
       await h.stop()
     }
   })
 
-  test("默认 DEFAULT_SETTINGS.hours = { travel:[9,21], night:[1] }（缺省 boot 即此值）", async () => {
+  test("DEFAULT_SETTINGS.hours = { buddy:[], travel:[9,21], night:[1] }（缺省 boot 即此值，buddy 不排程）", async () => {
     const stateDir = makeSandbox("wb-sched-").dir
     keep.push(stateDir)
     const h = await boot(stateDir)
     try {
       const s = await (await get(h.port, "/api/state")).json()
-      assert.deepEqual(s.settings.hours, { travel: [9, 21], night: [1] })
+      assert.deepEqual(s.settings.hours, { buddy: [], travel: [9, 21], night: [1] })
       assert.ok(!JSON.stringify(s.scheduler.nextRuns).includes("growth"))
+      assert.ok(!s.scheduler.nextRuns.some(([leg]) => leg === "buddy"), "buddy 默认空窗口 → nextRuns 不含 buddy")
       // settings.legs 默认仍含 growth（手动默认腿不变）
       assert.deepEqual(s.settings.legs, ["growth", "travel"])
+    } finally {
+      await h.stop()
+    }
+  })
+
+  test("buddy 显式配了小时 → nextRuns 含 buddy、tick 触发 buddy 腿", async () => {
+    const stateDir = makeSandbox("wb-sched-").dir
+    keep.push(stateDir)
+    const h = await boot(stateDir)
+    try {
+      const t0 = Date.now()
+      const nowHour = new Date(t0 + 1000 + 8 * 3600 * 1000).getUTCHours()
+      const st = await post(h.port, "/api/settings", { scheduler: true, hours: { buddy: [nowHour] } })
+      assert.equal(st.status, 200)
+      const s = await (await get(h.port, "/api/state")).json()
+      assert.ok(
+        s.scheduler.nextRuns.some(([leg, hh]) => leg === "buddy" && hh === nowHour),
+        `schedulerNextRuns 含 buddy: ${JSON.stringify(s.scheduler.nextRuns)}`,
+      )
+      const job = h.ticks.checkScheduler(t0)
+      assert.ok(job, "buddy 窗口命中 → 触发")
+      assert.deepEqual(job.legs, ["buddy"], "排程触发的腿就是 buddy")
+      await tick()
     } finally {
       await h.stop()
     }

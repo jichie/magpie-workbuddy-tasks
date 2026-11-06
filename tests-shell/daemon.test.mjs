@@ -461,11 +461,10 @@ describe("快照投影 · 参与任务开关 · 风控冷却", () => {
       const rich = tasks.find((t) => t.title === "富猫聊天")
       assert.equal(rich.jumpUrl, "https://example.com/go", "jumpUrl 必须透出（否则看板没法展示深链）")
       assert.equal(rich.acceptStatus, "not_accepted")
-      // P0-2：引擎判断随投影下发 —— RichMeow_Chat 是 DESKTOP_ONLY：desktopOnly
-      // 与 jumpUrl 形状无关（这里 jumpUrl 是 https URL，仍判桌面端专属）；
-      // canAccept 只看 not_accepted/非 auto/非 unforgeable（引擎确实会接它），
-      // canLight 必须为 false（伪造事件不推进）。
-      assert.equal(rich.desktopOnly, true)
+      // P0-2：引擎判断随投影下发 —— RichMeow 已改走 6 条桌面会话事件链，
+      // 不再是 DESKTOP_ONLY（desktopOnly=false）；当前状态 not_accepted，
+      // 所以 canLight 仍为 false，接取后才会变 true。
+      assert.equal(rich.desktopOnly, false)
       assert.equal(rich.unforgeable, false)
       assert.equal(rich.canAccept, true)
       assert.equal(rich.canLight, false)

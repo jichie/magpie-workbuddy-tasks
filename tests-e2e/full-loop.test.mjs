@@ -600,10 +600,13 @@ test("/api/history 记录该轮；job 结束后自动快照回填 /api/state", a
     assert.equal(typeof t.canLight, "boolean", "canLight 是布尔（契约 §3）");
   }
   const richmeowSnap = snap.tasks.find((t) => t.title === "桌面对话事件链");
-  assert.equal(richmeowSnap.jumpUrl, "workbuddy://chat", "DESKTOP_ONLY 深链必须透出");
+  assert.equal(richmeowSnap.jumpUrl, "workbuddy://chat", "深链必须透出");
   assert.equal(richmeowSnap.taskType, "single");
-  assert.equal(richmeowSnap.desktopOnly, true, "DESKTOP_ONLY 判断随投影下发（P0-2）");
-  assert.equal(richmeowSnap.canLight, false, "desktopOnly 不可点亮");
+  assert.equal(richmeowSnap.desktopOnly, false, "RichMeow 已改走 6 条桌面会话事件链");
+  // 整轮已把它接取（上面对 stub 状态断言 accept_status=accepted）：6 连已实现
+  // → 快照回填时 canLight 翻真、canAccept 收敛为 false。
+  assert.equal(richmeowSnap.canLight, true, "已接取的 RichMeow 可经 6 连点亮");
+  assert.equal(richmeowSnap.canAccept, false, "已接取后不再给接取结论");
   const wechatSnap = snap.tasks.find((t) => t.code === "wb_wechat_oa_subscribe_task");
   assert.equal(wechatSnap.unforgeable, true, "unforgeable 语义沿用（公众号关注）");
   assert.match(wechatSnap.reason, /微信/, "reason 随投影下发");
