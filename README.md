@@ -12,6 +12,29 @@
 2. 打开「WorkBuddy 任务」入口卡，进入看板；首次加载会读取账号与任务快照。
 3. 排程默认是关的。想手动跑：勾选账号和任务腿，点「批量做任务」；只想接取/领奖就用对应按钮。
 4. 任务明细里可勾选任务，批量操作只做选中的；积分列会显示余额，点「明细」看套餐权益包。
+5. **可选**：已有账号 JSON（hub / 旧机器 / 桌面端）？看板「导入 / 导出」→ 预览 → 确认，账号会合并进 magpie 的凭据库，magpie 和社区 WorkBuddy 插件都能直接使用。
+
+## 账号导入 / 导出（可直接同步进 magpie）
+
+看板账号卡片右上角有「导入 / 导出」，也可以直接调 API。**导入写的不是本插件的私有账本，而是 magpie 的凭据库 `plugin-auth.json`**：确认后这些账号会出现在 magpie 的 WorkBuddy 账号列表里，社区插件 `@magpie-community/opencode-workbuddy-auth`（对话）也能直接使用；反过来，在 magpie 里已经登录的账号，本插件无需导入即可复用。适合从 hub、旧机器或其他客户端迁移账号。
+
+导入文件可能包含 access/refresh token，**不要发到公开渠道**；写盘前会自动备份。
+
+**导出**（`GET /api/accounts/export`）：生成 hub 同款 `workbuddy-accounts` JSON。默认 `secrets=1`，**包含 access/refresh token**，下载文件请妥善保管；`secrets=0` 会删除两个 token 字段。默认只导国内版；显式 `realm=intl` 是 API 层的备份逃生口（看板不提供入口）。`uid=a,b` 可只导指定账号，`download=1` 触发附件下载。
+
+**导入**（`POST /api/accounts/import`）：两段式。
+
+1. **预览**（默认）：只读，返回 `adds / updates / skips / rejects` 和每个账号的原因，绝不写盘；
+2. **确认**（`confirm:true`）：合并写入 magpie 的 `plugin-auth.json`，写前自动备份，只同步国内版，支持导出信封、裸数组、单账号对象、桌面端凭据和 cockpit snake_case 行。
+
+智能合并规则（按顺序）：
+
+- 导入项没有 `refresh` 而现有有 → **skip**（写进去会削弱续期能力）；
+- 现有 token 尚未过期 → **skip**（绝不把在用的新 token 换成 JSON 里的旧 token）；
+- 现有已过期且导入的 token 更新 → **update**，只改 `access / refresh / expires`，其它字段保留；
+- 其余 → **skip**。
+
+确认写入后，在 magpie 插件管理里把 WorkBuddy **关掉再打开**，宿主才会重新读取账号；之后本插件和 magpie 里的对话都使用这份登录态。
 
 ## 它做什么
 
@@ -24,16 +47,18 @@
 | **只领奖** | 看板单账号「领取」/ `POST /api/task/claim` / 工具 `workbuddy_tasks_claim` | 领取单个已完成任务；批量运行时也会按 `claim:false` 只点亮不领奖 |
 | **任务级勾选** | 看板任务明细 / `POST /api/run` 的 `codes` / 工具 `codes` | 按账号勾选任务，批量操作只作用于选中的 code；未勾选 = 全部任务。选中但任务表里不存在的 code 会警告一次并跳过 |
 | **猫猫旅行** | 任务腿 `travel` | `arrived` 领奖 → `idle` 派出（先完成并领取 `first_buddy`）→ `traveling` 如实报告，一次推进一步 |
+| **Buddy 盲盒** | 任务腿 `buddy` | 用积累的**成长能量**开盲盒：`quota` 读出 `affordable`（还能开几个）与 `max_open_count`（单次上限），一次 `open` 批量开启 `min(affordable, max_open_count)` 个。**会消耗成长能量**；不领积分、不计入收益结算。能量不足时如实跳过（不发开盒请求）。腿顺序在 `travel` 之前：开出的 Buddy 可被随后的旅行使用 |
+| **微信小程序链式任务** | 成长腿内自动（`mpTasks:false` 可关）+ 快照/看板（0.3.0 起） | `Sequential_Tasks_1–6` + `school_season` 走**小程序埋点链路**（专属标头 + `WorkBuddy_MP` 事件指纹），接取/点亮/领奖一次完成；`codes` 勾选同样生效。**0.3.0 起进任务快照/看板**：快照刷新会在 web 清单之后用小程序头族再拉一份 MP 清单，只补充 web 清单里没有的 code（同一 code 以 web 为准）；单账号「接取 / 领取」对 MP code 自动改走小程序头族。注意 `workstation_expert`、`Sequential_Tasks_7` 等仍是 web 侧规格任务，等上游下发才出现 |
 | **夜猫子** | 任务腿 `night` | `black_cat` 只在**北京时间 23:00–08:00** 上报，白天诚实跳过；每天计 1 次、累计 3 天。01:00 清单暂缺 `black_cat` 时会按 5/15/30s 重试约 50s；仍没有就如实跳过（不记失败） |
 | **每日活跃** | 自动（每个 job 的每个账号开跑前） | 每个账号每个**北京日**往计费域上报一条 chat 事件，点亮成长中心连登。幂等账本 `state/daily-activity.json`，重启后同一天不重发；失败只记日志，不阻断任务 |
 | **积分余额与明细** | 看板积分列 / `GET /api/credits?uid=<uid>` | 只读查询国内版积分余额、每个套餐包的额度/已用/剩余/发放原因/到期时间，以及最早到期提示。看板有「明细」弹窗，可按状态筛选、搜索、排序、强制刷新 |
-| **小时排程** | 看板排程区 / `POST /api/settings` | **默认停用**。启用后按**北京时间** 09:00、21:00 跑「猫猫旅行」，01:00 跑「夜猫子」；同一北京日同一窗口只触发一次。**成长任务不在排程里**，只能手动或工具发起 |
-| **账号导入 / 导出** | 看板「导入 / 导出」/ `/api/accounts/export`、`/api/accounts/import` | 导出 hub 同款 `workbuddy-accounts` JSON；导入走「预览 → 确认写入」两段式，智能合并写回 magpie 的 `plugin-auth.json`，写前自动备份。只同步国内版 |
+| **小时排程** | 看板排程区 / `POST /api/settings` | **默认停用**。启用后按**北京时间** 09:00、21:00 跑「猫猫旅行」，01:00 跑「夜猫子」；同一北京日同一窗口只触发一次。**成长任务不在排程里**，只能手动或工具发起。**Buddy 盲盒默认不排程**（开盲盒消耗成长能量，不给明确授权绝不自动花）——在看板/设置里为它显式配了小时窗口才会自动跑 |
+| **账号导入 / 导出** | 看板「导入 / 导出」/ `/api/accounts/export`、`/api/accounts/import` | 导出 hub 同款 `workbuddy-accounts` JSON；导入走「预览 → 确认写入」两段式，**合并写回 magpie 的 `plugin-auth.json`——不只是本插件，magpie / 社区 WorkBuddy 插件也能直接使用**，写前自动备份。只同步国内版 |
 | **看板与入口卡** | 守护进程 `:4390` / magpie 插件页 | 账号、任务、积分、实时步骤/SSE、排程、历史；magpie 入口卡显示看板地址，按当前访问 magpie 的主机自动推导 |
 
 风控红线（不可配置、不可绕过）：任意两次上游调用之间至少 **1s**；账号之间手动 **1.5s**、排程 **2–5s** 抖动；绝不并行跑成长任务；命中 403 / 11140 后该账号冷却 **120 分钟**，冷却中整轮跳过，绝不换号硬闯。
 
-任务判定只有一个来源（`engine/taskkind.mjs`）：已知任务按 `TASK_SPECS`；未收录但 `jump_url` 能解出 `expertId=ex_…` 的 `expert_use_*` 任务会钉住该专家 id 点亮；其余未收录、桌面端专属、`unforgeable` 任务一律不伪造进度。
+任务判定只有一个来源（`engine/taskkind.mjs`）：已知任务按 `TASK_SPECS`；小程序任务（`MP_TASK_SPECS` 命中或 `Sequential_Tasks_` 前缀）走小程序链路判定；未收录但 `jump_url` 能解出 `expertId=ex_…` 的 `expert_use_*` 任务会钉住该专家 id 点亮；其余未收录、桌面端专属、`unforgeable` 任务一律不伪造进度。
 
 ### 看板里有什么
 
@@ -41,8 +66,8 @@
 - **任务明细**：展开每个账号的任务表；首列是勾选框，表头和提示条支持全选/半选。**勾选后批量操作只作用于选中任务，不勾选 = 全部。**
 - **积分**：任务进度右侧显示 `剩余 / 总额` 与「明细」按钮；最近 7 天内有套餐到期会显示提醒。
 - **积分明细弹窗**：剩余可用 / 已消耗 / 总额度 / 最近将过期四张卡；额度利用率；套餐包表格（来源、到期倒计时、总额度、已用、剩余、利用率）；筛选「全部 / 有剩余 / 即将到期 / 已用完或过期」；搜索包名/代码/来源；四种排序；「刷新明细」。
-- **批量条**：任务腿（成长 / 旅行 / 夜猫）、自动领奖、批量接任务、只领奖、每日签到、批量做任务。
-- **排程**：启用开关、旅行/夜猫子的小时窗口（北京时间）、下一次运行、风控冷却名单。
+- **批量条**：任务腿（成长 / 盲盒 / 旅行 / 夜猫）、自动领奖、批量接任务、只领奖、每日签到、批量做任务。
+- **排程**：启用开关、旅行/夜猫子/盲盒的小时窗口（北京时间，盲盒默认空）、下一次运行、风控冷却名单。
 - **历史**：每次尝试一行；「触发」列区分「排程 / 手动」。
 - **实时进度**：SSE 推送步骤与日志；断线自动回退 3 秒轮询。
 
@@ -50,7 +75,7 @@
 
 - **自动签到**：社区插件 `@magpie-community/opencode-workbuddy-auth` 已有 `auth.checkin`（每个北京日一次）。本插件不声明 provider，也不实现 `auth.checkin`；看板只保留一个走计费接口的「每日签到」按钮（`POST /api/checkin`）供偶尔手动补用。
 - **连登管家 / 补签卡 / 抽奖 / 礼包兑换**：不做。本插件只通过「每日活跃」点亮成长中心连登；补签卡、7/14/28 天兑换、抽奖、礼包兑换一概不碰，也不消耗任何积分或道具。
-- **桌面端专属伪装**：`RichMeow_Chat`、`Buddy_App`、`Buddy_App_QQ` 上游只认真实桌面客户端行为，伪造事件不推进进度。看板只展示它们的深链，任务会停在未完成，这是正常的。
+- **桌面端专属伪装**：`Buddy_App`、`Buddy_App_QQ` 上游只认真实桌面客户端行为，伪造事件不推进进度。看板只展示它们的深链，任务会停在未完成，这是正常的。`RichMeow_Chat`（RichMeow，桌面对话事件链）已不在此列：hub 937c179 证实**一次上报 6 条桌面会话事件链**（`agent_task_created → chat_message_send → chat_request_send → chat_message_response → chat_request_response → agent_task_completed`，timestamp 依次 +20）即可点亮，引擎已实现（`buildEvent` 的 `richmeow` 分支）。
 - **无法自动化的任务**：`wb_wechat_oa_subscribe_task`（需关注公众号满 24 小时）、`Expert_Philanthropy`（真实捐款）不接取、不上报、不领奖。
 - **国际版**：`workbuddy-ai` 不进账号列表、不进快照/统计、不参与任务、默认不导出；`/api/state` 只给一个 `intlSkipped:{count,note}` 计数说明去向。
 - **不服务对话模型、不声明 provider**：没有 `auth`/`config` 钩子，magpie 的「供应商」列表里不会出现本插件，也就没有「未登录」卡和登录按钮。`workbuddy` / `workbuddy-ai` 两个 provider id 始终归社区插件，对话链路不动。
@@ -62,26 +87,6 @@
 - 这样社区插件和本插件始终用同一对 token，refresh 轮换不会把对方踢下线——官方插件负责的对话不受影响。
 - **这是最脆弱的一环**：`plugin-auth.json` 的位置和格式不是 magpie 承诺的公开接口。magpie 改格式时，最坏情况是登录态需要重新扫码；解析失败我们会拒绝写入，不会损坏 magpie 的数据。
 - **Opt-out**：在 magpie「插件管理」里停用本插件，守护进程 10 秒内读到 `plugins.json` 的 `off:true` 后自行退出，之后不再读任何文件。也可以按账号关「参与任务」，但账号仍会被读取用于展示。
-
-## 账号导入 / 导出
-
-看板账号卡片右上角有「导入 / 导出」，也可以直接调 API。
-
-**导出**（`GET /api/accounts/export`）：生成 hub 同款 `workbuddy-accounts` JSON。默认 `secrets=1`，**包含 access/refresh token**，下载文件请妥善保管；`secrets=0` 会删除两个 token 字段。默认只导国内版；显式 `realm=intl` 是 API 层的备份逃生口（看板不提供入口）。`uid=a,b` 可只导指定账号，`download=1` 触发附件下载。
-
-**导入**（`POST /api/accounts/import`）：两段式。
-
-1. **预览**（默认）：只读，返回 `adds / updates / skips / rejects` 和每个账号的原因，绝不写盘；
-2. **确认**（`confirm:true`）：写入 magpie 的 `plugin-auth.json`，写前自动备份，只同步国内版，支持导出信封、裸数组、单账号对象、桌面端凭据和 cockpit snake_case 行。
-
-智能合并规则（按顺序）：
-
-- 导入项没有 `refresh` 而现有有 → **skip**（写进去会削弱续期能力）；
-- 现有 token 尚未过期 → **skip**（绝不把在用的新 token 换成 JSON 里的旧 token）；
-- 现有已过期且导入的 token 更新 → **update**，只改 `access / refresh / expires`，其它字段保留；
-- 其余 → **skip**。
-
-确认写入后，需要在 magpie 插件管理里把 WorkBuddy **关掉再打开**，宿主才会认到新账号。
 
 ## 安装
 
@@ -171,6 +176,7 @@ magpie plugin add /path/to/magpie-workbuddy-tasks
 - 排程**默认停用**。第一次装好不会自动往账号打上游请求，必须你在看板里点一次「启用小时窗口排程」。
 - 默认窗口：旅行 09:00 / 21:00，夜猫子 01:00；数字是北京小时，可在看板修改。
 - **成长任务不在排程里**：自动到点跑的都是无任务码的腿；成长任务只能手动（看板 / `POST /api/run` / 工具），可配合 `codes` 只做选中任务。
+- **Buddy 盲盒可配排程但默认空窗口**：开盲盒会消耗成长能量，默认绝不自动跑；只有你在看板/`POST /api/settings` 里给 `hours.buddy` 显式配了小时（0–23 整数）才会到点执行。
 - 守护进程每 30 秒检查一次窗口；同一北京日同一窗口只触发一次（`state/lastFired.json`，日期段是北京日期）。有 job 在跑时让路。
 - 夜猫子 `black_cat` 只在 23:00–08:00 计数，每天 1 次、累计 3 天。
 - 每日活跃在每个 job 的每个账号开跑前执行一次；同一北京日不重发。
@@ -235,9 +241,10 @@ magpie plugin add /path/to/magpie-workbuddy-tasks
 | 「没有可参与任务的账号」 | 需要 magpie 里已登录的国内版 `workbuddy` **OAuth 个人账号**；API key、企业/团队、国际版都不参与。也可能是账号被「参与任务」开关停用。Docker 自定义安装时多半是配置目录不对：给守护进程设 `MAGPIE_CONFIG_DIR=/config/magpie` 后重启。看板「重新扫描」或 `POST /api/accounts` 可立即重扫 |
 | 「任务引擎不可用」/ `/api/run` 503 | `engine/*.mjs` 缺失或加载失败；补齐 `engine/` 后在插件管理里关/开一次 |
 | 触发风控限制（403 / 11140） | 账号级风控。引擎立即停手，账号进入 120 分钟冷却（`scheduler.holds` 可看解除时间），冷却中整轮跳过；绝不换号硬闯 |
-| 桌面端专属任务一直未完成 | `RichMeow_Chat` / `Buddy_App` / `Buddy_App_QQ` 上游只认真实桌面行为，插件不会伪造；看板只给深链 |
+| 桌面端专属任务一直未完成 | `Buddy_App` / `Buddy_App_QQ` 上游只认真实桌面行为，插件不会伪造；看板只给深链。`RichMeow_Chat`（RichMeow）已可自动点亮（6 条桌面会话事件链） |
 | 排程到点没跑 / 跑错腿 | 先确认排程开关已启用；小时是**北京时间**；同一北京日同一窗口已触发过会跳过（`lastFired.json`）；有 job 在跑时让路。成长任务本来就不在排程里 |
 | 夜猫子显示「未下发，跳过」 | 上游当晚没有下发 `black_cat`（活动已结束、今日已领或日切未完成）。01:00 会先重试 4 次约 50s；仍没有就按跳过处理，不是插件故障 |
+| 小程序任务接取失败：`task locked until …` | 小程序链式任务按天解锁：完成前一个任务后，下一个任务次日才可接。日志会显示锁定日期，到日期再跑即可 |
 | 历史「触发」显示手动 | 旧版本写入的旧行不会自动回溯；修复后新产生的排程行显示「排程」。手动跑的行始终是「手动」 |
 | 积分显示「未查询」/ 刷新返回 409 | 守护进程会在空闲时拉取；批量任务运行中需要拉取会返回 409，等 job 结束再点「查询/刷新明细」。登录过期会带 `needRelogin:true`，重新登录 WorkBuddy 即可 |
 | 看板连不上 | 宿主懒加载 + 插件开关会重启宿主。用看板顶栏「启动命令」或手动 `node daemon.mjs --cfg <配置目录> --port 4390` |
@@ -255,7 +262,8 @@ engine/          任务引擎
   store / accountio        读 plugin-auth.json、导入导出
   upstream / identity      信封、重试、头族、全局节流
   tasks / taskkind         成长任务流水线、任务 → kind 判定
-  travel / daily           猫猫旅行、夜猫子、每日活跃
+  miniprogram              微信小程序链式任务（Sequential_Tasks 系列 + 校园日）
+  travel / buddy / daily   猫猫旅行、Buddy 盲盒、夜猫子、每日活跃
   runner / schedule        跨账号编排、北京时间窗口
   credits                  积分余额与套餐明细（只读）
   constants / fingerprint  上游常量、设备指纹
@@ -271,12 +279,13 @@ docs/CONTRACT.md 内部契约（实现必须遵守的接口与红线）
 node --test "tests/**/*.test.mjs" "tests-shell/*.test.mjs" "tests-e2e/*.test.mjs"
 ```
 
-当前 **303 个测试全绿**，全部零真实网络：上游由脚本化假 WorkBuddy 提供，时钟可注入；覆盖限速红线、风控冷却、任务勾选、北京时间排程、积分解析、导入导出、凭据回写等。
+当前 **341 个测试全绿**，全部零真实网络：上游由脚本化假 WorkBuddy 提供，时钟可注入；覆盖限速红线、风控冷却、任务勾选、北京时间排程、Buddy 盲盒、小程序链式任务、积分解析、导入导出、凭据回写等。
 
 ## 来源与致谢
 
 - 任务流水线、账号 JSON 导入/导出、积分数据口径参考 [workbuddy2api-hub](https://github.com/ardeyouxipianyi/workbuddy2api-hub)。
 - 「资料库」web 点击点亮与每日活跃参考社区项目 [magpie-workbuddy-growth](https://github.com/connoryang331/magpie-workbuddy-growth)。
+- 小程序链式任务的埋点协议与任务链设计参考 [L0NE-6/WorkBuddy-Daily](https://github.com/L0NE-6/WorkBuddy-Daily)（MIT）；猫猫旅行与 Buddy 盲盒安全生命周期参考 [88lin/workbuddy-auto-signin](https://github.com/88lin/workbuddy-auto-signin)（MIT）。
 - magpie 插件 API 与沙箱页规范来自 [usemagpie.ai](https://usemagpie.ai/docs/zh/plugins)；账号登录态由 `@magpie-community/opencode-workbuddy-auth` 提供。
 
 本项目与 WorkBuddy / 腾讯、magpie 官方均无隶属关系。
