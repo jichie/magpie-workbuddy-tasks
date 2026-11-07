@@ -14,3 +14,6 @@ wb-tasks-*/
 *.log
 .DS_Store
 Thumbs.db
+
+# 本地看板截图（含账号昵称/uid，绝不入库）
+dash-shot.png

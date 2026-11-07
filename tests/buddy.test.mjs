@@ -141,8 +141,10 @@ test("runner：腿的顺序固定 growth → buddy → travel → night（buddy 
     sleep: clock.sleep,
     fetch: backend.fetchImpl,
   });
-  // 只跑 buddy+travel：growth 腿自带的「顺手猫猫旅行」会先派出，干扰本断言；
-  // 全腿顺序归一另有单独断言（["night","bogus","buddy","growth","travel"] 入参）。
+  // 只跑 buddy+travel（不含 growth，排除干扰；growth 腿的旅行收尾已由 travel 腿
+  // 接管 —— growth+travel 同时跑时旅行只发生一次，见 tests/runner.test.mjs 的
+  // 需求 1 回归）；全腿顺序归一另有单独断言（["night","bogus","buddy","growth",
+  // "mp","travel"] 入参）。
   const job = runner.start({ legs: ["travel", "bogus", "buddy"] });
   const done = await runner.wait(job.id);
   assert.deepEqual(done.steps.map((s) => s.leg), ["buddy", "travel"], "未知腿剔除、顺序归一为 buddy→travel");
@@ -157,7 +159,7 @@ test("runner：腿的顺序固定 growth → buddy → travel → night（buddy 
   assert.ok(buddyOpenAt != null && departAt != null && buddyOpenAt <= departAt, "先开盲盒后派旅行");
 });
 
-test("runner：全腿入参乱序 → 归一为 growth → buddy → travel → night", async () => {
+test("runner：全腿入参乱序 → 归一为 growth → mp → buddy → travel → night", async () => {
   const clock = fakeClock(NOW);
   const backend = wbBackend({
     clock,
@@ -171,7 +173,7 @@ test("runner：全腿入参乱序 → 归一为 growth → buddy → travel → 
     sleep: clock.sleep,
     fetch: backend.fetchImpl,
   });
-  const job = runner.start({ legs: ["night", "bogus", "buddy", "growth", "travel"] });
+  const job = runner.start({ legs: ["night", "bogus", "buddy", "growth", "mp", "travel"] });
   const done = await runner.wait(job.id);
-  assert.deepEqual(done.steps.map((s) => s.leg), ["growth", "buddy", "travel", "night"], "未知腿剔除、顺序归一");
+  assert.deepEqual(done.steps.map((s) => s.leg), ["growth", "mp", "buddy", "travel", "night"], "未知腿剔除、顺序归一");
 });

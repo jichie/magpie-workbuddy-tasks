@@ -426,7 +426,8 @@ describe("快照投影 · 参与任务开关 · 风控冷却", () => {
       for (const t of tasks) {
         // 规范拼写逐字断言；daemon 绝不再读第二种键名（snake_case/camel 混猜）。
         // P0-2：六个判断字段（desktopOnly/unforgeable/reason/canAccept/canLight/
-        // pinnedExpertId）随投影一并下发（契约 §3）。
+        // pinnedExpertId）随投影一并下发（契约 §3）；需求 2 起再加次日锁三字段
+        //（locked/lockedUntil/lockHint，无锁时 locked=false、其余空串）。
         assert.deepEqual(
           Object.keys(t).sort(),
           [
@@ -436,6 +437,9 @@ describe("快照投影 · 参与任务开关 · 风控冷却", () => {
             "code",
             "desktopOnly",
             "jumpUrl",
+            "lockHint",
+            "locked",
+            "lockedUntil",
             "pinnedExpertId",
             "progress",
             "reason",
@@ -618,7 +622,7 @@ describe("生命周期", () => {
     }
   })
 
-  test("排程窗口：当前小时命中即触发一次，同一天同窗口不重复", async () => {
+  test("排程窗口：当前小时命中即触发一次，同一天同窗口不重复（默认 hours 全空不触发）", async () => {
     const stateDir = tmpState()
     const { h, engine } = await boot({ stateDir })
     try {
@@ -631,17 +635,18 @@ describe("生命周期", () => {
       // 排程小时按北京时间（UTC+8）解释（CONTRACT §7/§8）：这里用与引擎相同的
       // 换算取「当前北京小时」，与 checkScheduler 收到的同一时刻对齐，不依赖宿主时区
       const hour = new Date(d.getTime() + 8 * 3600 * 1000).getUTCHours()
+      // 需求 4：默认 hours 全空 = 默认不排任何腿 —— 开了排程也绝不自动触发
+      assert.equal(h.ticks.checkScheduler(d.getTime()), null, `默认空窗口：北京 ${hour} 点不触发`)
+      // 显式配 travel:[当前小时] → 命中即触发一次；同一天同窗口不重复
+      const st2 = await post(h.port, "/api/settings", { hours: { travel: [hour] } }, KEY)
+      assert.equal(st2.status, 200)
       const job = h.ticks.checkScheduler(d.getTime())
-      if ([9, 21, 1].includes(hour)) {
-        assert.ok(job, `小时 ${hour} 在默认窗口内应触发`)
-        assert.ok(job.id)
-        for (let i = 0; i < 100 && h.runner.current(); i++) await tick()
-        // 同一窗口再 tick：job 已结束，只能是 fired 已标记 —— 不应再启动
-        const again = h.ticks.checkScheduler(d.getTime() + 1000)
-        assert.ok(again === null)
-      } else {
-        assert.equal(job, null, `小时 ${hour} 不在默认窗口内，不应触发`)
-      }
+      assert.ok(job, `小时 ${hour} 在显式配置的 travel 窗口内应触发`)
+      assert.ok(job.id)
+      for (let i = 0; i < 100 && h.runner.current(); i++) await tick()
+      // 同一窗口再 tick：job 已结束，只能是 fired 已标记 —— 不应再启动
+      const again = h.ticks.checkScheduler(d.getTime() + 1000)
+      assert.ok(again === null)
       void engine
     } finally {
       await h.stop()

@@ -100,6 +100,9 @@ export function mpBase(uid, nick, nowMs) {
 
 // fetchMPTasks(acct, opts) -> 规范任务数组（camelCase，CONTRACT §2 拼写）；
 // name/target/reward 用 MP_TASK_SPECS 补齐（MP 清单的上游裸字段常缺这些）。
+// 次日锁（0.3.2）：上游清单自带 locked/unlock_at（2026-11-07 实测：链式任务未
+// 解锁时 locked:true + unlock_at:"…+08:00"，已解锁 locked:false）—— 原样归一
+// 进规范 Task，快照投影（daemon.snapTask）以上游字段为唯一主依据。
 export async function fetchMPTasks(acct, opts = {}) {
   const ctx = ctxOf(opts);
   await ctx.breathe(); // 防风控：与上一次上游调用之间 ≥ gap
@@ -119,6 +122,9 @@ export async function fetchMPTasks(acct, opts = {}) {
       code,
       title: t.title || spec.name || code,
       acceptStatus: t.accept_status || "not_accepted",
+      // 上游锁字段逐字透传（上游缺失时归一 false/""，保证规范形状字段完备）
+      locked: t.locked === true,
+      unlockAt: String(t.unlock_at ?? ""),
       taskType: t.task_type || "",
       progress: {
         current: prog.current ?? 0,
@@ -132,12 +138,50 @@ export async function fetchMPTasks(acct, opts = {}) {
 
 // ---- 接取 / 领奖 ----------------------------------------------------------------
 
-// acceptMPTasks(acct, codes, opts) -> {ok, accepted[], failed[], msg, restricted?}
+// parseMPLock(message) -> { until: "YYYY-MM-DD" } | null（纯函数，导出供 daemon 的
+// 防御层复用）。从上游接取失败原因里解析「锁到哪天」，已知形态（2026-11-07 生产
+// 实测）："task locked until 2026-11-07"；容忍大小写、多余空白与中文表述
+//（"锁定至/锁到/锁至 2026-11-07" 等）。只有日期而没有锁语义的消息不判锁（避免
+// 把无关失败原因误判成锁）。解析不出 / 日期非法 → null。
+export function parseMPLock(message) {
+  const s = String(message ?? "");
+  if (!s) return null;
+  if (!/(?:task\s*)?locked|锁/i.test(s)) return null; // 必须带「锁」语义
+  const m = /(\d{4}-\d{2}-\d{2})/.exec(s);
+  if (!m || !isValidDayKey(m[1])) return null;
+  return { until: m[1] };
+}
+
+// isValidDayKey("YYYY-MM-DD") -> 日历上真实存在的日期（2026-13-40 这类垃圾一律 false）
+function isValidDayKey(s) {
+  const [y, mo, d] = s.split("-").map(Number);
+  if (!(mo >= 1 && mo <= 12)) return false;
+  const t = Date.UTC(y, mo - 1, d);
+  const dt = new Date(t);
+  return Number.isFinite(t) && dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;
+}
+
+// acceptMPTasks(acct, codes, opts) -> {ok, accepted[], failed[], failures[], msg, restricted?}
 // 与 tasks.acceptTasks 同款批次语义（ACCEPT_CHUNK 上限、results 分账），头用 MP。
+// failures[] 记录每个失败项的上游原因（{code, message}，与 failed 一一对应）；
+// 原因里解析出锁（parseMPLock）时回调 opts.onLock?.(code, until, message)——
+// daemon 据此落盘 mp-locks.json，回调异常只吞掉，绝不影响接取主流程。
 export async function acceptMPTasks(acct, codes, opts = {}) {
   const ctx = ctxOf(opts);
-  const out = { ok: true, accepted: [], failed: [], msg: "" };
+  const out = { ok: true, accepted: [], failed: [], failures: [], msg: "" };
   if (!Array.isArray(codes) || !codes.length) return out;
+  // 失败登记的唯一入口：failed/failures 同步维护，顺带解析锁回调
+  const noteFailure = (code, message) => {
+    const msg = String(message ?? "");
+    out.failed.push(code);
+    out.failures.push({ code, message: msg });
+    const lock = parseMPLock(msg);
+    if (lock) {
+      try {
+        opts.onLock?.(code, lock.until, msg);
+      } catch {} // 回调是旁路信息收集，异常绝不打断接取
+    }
+  };
   const url = chatUrl(opts) + "/v2/activity/growth/tasks/accept";
   for (let i = 0; i < codes.length; i += Math.max(1, Number(opts.chunk ?? ACCEPT_CHUNK))) {
     await ctx.breathe(); // 批与批之间 ≥ gap
@@ -151,13 +195,13 @@ export async function acceptMPTasks(acct, codes, opts = {}) {
       out.ok = false;
       out.restricted = true;
       out.msg = res.msg || "restricted";
-      out.failed.push(...part);
+      for (const code of part) noteFailure(code, out.msg);
       break;
     }
     if (!res.ok) {
       out.ok = false;
       out.msg = res.msg || `code=${res.code}`;
-      out.failed.push(...part);
+      for (const code of part) noteFailure(code, out.msg);
       continue;
     }
     const results = res.data?.results ?? [];
@@ -168,11 +212,11 @@ export async function acceptMPTasks(acct, codes, opts = {}) {
       seen.add(code);
       if (st === "accepted" || st === "already_accepted") out.accepted.push(code);
       else {
-        out.failed.push(code);
+        noteFailure(code, item.message || st);
         out.msg = `${code}: ${item.message || st}`;
       }
     }
-    for (const code of part) if (!seen.has(code)) out.failed.push(code);
+    for (const code of part) if (!seen.has(code)) noteFailure(code, "");
   }
   return out;
 }
@@ -273,8 +317,15 @@ export function mpEventForCode(code, i, cid, rid, now) {
 
 // runMiniProgramTasks(acct, opts) -> {ok, logs, earnedCredit, lit, claimed, restricted?}
 // opts: {gap?, claim?, codes?: string[], mpTasks?: boolean（仅 runGrowthTasks 用）,
+//        lockedCodes?: string[] | Set<string>（mp-locks 台账仍锁定的 code，整条跳过）,
+//        onLock?(code, until, reason), onClaimed?(code),
 //        log(fn), sleep(fn), now(fn), fetch, signal, spacer}
 // opts.codes 非空 = 只处理选中的 MP 交集；交集为空时**连清单都不拉**（不白发请求）。
+// 次日锁（0.3.2）双来源整条跳过（不进接取批次、不点亮、不领奖，记同一行跳过日志
+// —— 不能把锁定任务塞进 accept 批次白撞一次）：清单自带 t.locked===true（上游
+// 权威，2026-11-07 实测 实测账号 B ST3 形态）+ opts.lockedCodes（daemon 注入，来自
+// state/mp-locks.json，旧缓存/防御回退）。claimed 优先判断：已领奖任务即使带着
+// 陈旧锁记录也只记「已领奖，跳过」，不被锁字段挡住。
 export async function runMiniProgramTasks(acct, opts = {}) {
   const ctx = ctxOf(opts);
   const logs = [];
@@ -290,6 +341,9 @@ export async function runMiniProgramTasks(acct, opts = {}) {
     return { ok: true, logs, earnedCredit: 0, lit: 0, claimed: 0 };
   }
 
+  // 次日锁清单归一：空集合 = 无锁（null，省一次 has 判断）
+  const locked = mpSelectedSet(opts.lockedCodes ?? []);
+
   let mpTasks = await fetchMPTasks(acct, opts);
   if (!mpTasks.length) {
     return { ok: true, logs, earnedCredit: 0, lit: 0, claimed: 0 };
@@ -302,7 +356,11 @@ export async function runMiniProgramTasks(acct, opts = {}) {
   }
 
   logs.push(`📱 发现 ${supported.length} 个小程序成长任务，开始执行自动化...`);
-  const unaccepted = supported.filter((t) => t.acceptStatus === "not_accepted").map((t) => t.code);
+  // 待接取批次剔除双来源锁定项（上游 t.locked 权威 + mp-locks 台账回退）：
+  // 锁定任务接取必被上游拒，塞进批次只会白撞一次
+  const unaccepted = supported
+    .filter((t) => t.acceptStatus === "not_accepted" && t.locked !== true && !(locked && locked.has(t.code)))
+    .map((t) => t.code);
   if (unaccepted.length) {
     const acc = await acceptMPTasks(acct, unaccepted, opts);
     if (acc.restricted) {
@@ -323,6 +381,13 @@ export async function runMiniProgramTasks(acct, opts = {}) {
   let lit = 0;
   let claimed = 0;
   const now = Math.floor(ctx.now());
+  // 领奖成功的统一出口：计数 + onClaimed 回调（daemon 记领奖日期并给链上下一环
+  // 记锁）；回调是旁路信息收集，异常只吞掉，绝不影响主流程。
+  const onClaimed = (code) => {
+    try {
+      opts.onClaimed?.(code);
+    } catch {}
+  };
 
   for (const t of mpTasks) {
     const code = t.code;
@@ -332,8 +397,16 @@ export async function runMiniProgramTasks(acct, opts = {}) {
     const tgt = t.progress?.target ?? 1;
     const name = t.title || code;
 
+    // claimed 优先判断：已领奖任务即使带着陈旧锁记录（mp-locks 台账/上游锁字段）
+    // 也只记「已领奖，跳过」，不被锁字段挡住
     if (status === "claimed") {
       logs.push(`✓ 小程序任务 [${name}] 已领奖，跳过`);
+      continue;
+    }
+
+    // 次日锁双来源（上游 t.locked 权威 + mp-locks 台账回退）：整条跳过，记同一行
+    if ((locked && locked.has(code)) || t.locked === true) {
+      logs.push(`⏳ 小程序任务 [${name}] 到第二天才能接取任务，跳过`);
       continue;
     }
 
@@ -344,6 +417,7 @@ export async function runMiniProgramTasks(acct, opts = {}) {
           totalEarned += res.credit ?? 0;
           claimed += 1;
           logs.push(`✓ 小程序任务 [${name}] 领奖成功: +${res.credit ?? 0} 积分`);
+          onClaimed(code);
         } else {
           logs.push(`! 小程序任务 [${name}] 领奖失败: ${res.reason || "未知原因"}`);
           if (res.restricted) {
@@ -377,6 +451,7 @@ export async function runMiniProgramTasks(acct, opts = {}) {
         lit += 1;
         claimed += 1;
         logs.push(`✓ 小程序任务 [${name}] 点亮并领奖成功: +${res.credit ?? 0} 积分`);
+        onClaimed(code);
       } else {
         logs.push(`? 小程序任务 [${name}] 已上报，领奖将在下轮重试`);
         if (res.restricted) {

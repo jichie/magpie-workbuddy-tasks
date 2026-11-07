@@ -28,6 +28,7 @@ export function localTime(y, monthIndex, day, hour, minute = 0) {
 
 function cloneTask(t) {
   // 内部形态：current/target 拍平（引擎看到的列表响应里它们住在 progress 里）
+  // 上游锁字段（0.3.2 实测）：种子带了才透传（模拟上游清单自带 locked/unlock_at）
   return {
     task_code: t.task_code,
     title: t.title ?? t.task_code,
@@ -39,6 +40,8 @@ function cloneTask(t) {
     reward_energy: t.reward_energy ?? 0,
     current: t.progress?.current ?? t.current ?? 0,
     target: t.progress?.target ?? t.target ?? 1,
+    ...(t.locked !== undefined ? { locked: t.locked } : {}),
+    ...(t.unlock_at !== undefined ? { unlock_at: t.unlock_at } : {}),
   };
 }
 
@@ -120,6 +123,10 @@ export function wbBackend(opts = {}) {
           description: t.description,
           jump_url: t.jump_url,
           accept_status: t.accept_status,
+          // 上游锁字段（0.3.2）：种子带了才出现在响应里（缺失 = 上游没给，
+          // 引擎 fetchMPTasks 归一 false/""）
+          ...(t.locked !== undefined ? { locked: t.locked } : {}),
+          ...(t.unlock_at !== undefined ? { unlock_at: t.unlock_at } : {}),
           task_type: t.task_type,
           progress: { current: t.current, target: t.target },
           reward_credit: t.reward_credit,
@@ -247,7 +254,8 @@ export function makeAcct(overrides = {}) {
   };
 }
 
-// 任务种子的简写。
+// 任务种子的简写。extra.locked / extra.unlock_at（可选）：上游清单的次日锁字段，
+// 只有用例显式给了才出现在清单响应里（模拟「上游带/不带锁字段」两种形态）。
 export function task(code, extra = {}) {
   return {
     task_code: code,
@@ -259,6 +267,8 @@ export function task(code, extra = {}) {
     progress: { current: extra.current ?? 0, target: extra.target ?? 1 },
     reward_credit: extra.reward ?? 100,
     reward_energy: extra.reward_energy ?? 0,
+    ...(extra.locked !== undefined ? { locked: extra.locked } : {}),
+    ...(extra.unlock_at !== undefined ? { unlock_at: extra.unlock_at } : {}),
   };
 }
 

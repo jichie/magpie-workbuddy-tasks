@@ -658,6 +658,8 @@ function selectedCodeSet(codes) {
 //  （MP 专属任务除外——它们由小程序链路处理，见 engine/miniprogram.mjs）。
 //   空数组/未传 = 全部任务（旧行为）。
 //   opts.mpTasks —— 显式 false 关闭 2b 的小程序链式任务（缺省开启）。
+//   opts.travel —— 显式 false 关闭第 3 步的猫猫旅行检查（缺省开启；runner 批量
+//   编排里旅行只由 travel 腿负责，growth 腿传 false 避免重复跑旅行）。
 // GrowsResult: {ok, logs, earnedCredit, credit, energy, lit, claimed, restricted?}
 export async function runGrowthTasks(acct, opts = {}) {
   const ctx = makeCtx(opts);
@@ -805,14 +807,19 @@ export async function runGrowthTasks(acct, opts = {}) {
     }
   }
 
-  // 3. 顺手检查猫猫旅行
-  const trRes = await runCatTravel(acct, run);
-  if (trRes.msg) {
-    emit(`猫猫日常: ${trRes.msg}`);
-    if (trRes.credit) totals.credit += trRes.credit;
-  }
-  if (trRes.restricted) {
-    return { ok: false, restricted: true, logs, earnedCredit: totals.credit, ...totals };
+  // 3. 顺手检查猫猫旅行（opts.travel === false 时整段跳过：一次 travel/status 都
+  //     不发、日志也不出现「猫猫日常」）。runner 的批量编排里旅行只由 travel 腿
+  //     负责（growth 腿显式传 travel:false），否则「只勾 growth」的批量会跑旅行、
+  //     「growth+travel」的批量会跑两次；直接调用本函数（旧测试/嵌入）缺省仍检查。
+  if (opts.travel !== false) {
+    const trRes = await runCatTravel(acct, run);
+    if (trRes.msg) {
+      emit(`猫猫日常: ${trRes.msg}`);
+      if (trRes.credit) totals.credit += trRes.credit;
+    }
+    if (trRes.restricted) {
+      return { ok: false, restricted: true, logs, earnedCredit: totals.credit, ...totals };
+    }
   }
 
   // 4. 结算（hub 会顺带刷新积分余额，这里以能量余额回显代之）

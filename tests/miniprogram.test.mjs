@@ -26,6 +26,7 @@ import {
   isMPCode,
   mpBase,
   mpEventForCode,
+  parseMPLock,
   reportMPEvents,
   runMiniProgramTasks,
 } from "../engine/miniprogram.mjs";
@@ -78,8 +79,8 @@ test("fetchMPTasks：MP 头族拉取 + 规范化形状（spec 补 reward）", as
   const s1 = tasks.find((t) => t.code === "Sequential_Tasks_1");
   assert.deepEqual(
     Object.keys(s1).sort(),
-    ["acceptStatus", "code", "progress", "rewardCredit", "taskType", "title"].sort(),
-    "规范任务形状（CONTRACT §2 拼写）",
+    ["acceptStatus", "code", "locked", "progress", "rewardCredit", "taskType", "title", "unlockAt"].sort(),
+    "规范任务形状（CONTRACT §2 拼写 + 次日锁字段）",
   );
   assert.equal(s1.acceptStatus, "accepted");
   assert.deepEqual(s1.progress, { current: 0, target: 1 });
@@ -93,6 +94,32 @@ test("fetchMPTasks：MP 头族拉取 + 规范化形状（spec 补 reward）", as
     now: clock.now, sleep: clock.sleep, fetch: zero.fetchImpl, gap: GAP,
   });
   assert.equal(tasks2[0].rewardCredit, MP_TASK_SPECS.school_season.reward, "reward 缺失时由 MP_TASK_SPECS 补齐");
+});
+
+test("fetchMPTasks：上游 locked/unlock_at 逐字透传；缺失时归一 false/\"\"", async () => {
+  const clock = fakeClock(NOW);
+  // 实测账号 B 实测形态：ST3 not_accepted + locked:true + unlock_at(+08:00 ISO)
+  const backend = wbBackend({
+    clock,
+    tasks: [
+      task("Sequential_Tasks_3", {
+        title: "小程序对话5次", status: "not_accepted",
+        locked: true, unlock_at: "2026-11-08T00:00:00+08:00",
+      }),
+      task("school_season", { title: "校园日活动", status: "accepted" }), // 上游没给锁字段
+    ],
+    mpOnly: ["Sequential_Tasks_3", "school_season"],
+    litRules: {},
+  });
+  const tasks = await fetchMPTasks(makeAcct(), {
+    now: clock.now, sleep: clock.sleep, fetch: backend.fetchImpl, gap: GAP,
+  });
+  const s3 = tasks.find((t) => t.code === "Sequential_Tasks_3");
+  assert.equal(s3.locked, true, "上游 locked:true 透传");
+  assert.equal(s3.unlockAt, "2026-11-08T00:00:00+08:00", "unlock_at 原样透传（解析留给投影）");
+  const school = tasks.find((t) => t.code === "school_season");
+  assert.equal(school.locked, false, "上游没给 locked → 归一 false");
+  assert.equal(school.unlockAt, "", "上游没给 unlock_at → 归一空串");
 });
 
 test("mpBase：小程序埋点指纹逐字对齐", () => {
@@ -419,13 +446,81 @@ test("runMiniProgramTasks：codes 勾选只处理选中的 MP 交集", async () 
   const text = res.logs.join("\n");
   assert.equal(res.ok, true, text);
   assert.ok(text.includes("📱 发现 1 个小程序成长任务"), text);
-  assert.ok(text.includes("正在点亮小程序任务 [小程序对话5次] (需上报 5 次)"), text);
+  assert.ok(text.includes("正在点亮小程序任务 [小程序对话5次] (需上报 5 次)..."), text);
   assert.ok(!text.includes("小程序专家对话"), "未选中的任务完全不动作");
   assert.equal(res.earnedCredit, 300);
   // 未选中的任务原封不动
   const s1 = backend.state.tasks.find((t) => t.task_code === "Sequential_Tasks_1");
   assert.equal(s1.accept_status, "accepted");
   assert.equal(s1.current, 0);
+});
+
+test("runMiniProgramTasks：清单自带 locked:true 的任务整条跳过（不传 lockedCodes 也生效）", async () => {
+  const clock = fakeClock(NOW);
+  // 实测账号 B ST3 实测形态：not_accepted + locked:true + unlock_at(+08:00)
+  const backend = wbBackend({
+    clock,
+    tasks: [
+      task("Sequential_Tasks_3", {
+        title: "小程序对话5次", status: "not_accepted", target: 5, reward: 300,
+        locked: true, unlock_at: "2026-11-08T00:00:00+08:00",
+      }),
+      task("Sequential_Tasks_1", { title: "小程序对话", status: "not_accepted", target: 1, reward: 100 }),
+      task("school_season", { title: "校园日活动", status: "accepted", target: 1, reward: 100 }),
+    ],
+    mpOnly: ["Sequential_Tasks_3", "Sequential_Tasks_1", "school_season"],
+    litRules: { chat_request_send: ["Sequential_Tasks_1", "school_season"] },
+  });
+  const res = await runMiniProgramTasks(makeAcct(), {
+    now: clock.now, sleep: clock.sleep, fetch: backend.fetchImpl, gap: GAP,
+  });
+  const text = res.logs.join("\n");
+  assert.equal(res.ok, true, text);
+  // 跳过日志（与 lockedCodes 跳过同一行口径）
+  assert.ok(text.includes("⏳ 小程序任务 [小程序对话5次] 到第二天才能接取任务，跳过"), text);
+
+  // accept 批次只含未锁定任务（ST3 被剔除）；不 report/claim ST3
+  const acceptCall = backend.calls.find((c) => c.path === "/v2/activity/growth/tasks/accept");
+  assert.ok(acceptCall, "ST1 未锁定 → 照常发起接取批次");
+  assert.deepEqual(acceptCall.body.task_codes, ["Sequential_Tasks_1"], "锁定任务不进接取批次");
+  const st3 = backend.state.tasks.find((t) => t.task_code === "Sequential_Tasks_3");
+  assert.equal(st3.accept_status, "not_accepted", "锁定任务状态原封不动");
+  assert.equal(st3.current, 0, "锁定任务不上报（进度不动）");
+  assert.equal(backend.state.claims.includes("Sequential_Tasks_3"), false, "锁定任务不领奖");
+  // 未锁定任务照常接取/点亮/领奖
+  assert.deepEqual(backend.state.claims, ["Sequential_Tasks_1", "school_season"]);
+  assert.equal(res.earnedCredit, 200);
+});
+
+test("runMiniProgramTasks：claimed 优先于锁判断（陈旧锁记录不挡「已领奖，跳过」）", async () => {
+  const clock = fakeClock(NOW);
+  const backend = wbBackend({
+    clock,
+    tasks: [
+      task("Sequential_Tasks_1", { title: "小程序对话", status: "claimed", current: 1, target: 1, reward: 100 }),
+    ],
+    mpOnly: ["Sequential_Tasks_1"],
+    litRules: {},
+  });
+  // 旧缓存形态：claimed 但清单里仍带 locked:true（异常/陈旧数据）
+  const fetchImpl = async (url, init) => {
+    const res = await backend.fetchImpl(url, init);
+    if (new URL(url).pathname === "/v2/activity/growth/tasks") {
+      const body = JSON.parse(await res.text());
+      for (const t of body.data.tasks) t.locked = true;
+      return { status: res.status, text: async () => JSON.stringify(body) };
+    }
+    return res;
+  };
+  const res = await runMiniProgramTasks(makeAcct(), {
+    now: clock.now, sleep: clock.sleep, fetch: fetchImpl, gap: GAP,
+    lockedCodes: ["Sequential_Tasks_1"], // 双来源都命中
+  });
+  const text = res.logs.join("\n");
+  assert.equal(res.ok, true, text);
+  assert.ok(text.includes("✓ 小程序任务 [小程序对话] 已领奖，跳过"), text);
+  assert.ok(!text.includes("到第二天才能接取任务"), "claimed 不被锁字段挡住");
+  assert.equal(backend.state.claims.includes("Sequential_Tasks_1"), false, "已领奖不再重复领");
 });
 
 test("runGrowthTasks 集成：2b 在普通任务之后、猫猫旅行之前；收益并入 totals", async () => {
@@ -511,4 +606,116 @@ test("isMPCode：MP_TASK_SPECS 命中或 Sequential_Tasks_ 前缀", () => {
   assert.equal(isMPCode("Sequential_Tasks_99"), true, "前缀兼容");
   assert.equal(isMPCode("create_canvas"), false);
   assert.equal(isMPCode(""), false);
+});
+
+// ---- 次日锁（需求 2）---------------------------------------------------------
+
+test("parseMPLock：英文/中文/多余空白都解析出 until；无锁语义或垃圾输入返回 null", () => {
+  // 已知形态（2026-11-07 生产实测）
+  assert.deepEqual(parseMPLock("task locked until 2026-11-07"), { until: "2026-11-07" });
+  // 容忍大小写与多余空白
+  assert.deepEqual(parseMPLock("Task  Locked   Until  2026-11-07"), { until: "2026-11-07" });
+  assert.deepEqual(parseMPLock("locked until 2026-11-07 00:00"), { until: "2026-11-07" });
+  // 中文表述
+  assert.deepEqual(parseMPLock("任务锁定至 2026-11-08，请次日再试"), { until: "2026-11-08" });
+  assert.deepEqual(parseMPLock("锁到 2026-11-07 才可接取"), { until: "2026-11-07" });
+  // 解析不出 → null
+  assert.equal(parseMPLock("task locked until"), null, "有锁语义没日期");
+  assert.equal(parseMPLock("2026-11-07"), null, "裸日期没有锁语义");
+  assert.equal(parseMPLock("task not completed"), null);
+  assert.equal(parseMPLock(""), null);
+  assert.equal(parseMPLock(null), null);
+  assert.equal(parseMPLock(undefined), null);
+  // 非法日期 → null
+  assert.equal(parseMPLock("task locked until 2026-13-40"), null);
+});
+
+test("acceptMPTasks：failures 记录每个失败项的上游原因；锁原因触发 onLock 回调", async () => {
+  const clock = fakeClock(NOW);
+  const backend = wbBackend({
+    clock,
+    tasks: [task("Sequential_Tasks_2", { title: "小程序专家对话", status: "not_accepted" })],
+    mpOnly: ["Sequential_Tasks_2"],
+    litRules: {},
+  });
+  // 上游对 ST2 的接取回「锁到次日」；对不存在的 code 回 unknown_task
+  const fetchImpl = async (url, init) => {
+    const path = new URL(url).pathname;
+    if (path.endsWith("/tasks/accept")) {
+      return {
+        status: 200,
+        text: async () => JSON.stringify({
+          code: 0,
+          data: { results: [
+            { task_code: "Sequential_Tasks_2", status: "error", message: "task locked until 2026-11-07" },
+          ] },
+        }),
+      };
+    }
+    return backend.fetchImpl(url, init);
+  };
+  const locks = [];
+  const out = await acceptMPTasks(makeAcct(), ["Sequential_Tasks_2", "nope_nope"], {
+    now: clock.now, sleep: clock.sleep, fetch: fetchImpl, gap: GAP,
+    onLock: (code, until, reason) => locks.push([code, until, reason]),
+  });
+  // 批次信封成功 → ok 仍为 true（与 tasks.acceptTasks 同款分账语义：条目级失败
+  // 只进 failed/failures，不翻转整批）
+  assert.equal(out.ok, true);
+  assert.deepEqual(out.failed, ["Sequential_Tasks_2", "nope_nope"], "failed 字符串数组保留（兼容旧调用方）");
+  assert.equal(out.failures.length, 2, "failures 与 failed 一一对应");
+  assert.equal(out.failures[0].code, "Sequential_Tasks_2");
+  assert.match(out.failures[0].message, /task locked until 2026-11-07/);
+  assert.equal(out.failures[1].code, "nope_nope");
+  // 锁原因回调：code/until/原始 message
+  assert.deepEqual(locks, [["Sequential_Tasks_2", "2026-11-07", "task locked until 2026-11-07"]]);
+  // 回调抛异常不影响主流程
+  const out2 = await acceptMPTasks(makeAcct(), ["Sequential_Tasks_2"], {
+    now: clock.now, sleep: clock.sleep, fetch: fetchImpl, gap: GAP,
+    onLock: () => { throw new Error("callback boom"); },
+  });
+  assert.equal(out2.ok, true, "回调异常被吞掉，接取结果照常返回");
+  assert.equal(out2.failures.length, 1);
+  assert.match(out2.failures[0].message, /task locked until 2026-11-07/);
+});
+
+test("runMiniProgramTasks：lockedCodes 整条跳过（不进接取批次、不点亮不领奖），日志有提示", async () => {
+  const clock = fakeClock(NOW);
+  const backend = wbBackend({
+    clock,
+    tasks: [
+      task("Sequential_Tasks_2", { title: "小程序专家对话", status: "not_accepted", target: 1, reward: 200 }),
+      task("Sequential_Tasks_4", { title: "小程序定时任务", status: "accepted", target: 1, reward: 100 }),
+    ],
+    mpOnly: ["Sequential_Tasks_2", "Sequential_Tasks_4"],
+    litRules: { automated_task_create_suc: "Sequential_Tasks_4" },
+  });
+  const claimed = [];
+  const res = await runMiniProgramTasks(makeAcct(), {
+    now: clock.now, sleep: clock.sleep, fetch: backend.fetchImpl, gap: GAP,
+    lockedCodes: ["Sequential_Tasks_2"],
+    onClaimed: (code) => claimed.push(code),
+  });
+  const text = res.logs.join("\n");
+  assert.equal(res.ok, true, text);
+  // 锁定任务：不进接取批次（本用例 ST2 是唯一的 not_accepted，批次为空 → 连接取
+  // 请求都不发）、日志有跳过提示、状态原封不动
+  const acceptCall = backend.calls.find((c) => c.path === "/v2/activity/growth/tasks/accept");
+  assert.equal(acceptCall, undefined, "锁定任务从接取批次剔除后批次为空 → 不发 accept");
+  assert.ok(!backend.state.reports.some((e) => e.task_code === "Sequential_Tasks_2"), "锁定任务不上报");
+  assert.ok(text.includes("⏳ 小程序任务 [小程序专家对话] 到第二天才能接取任务，跳过"), text);
+  assert.equal(backend.state.tasks.find((t) => t.task_code === "Sequential_Tasks_2").accept_status, "not_accepted");
+  assert.equal(backend.state.claims.includes("Sequential_Tasks_2"), false, "锁定任务不领奖");
+  // 未锁定的任务照常点亮领奖，onClaimed 回调收到它
+  assert.ok(text.includes("✓ 小程序任务 [小程序定时任务] 点亮并领奖成功"), text);
+  assert.deepEqual(claimed, ["Sequential_Tasks_4"], "领奖成功回调按 code 上报");
+  // 空数组 / 不传 = 无锁，行为与旧版一致
+  const backend2 = wbBackend({
+    clock, tasks: [task("Sequential_Tasks_2", { status: "not_accepted" })], mpOnly: ["Sequential_Tasks_2"], litRules: {},
+  });
+  const res2 = await runMiniProgramTasks(makeAcct(), {
+    now: clock.now, sleep: clock.sleep, fetch: backend2.fetchImpl, gap: GAP, lockedCodes: [],
+  });
+  assert.equal(res2.ok, true);
+  assert.ok(!res2.logs.join("\n").includes("跳过"), "空锁清单 → 不跳过");
 });

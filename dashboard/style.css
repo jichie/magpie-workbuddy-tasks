@@ -1127,7 +1127,7 @@ details[open] > .acct-tasks-summary { color: var(--ink-2); border-bottom: 1px so
 
 /* ---- 排程 -------------------------------------------------------------------- */
 
-.sched { display: grid; gap: 16px; }
+.sched { display: grid; gap: 12px; }
 
 .switch-row { align-items: flex-start; }
 .switch-row .switch-track { margin-top: 1px; }
@@ -1135,16 +1135,30 @@ details[open] > .acct-tasks-summary { color: var(--ink-2); border-bottom: 1px so
 .switch-text strong { font-weight: 600; }
 .switch-text small { font-size: 11.5px; color: var(--ink-3); font-weight: 400; line-height: 1.5; }
 
-.hours { display: grid; gap: 10px; }
-.hour-row {
+/* 小时窗口：两列 × 两行紧凑布局；每行只留 label + input，
+   细节说明统一收在下方 .hours-note，避免每行再占一行 hint。 */
+.hours {
   display: grid;
-  grid-template-columns: 76px minmax(0, 1fr);
-  gap: 3px 10px;
-  align-items: center;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 14px;
 }
-.hour-row .field-label { font-size: 12px; font-weight: 500; letter-spacing: 0; color: var(--ink-2); }
-.hour-row .input { width: 100%; max-width: 220px; }
-.hour-row .hint { grid-column: 2; }
+.hour-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.hour-row .field-label {
+  flex: 0 0 92px;
+  width: 92px;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0;
+  color: var(--ink-2);
+}
+.hour-row .input { flex: 1; width: auto; max-width: none; min-width: 0; }
+.hour-row .hint { display: none; }
 .hours-note { margin-top: -4px; }
 
 .form-actions { display: flex; justify-content: flex-end; }
@@ -1667,6 +1681,8 @@ dialog::backdrop { background: rgba(8, 10, 14, .5); }
   .acct-intl { padding: 8px 16px 0; }
   .acct-tasks .tbl-wrap { padding: 2px 16px 10px; }
   .task-sel-bar { padding-left: 16px; padding-right: 16px; }
+  /* 窄屏：小时窗口降为单列，避免两列时输入框过窄 */
+  .hours { grid-template-columns: minmax(0, 1fr); }
   .acct-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .batchbar { padding: 14px 16px 10px; }
   .batch-actions { margin-left: 0; width: 100%; justify-content: space-between; }

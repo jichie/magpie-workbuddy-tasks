@@ -162,7 +162,7 @@
         <!-- 任务腿勾选是唯一选择源：初始勾选由 app.js 按 settings.legs 回写，HTML 里不写死 checked。 -->
         <fieldset class="segments" id="legsBox">
           <legend class="sr-only">任务腿</legend>
-          <label class="segment"><input type="checkbox" class="leg-check" value="growth"><span>成长任务</span></label>
+          <label class="segment" title="成长任务（含微信小程序链式任务 Sequential_Tasks_1–6；小程序任务随成长任务一起跑）"><input type="checkbox" class="leg-check" value="growth"><span>成长任务</span></label>
           <label class="segment" title="Buddy 盲盒：消耗成长能量开盲盒（不是领奖）；无能量时后端会跳过"><input type="checkbox" class="leg-check" value="buddy"><span>Buddy 盲盒</span></label>
           <label class="segment"><input type="checkbox" class="leg-check" value="travel"><span>猫猫旅行</span></label>
           <label class="segment"><input type="checkbox" class="leg-check" value="night"><span>夜猫子</span></label>
@@ -228,22 +228,27 @@
 
           <div class="hours" role="group" aria-label="排程小时窗口">
             <div class="hour-row">
+              <span class="field-label">小程序链式任务</span>
+              <input class="input input-mono" id="hoursMp" inputmode="numeric" placeholder="留空" aria-label="小程序链式任务小时窗口">
+              <span class="hint">北京时间小时；留空 = 不排程；只跑 Sequential_Tasks 系列小程序任务</span>
+            </div>
+            <div class="hour-row">
               <span class="field-label">Buddy 盲盒</span>
               <input class="input input-mono" id="hoursBuddy" inputmode="numeric" placeholder="留空" aria-label="Buddy 盲盒小时窗口">
               <span class="hint">北京时间小时；留空 = 不排程；会消耗成长能量</span>
             </div>
             <div class="hour-row">
               <span class="field-label">猫猫旅行</span>
-              <input class="input input-mono" id="hoursTravel" inputmode="numeric" placeholder="9,21" aria-label="猫猫旅行小时窗口">
-              <span class="hint">北京时间（UTC+8）小时（0–23）；默认 09:00 与 21:00</span>
+              <input class="input input-mono" id="hoursTravel" inputmode="numeric" placeholder="留空" aria-label="猫猫旅行小时窗口">
+              <span class="hint">北京时间小时；留空 = 不排程</span>
             </div>
             <div class="hour-row">
               <span class="field-label">夜猫子</span>
-              <input class="input input-mono" id="hoursNight" inputmode="numeric" placeholder="1" aria-label="夜猫子小时窗口">
-              <span class="hint">默认北京时间 01:00；上游只在 23:00–08:00 计数</span>
+              <input class="input input-mono" id="hoursNight" inputmode="numeric" placeholder="留空" aria-label="夜猫子小时窗口">
+              <span class="hint">北京时间小时；留空 = 不排程；上游只在 23:00–08:00 计数</span>
             </div>
           </div>
-          <p class="hint hours-note">按北京时间（UTC+8）：默认旅行 09:00 与 21:00；夜猫子 01:00（上游只在 23:00–08:00 计数）；Buddy 盲盒默认不排程（会消耗成长能量）</p>
+          <p class="hint hours-note">北京时间（UTC+8）小时；留空 = 不排程。小程序任务按天解锁，Buddy 盲盒消耗成长能量，夜猫子仅 23:00–08:00 计数。</p>
           <div class="form-actions">
             <button type="button" class="ghost-btn" id="saveHoursBtn">保存窗口</button>
           </div>

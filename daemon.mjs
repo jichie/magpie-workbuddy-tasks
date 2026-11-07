@@ -75,27 +75,25 @@ import { beijingDateKey, beijingHour } from "./engine/constants.mjs"
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const VERSION = (() => {
   try {
-    return String(JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf8")).version || "0.3.1")
+    return String(JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf8")).version || "0.3.2")
   } catch {
-    return "0.3.1"
+    return "0.3.2"
   }
 })()
 
-const LEGS = ["growth", "buddy", "travel", "night"]
-const LEG_NAMES = { growth: "成长任务", buddy: "Buddy 盲盒", travel: "猫猫旅行", night: "夜猫子" }
+const LEGS = ["growth", "mp", "buddy", "travel", "night"]
+const LEG_NAMES = { growth: "成长任务", mp: "小程序链式任务", buddy: "Buddy 盲盒", travel: "猫猫旅行", night: "夜猫子" }
 const HISTORY_CAP = 2000
 
 // 积分缓存的有效期（GET /api/credits，CONTRACT §3）：缓存年龄小于它且未要求
 // refresh 时直接返回缓存，绝不发上游。导出供测试对齐。
 export const CREDITS_TTL_MS = 10 * 60 * 1000
 
-// 排程小时窗口只认这三条腿（契约 §7/§8）：到点自动跑的都是无任务码的腿；
+// 排程小时窗口只认这四条腿（契约 §7/§8）：到点自动跑的都是无任务码的腿；
 // growth 刻意不在排程里（engine/schedule.SCHEDULE_WINDOWS 同口径），只能手动
 // 发起（看板「立即运行」/ POST /api/run / 工具，可配合 codes 勾选）。
-// buddy 默认**不排程**（DEFAULT_SETTINGS.hours.buddy=[]）：开盲盒消耗成长能量，
-// 不给明确授权就绝不自动花；用户在看板/设置里为它配了小时窗口才会自动跑。
 // 手动运行不受此限制——LEGS 仍含 growth，settings.legs 默认也仍含 growth。
-const SCHEDULE_HOURS_LEGS = ["buddy", "travel", "night"]
+const SCHEDULE_HOURS_LEGS = ["mp", "buddy", "travel", "night"]
 
 const DEFAULT_SETTINGS = {
   scheduler: false, // 小时窗口排程总开关：默认停用，须由用户在看板里显式点一次「启用排程」才生效
@@ -103,16 +101,19 @@ const DEFAULT_SETTINGS = {
   legs: ["growth", "travel"], // 手动运行未指定 legs 时的默认腿（growth 仍可手动勾选）
   gapMs: 1500, // 账号之间的基础间隔（手动）；排程时 runner 另加 2–5s 抖动
   jitterMs: [2000, 5000], // 排程运行的账号间抖动（交给 runner，见契约 §0.4）
-  // 北京小时窗口 UTC+8（只有 buddy|travel|night 可配窗口，growth 无窗口；与容器
-  // 时区无关）。buddy 默认空 = 不排程，避免排程自动消耗成长能量开盲盒。
-  hours: { buddy: [], travel: [9, 21], night: [1] },
+  // 北京小时窗口 UTC+8（只有 mp|buddy|travel|night 可配窗口，growth 无窗口；与
+  // 容器时区无关）。**默认全部空 = 默认不排任何腿，留空即不排**：到点自动跑
+  // 意味着自动消耗成长能量/自动接取任务，不给明确授权（显式配小时）就绝不自动
+  // 做；用户在看板/设置里为某条腿配了小时窗口，那条腿才会自动跑。
+  hours: { mp: [], buddy: [], travel: [], night: [] },
   host: { chat: "", bill: "", web: "" }, // 留空 = 用 engine/upstream 的默认
 }
 
-// normalizeScheduleHours(raw) -> {buddy:number[], travel:number[], night:number[]}
-//（导出供测试）键限制为 buddy|travel|night（growth/未知键丢弃），每条腿只留
+// normalizeScheduleHours(raw) -> {mp:number[], buddy:number[], travel:number[], night:number[]}
+//（导出供测试）键限制为 mp|buddy|travel|night（growth/未知键丢弃），每条腿只留
 // 0–23 的整数并去重升序。输入不是对象时返回空腿表（调用方先与
-// DEFAULT_SETTINGS.hours 合并，缺键由此兜底）。
+// DEFAULT_SETTINGS.hours 合并，缺键由此兜底；用户显式写空的腿保持空，不会被
+// 默认值复活——默认值本身也全是空）。
 export function normalizeScheduleHours(raw) {
   const src = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}
   const out = {}
@@ -129,6 +130,37 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const nowIso = () => new Date().toISOString()
 const dateKey = (d = new Date()) =>
   `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`
+
+// ---- 日期键小工具（小程序链式锁专用，全部 UTC 毫秒算术，与宿主时区无关）------
+const DAY_MS = 86400000
+const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/
+
+function dayKeyToUtcMs(key) {
+  const [y, m, d] = key.split("-").map(Number)
+  return Date.UTC(y, m - 1, d)
+}
+
+function utcMsToDayKey(ms) {
+  const d = new Date(ms)
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`
+}
+
+// isValidDayKey：日历上真实存在的 YYYY-MM-DD（2026-13-40 一律 false）
+function isValidDayKey(key) {
+  if (!DAY_KEY_RE.test(key)) return false
+  return utcMsToDayKey(dayKeyToUtcMs(key)) === key
+}
+
+// beijingDayFromIso("2026-11-08T00:00:00+08:00") -> "2026-11-08"（不可解析 → null）
+// 上游 unlock_at 是**带时区**的 ISO（实测 +08:00）：先 Date.parse 成 epoch 再按
+// 北京日取 —— 绝不能直接 slice 字符串，Z/UTC 形态会差一天。
+function beijingDayFromIso(iso) {
+  const s = String(iso ?? "").trim()
+  if (!s) return null
+  const ms = Date.parse(s)
+  if (!Number.isFinite(ms)) return null
+  return beijingDateKey(ms)
+}
 
 // scrub：把可能夹带凭据的文本洗一遍再出门（Bearer 头、JWT 形状的串）
 const SECRET_RES = [/(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, /\beyJ[A-Za-z0-9._-]{16,}/g]
@@ -223,9 +255,38 @@ export function routeNeedsKey() {
 // 判断字段出自 engine/taskkind.resolveTaskKind（与 fetchTasks 的 unforgeable/
 // reason、流水线的接取/点亮决策同一判断源），前端据此渲染，不要再拿 jumpUrl
 // 形状自己猜（真实数据 19 项全部有非空 jumpUrl）。
-export function snapTask(t) {
+// snapTask(t, lock?) —— 次日锁投影（0.3.2 实测口径：上游清单自带 locked/unlock_at，
+// 锁的主依据是**任务自身字段**，mp-locks 只是旧缓存的回退）：
+//   1. 任务带自身锁信息（typeof locked === "boolean" 或 unlockAt 非空，新缓存/
+//      新鲜清单必然带）→ 以上游为准：locked=false 必须能覆盖 mp-locks 里的陈旧
+//      锁（「实测账号 ST2 上游已 locked:false」绝不能被推断/旧锁标成锁定）；
+//   2. locked 仅在 acceptStatus==="not_accepted" 时为 true —— accepted/claimed
+//      即使带 locked:true 也不标锁（绝不显示锁定徽章/提示）；
+//   3. lockedUntil 从 unlockAt 解析为北京日期（带时区 ISO，Date.parse + 北京日，
+//      不能直接 slice）；解析失败回退 mp-locks 的 until；
+//   4. 任务完全没有自身锁字段（旧缓存/8·14 键老形态）→ 回退传入的 mp-locks 锁表；
+//   5. lockHint 固定「到第二天才能接取任务（YYYY-MM-DD 起可接）」，没有日期时
+//      「到第二天才能接取任务」。
+// 三字段始终存在；锁定项 canAccept 一律 false（与 rk.canAccept 取与），canLight
+// 等其余字段不变。
+export function snapTask(t, lock = null) {
   const p = t?.progress ?? {}
   const rk = resolveTaskKind(t)
+  const status = String(t?.acceptStatus ?? "")
+  const hasOwnLockInfo = typeof t?.locked === "boolean" || String(t?.unlockAt ?? "").trim() !== ""
+  const lockUntil = String(lock?.until ?? "")
+  let locked = false
+  let until = ""
+  if (hasOwnLockInfo) {
+    locked = t.locked === true && status === "not_accepted"
+    if (locked) {
+      until = beijingDayFromIso(t.unlockAt) ?? (isValidDayKey(lockUntil) ? lockUntil : "")
+    }
+  } else {
+    // 旧缓存回退：mp-locks 锁表（accept 失败落盘的显式锁 / doClaim 的即时锁）
+    locked = !!lock && isValidDayKey(lockUntil) && status === "not_accepted"
+    if (locked) until = lockUntil
+  }
   return {
     code: t?.code ?? "",
     title: t?.title ?? "",
@@ -242,14 +303,18 @@ export function snapTask(t) {
     unforgeable: rk.unforgeable === true,
     reason: String(rk.reason ?? ""),
     // 收敛结论：现在就能进「接取」（= not_accepted && 非 auto && !unforgeable，
-    // 与引擎 needsAccept 同口径）
-    canAccept: rk.canAccept === true,
+    // 与引擎 needsAccept 同口径；被次日锁锁定的任务再与 !locked 取与）
+    canAccept: rk.canAccept === true && !locked,
     // 收敛结论：引擎能/会用事件上报点亮（accepted，或 auto 的 not_accepted/
     // accepted；desktopOnly / 未收录一律 false；夜间窗口不含在内）
     canLight: rk.canLight === true,
     // 非空 = 事件 id 钉死该专家（TASK_SPECS 钉死或 jump_url 派生）；
     // 空串 = 不钉 id（expert/team 类走池子轮换，其它 kind 无专家 id）
     pinnedExpertId: String(rk.pinnedExpertId ?? ""),
+    // 次日锁三字段（始终存在）：提示文案固定口径，前端直接渲染不必自己拼。
+    locked,
+    lockedUntil: locked ? until : "",
+    lockHint: locked ? (until ? `到第二天才能接取任务（${until} 起可接）` : "到第二天才能接取任务") : "",
   }
 }
 
@@ -269,6 +334,9 @@ export const SNAP_VERSION = 2
 // 落盘用：规范 Task 的可序列化形状（只挑契约 §2 字段，raw/多余键不落盘）。
 // ?? 兜底保证 v2 条目「字段完备」——哪怕引擎违约给了缺字段的 Task，落盘后
 // 依然是可完整重投影的规范形状（v2 读取端因此可以信任条目）。
+// 次日锁（0.3.2）：locked/unlockAt 是**投影的输入字段**（上游清单自带，MP 任务
+// 专属；web 清单任务恒 false/""），随规范 Task 落盘 —— v2 重投影直接以上游为
+// 准，不依赖 mp-locks 推断。lockedUntil/lockHint 是投影输出，不落盘。
 function cacheTask(t) {
   const p = t?.progress ?? {}
   return {
@@ -277,6 +345,8 @@ function cacheTask(t) {
     description: t?.description ?? "",
     jumpUrl: t?.jumpUrl ?? "",
     acceptStatus: t?.acceptStatus ?? "",
+    locked: t?.locked === true,
+    unlockAt: String(t?.unlockAt ?? ""),
     taskType: t?.taskType ?? "",
     progress: { current: Number(p.current) || 0, target: Number(p.target) || 0 },
     rewardCredit: Number(t?.rewardCredit) || 0,
@@ -316,7 +386,9 @@ export function canReprojectTask(t) {
 // jumpUrl 重算，与直接刷新逐字节一致 —— 旧 8 键缓存升级读不必等下一次
 // ?refresh=）；无法无损重建 → 整份快照过期返回 null，前端显示「快照已过期，
 // 请刷新」。宁可空，不可错。
-export function projectSnapshot(snap) {
+// locks（可选）是 mp-locks 的锁表 {code: {until, reason}}：映射时按 code 传给
+// snapTask 投影出 locked/lockedUntil/lockHint；不传 = 无锁（兼容旧调用/老缓存）。
+export function projectSnapshot(snap, locks = null) {
   if (!snap || typeof snap !== "object" || Array.isArray(snap)) return null
   if (!Array.isArray(snap.tasks)) return null
   if (snap.snapVersion === SNAP_VERSION) {
@@ -328,7 +400,7 @@ export function projectSnapshot(snap) {
     if (!snap.tasks.every(canReprojectTask)) return null
   }
   return {
-    tasks: snap.tasks.map(snapTask),
+    tasks: snap.tasks.map((t) => snapTask(t, locks?.[t?.code] ?? null)),
     energy: snap.energy ?? null,
     streak: snap.streak ?? null,
     days: snap.days ?? null,
@@ -598,9 +670,10 @@ export async function startDaemon(opts = {}) {
   // 只有 POST /api/settings（校验 boolean）或看板开关能显式打开。
   settings.scheduler = settings.scheduler === true
   settings.claim = settings.claim === true
-  // 排程小时窗口只认 buddy|travel|night（本版起 growth 不再由排程触发）：旧
-  // settings.json 里的 hours.growth 在这里丢弃，未知键一律不收，缺的键补默认。
-  // （growth 仍可手动跑：settings.legs / POST /api/run 的 legs 不受影响。）
+  // 排程小时窗口只认 mp|buddy|travel|night（本版起 growth 不再由排程触发）：旧
+  // settings.json 里的 hours.growth 在这里丢弃，未知键一律不收，缺的键补默认
+  //（默认值全空 = 默认不排；用户 settings.json 里显式写空的腿保持空，不会被
+  // 默认值复活）。growth 仍可手动跑：settings.legs / POST /api/run 的 legs 不受影响。
   settings.hours = normalizeScheduleHours({ ...DEFAULT_SETTINGS.hours, ...(settings.hours ?? {}) })
   settings.host = { ...DEFAULT_SETTINGS.host, ...(settings.host ?? {}) }
   let snapshots = readJson(snapshotsFile, {})
@@ -617,6 +690,11 @@ export async function startDaemon(opts = {}) {
   // GET /api/credits 重新拉取）。
   let creditsCache = readJson(creditsFile, {})
   if (!creditsCache || typeof creditsCache !== "object" || Array.isArray(creditsCache)) creditsCache = {}
+  // 小程序链式任务锁（0.3.2）：state/mp-locks.json 记录 次日锁 与
+  // 领奖日期（uid -> code -> 北京日）。损坏/形状不对 → 空表起步：顶多丢一层
+  // 防御/即时锁（主依据是上游清单的 locked/unlock_at），绝不阻断启动。
+  const mpLocksFile = join(stateDir, "mp-locks.json")
+  const mpLocks = normalizeMPLockState(readJson(mpLocksFile, null))
 
   function readSettings() {
     return JSON.parse(JSON.stringify(settings))
@@ -629,6 +707,98 @@ export async function startDaemon(opts = {}) {
   const saveHubImports = () => writeJson(hubImportsFile, hubImports)
   const saveDailyActivity = () => writeJson(dailyActivityFile, dailyActivity)
   const saveCredits = () => writeJson(creditsFile, creditsCache)
+  const saveMPLocks = () => writeJson(mpLocksFile, mpLocks)
+
+  // ---- 小程序链式任务锁（0.3.2）：落盘 + 查询 -------------------------------
+  //
+  // mp-locks.json 形状：{ locks: {uid: {code: {until, reason, at}}}, claims: {uid: {code: "YYYY-MM-DD"}} }
+  //   locks  —— 次日锁：until 是北京时间日期，**until 当天即解锁**（「锁到 11-07」
+  //             表示 11-07 可用）；同一 code 永远保留更晚的 until。
+  //   claims —— 链式任务的领奖日期（北京日，doClaim/onClaimed 记账）。
+  //
+  // 定位（0.3.2 实测后收窄）：上游清单自带 locked/unlock_at，是快照投影的**唯一
+  // 主依据**（snapTask 上游字段优先）。mp-locks 只剩两个防御/过渡用途：
+  //   1. accept 被上游锁拒时解析失败消息落盘的显式锁（兼容假引擎/旧引擎）；
+  //   2. doClaim/onClaimed 领奖成功时给下一环记「明天」的即时锁 —— 只在旧缓存
+  //      （无自身锁字段）的回退路径可见，下一次快照刷新后必被上游字段覆盖
+  //      （上游 locked:false 优先于这里的陈旧锁）。
+
+  // 归一（启动时读入）：损坏/形状不对的条目逐条丢弃，绝不整份拒读 —— 保住还
+  // 能用的部分比全丢重推更接近真实状态。
+  function normalizeMPLockState(raw) {
+    const out = { locks: {}, claims: {} }
+    const src = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}
+    const locks = src.locks && typeof src.locks === "object" && !Array.isArray(src.locks) ? src.locks : {}
+    for (const [uid, codes] of Object.entries(locks)) {
+      if (!uid || !codes || typeof codes !== "object" || Array.isArray(codes)) continue
+      const per = {}
+      for (const [code, entry] of Object.entries(codes)) {
+        if (!code || !entry || typeof entry !== "object" || Array.isArray(entry)) continue
+        const until = String(entry.until ?? "")
+        if (!isValidDayKey(until)) continue
+        per[code] = { until, reason: String(entry.reason ?? "").slice(0, 200), at: String(entry.at ?? "") }
+      }
+      if (Object.keys(per).length) out.locks[uid] = per
+    }
+    const claims = src.claims && typeof src.claims === "object" && !Array.isArray(src.claims) ? src.claims : {}
+    for (const [uid, codes] of Object.entries(claims)) {
+      if (!uid || !codes || typeof codes !== "object" || Array.isArray(codes)) continue
+      const per = {}
+      for (const [code, day] of Object.entries(codes)) {
+        if (!code || typeof day !== "string" || !isValidDayKey(day)) continue
+        per[code] = day
+      }
+      if (Object.keys(per).length) out.claims[uid] = per
+    }
+    return out
+  }
+
+  // 北京「今天」/「明天」（beijingDateKey 口径，UTC 16:00 翻北京日；now 可注入）
+  const beijingToday = () => beijingDateKey(now())
+  const beijingTomorrow = () => beijingDateKey(now() + DAY_MS)
+
+  // recordMPLock(uid, code, until, reason)：记一条次日锁。until 必须是合法的
+  // YYYY-MM-DD；同一 code 取更晚的 until（更早的信息不覆盖，显式锁优先于推断）。
+  function recordMPLock(uid, code, until, reason = "") {
+    if (!uid || !code || !isValidDayKey(String(until ?? ""))) return false
+    const key = String(until)
+    const per = (mpLocks.locks[uid] ??= {})
+    const prev = per[code]
+    if (prev && prev.until >= key) return true // 已有更晚（或同日）的锁：不动
+    per[code] = { until: key, reason: String(reason ?? "").slice(0, 200), at: new Date(now()).toISOString() }
+    return saveMPLocks()
+  }
+
+  // recordMPClaim(uid, code)：领奖日期 = 北京时间今天。
+  function recordMPClaim(uid, code) {
+    if (!uid || !code) return false
+    const per = (mpLocks.claims[uid] ??= {})
+    per[code] = beijingToday()
+    return saveMPLocks()
+  }
+
+  // lockedMapFor(uid) -> {code: {until, reason}}：当前仍生效的锁。生效条件
+  // until > 北京今天（until 当天即解锁）；顺手清掉已过期条目（有过期才写盘，
+  // 平时只读不发 IO）。注意：这是**旧缓存/防御层**的锁源 —— 上游清单自带
+  // locked/unlock_at 时投影以上游为准（snapTask），上游 locked:false 会覆盖
+  // 这里的陈旧锁；下一次快照刷新后 mp-locks 即被上游字段取代。
+  function lockedMapFor(uid) {
+    const today = beijingToday()
+    const per = mpLocks.locks[uid]
+    if (!per || typeof per !== "object") return {}
+    const out = {}
+    let pruned = false
+    for (const [code, entry] of Object.entries(per)) {
+      if (!(entry?.until > today)) {
+        delete per[code]
+        pruned = true
+        continue
+      }
+      out[code] = { until: entry.until, reason: entry.reason ?? "" }
+    }
+    if (pruned) saveMPLocks()
+    return out
+  }
 
   if (!existsSync(settingsFile)) saveSettings()
 
@@ -677,6 +847,12 @@ export async function startDaemon(opts = {}) {
       dailyActivity[uid] = key
       saveDailyActivity()
     },
+    // 小程序链式任务锁（需求 2）：runner 在 growth 腿的 2b 与 mp 腿把这些透传给
+    // 引擎（engine/runner._mpLockOpts）—— mpLockedCodes 供引擎整条跳过仍锁定的
+    // 任务；onLock 落盘上游锁原因（accept 被拒时）；onClaimed 记领奖日期。
+    onMPLock: (uid, code, until, reason) => recordMPLock(uid, code, until, reason),
+    onMPClaimed: (uid, code) => recordMPClaim(uid, code),
+    mpLockedCodes: (uid) => Object.keys(lockedMapFor(uid)),
     // 铁律 4：全局节流器（上面创建的唯一实例）—— job 腿与 token 刷新的每一次
     // 上游调用都经它排队对齐，与快照刷新/手动操作共用同一份「上次放行时刻」。
     ...(upstreamSpacer ? { spacer: upstreamSpacer } : {}),
@@ -754,7 +930,7 @@ export async function startDaemon(opts = {}) {
   // fetch/时钟/bases —— 否则会绕开注入的 fetch 替身与防风控节奏。spacer 同理：
   // 这里是 daemon 内所有引擎调用的唯一 opts 工厂，全局节流器经它进入每一条
   // 路径 —— 任何调用点新建 opts 都自动带上同一个 spacer，不存在「新 ctx 忘了对齐」。
-  function engineOpts() {
+  function engineOpts(acct = null) {
     return {
       ...(opts.fetch ? { fetch: opts.fetch } : {}),
       now,
@@ -763,6 +939,15 @@ export async function startDaemon(opts = {}) {
       ...(upstreamSpacer ? { spacer: upstreamSpacer } : {}),
       bases: { chat: settings.host.chat || "", bill: settings.host.bill || "", web: settings.host.web || "" },
       env: { WB_CONFIG_DIR: cfgDir, WB_STATE_DIR: stateDir },
+      // 传入账号时附带小程序锁回调（需求 2）：手动 /api/task/accept、
+      // /api/task/claim 与快照刷新同样记录锁与领奖，保证 mp-locks.json 与批量
+      // job 路径同一份台账。回调异常由引擎侧吞掉，不影响主流程。
+      ...(acct
+        ? {
+            onLock: (code, until, reason) => recordMPLock(acct.uid, code, until, reason),
+            onClaimed: (code) => recordMPClaim(acct.uid, code),
+          }
+        : {}),
     }
   }
 
@@ -787,7 +972,7 @@ export async function startDaemon(opts = {}) {
         if (!acct) continue
         try {
           await sleepFn(1000) // 限速红线：与上一轮上游调用（可能是刚结束的 job）之间 ≥1s
-          const tasks = await fetchTasks(acct, engineOpts())
+          const tasks = await fetchTasks(acct, engineOpts(acct))
           // 小程序清单合并（0.3.0）：web 清单之后用小程序头族再拉一份 MP 清单，
           // **只补 web 清单里没有的 code**（Sequential_Tasks_1–6 + school_season
           // 这类 MP 专属任务）——同一 code 以 web 清单为准，绝不重复/覆盖 web
@@ -797,7 +982,7 @@ export async function startDaemon(opts = {}) {
           if (typeof fetchMPTasks === "function") {
             try {
               await sleepFn(1000) // 限速红线：与 fetchTasks 之间 ≥1s
-              const mpTasks = await fetchMPTasks(acct, engineOpts())
+              const mpTasks = await fetchMPTasks(acct, engineOpts(acct))
               if (Array.isArray(mpTasks) && mpTasks.length) {
                 const have = new Set(merged.map((t) => t.code))
                 const mpOnly = mpTasks.filter((t) => t?.code && !have.has(t.code))
@@ -807,18 +992,20 @@ export async function startDaemon(opts = {}) {
               log(`[snapshot] ${uid} 小程序清单拉取失败（不影响 web 快照）：${shortErr(e)}`)
             }
           }
+          // 次日锁（0.3.2）：上游清单自带 locked/unlock_at，随 cacheTask 落盘；
+          // 投影（snapTask）以上游字段为准 —— 这里不再做任何锁推断/落盘。
           let energy
           let days
           const up = engine?.upstream
           if (typeof up?.callJSON === "function" && typeof up?.growthBase === "function" && now() < deadline) {
             await sleepFn(1000) // 限速红线：两次上游调用 ≥1s
-            const e = await up.callJSON(acct, "chat", `${up.growthBase()}/v2/activity/growth/energy`, {}, engineOpts())
+            const e = await up.callJSON(acct, "chat", `${up.growthBase()}/v2/activity/growth/energy`, {}, engineOpts(acct))
             // 字段口径与 engine/tasks.fetchEnergy 对齐（P1 实测 2026-10-31：上游
             // 是 data.balance，data 里没有 energy/value 键）——只认这一种拼写，
             // 不做多拼写回退链（契约 §3：daemon 只做投影，不猜第二种键名）。
             if (e?.ok && e?.code === 0) energy = e.data?.balance ?? 0
             await sleepFn(1000)
-            const s = await up.callJSON(acct, "chat", `${up.growthBase()}/activity/growth/streak`, {}, engineOpts())
+            const s = await up.callJSON(acct, "chat", `${up.growthBase()}/activity/growth/streak`, {}, engineOpts(acct))
             // 字段口径与 engine/tasks.fetchGrowthSummary 对齐（P1 实测 2026-10-31：
             // data.streak.days；makeup_cards/redemption_status 同层）——data 顶层
             // 没有 days/streakDays 键，绝不回退去猜。
@@ -1202,7 +1389,19 @@ export async function startDaemon(opts = {}) {
     if (!acct) throw new Error(`找不到账号 ${uid}（重新扫描账号或检查 plugin-auth.json）`)
     // 小程序任务（0.3.0 起进快照）领奖走小程序头族（MP_HEADERS），web 回退语义
     // 由 claimMPTask 自带；返回形状与 web 领奖一致（MP 模块无 via 字段 → 空串）。
-    const r = await fn(acct, c, engineOpts())
+    const r = await fn(acct, c, engineOpts(acct))
+    // 0.3.2：MP 领奖成功 → 记领奖日期；Sequential_Tasks_N（N<6）同时给 N+1 记
+    // 一条「明天」的即时锁 —— 让旧缓存（无上游锁字段）的看板在下一次快照刷新前
+    // 也能显示锁定；刷新后以上游 locked/unlock_at 为准（上游 locked:false 会覆盖
+    // 这里的陈旧锁）。recordMPLock 同 code 取更晚，不会覆盖更晚的显式锁。
+    if (isMPCode(c) && r?.ok) {
+      recordMPClaim(uid, c)
+      const m = /^Sequential_Tasks_(\d+)$/.exec(c)
+      const n = m ? Number(m[1]) : 0
+      if (n >= 1 && n < 6) {
+        recordMPLock(uid, `Sequential_Tasks_${n + 1}`, beijingTomorrow(), "完成任务后次日才能接取")
+      }
+    }
     return {
       ok: !!r?.ok,
       credit: r?.credit ?? 0,
@@ -1234,15 +1433,31 @@ export async function startDaemon(opts = {}) {
     //（无独立 already 数组），合并后 MP 侧不贡献 already。
     const out = { accepted: [], already: [], failed: [] }
     if (web.length) {
-      const r = await engine.tasks.acceptTasks(acct, web, engineOpts())
+      const r = await engine.tasks.acceptTasks(acct, web, engineOpts(acct))
       out.accepted.push(...(r?.accepted ?? []))
       out.already.push(...(r?.already ?? []))
       out.failed.push(...(r?.failed ?? []))
     }
     if (mp.length) {
-      const r = await engine.miniprogram.acceptMPTasks(acct, mp, engineOpts())
+      const r = await engine.miniprogram.acceptMPTasks(acct, mp, engineOpts(acct))
       out.accepted.push(...(r?.accepted ?? []))
       out.failed.push(...(r?.failed ?? []))
+      // 需求 2 的防御层：onLock 回调（真引擎经 engineOpts 已带上）之外，再从
+      // 返回的 failed/failures 里解析一遍锁原因并落盘 —— 兼容未实现回调的假
+      // 引擎/旧引擎。recordMPLock 同 code 取更晚，与回调重复登记无害。
+      const parse = typeof engine.miniprogram.parseMPLock === "function" ? engine.miniprogram.parseMPLock : null
+      if (parse) {
+        const items = [
+          ...(Array.isArray(r?.failures) ? r.failures : []),
+          ...(Array.isArray(r?.failed) ? r.failed : []),
+        ]
+        for (const item of items) {
+          const fcode = typeof item === "string" ? item : String(item?.code ?? "")
+          const msg = typeof item === "string" ? "" : String(item?.message ?? "")
+          const lock = fcode ? parse(msg) : null
+          if (lock) recordMPLock(uid, fcode, lock.until, msg.slice(0, 200))
+        }
+      }
     }
     out.failed = out.failed.map((f) => (typeof f === "string" ? f : { ...f, reason: scrub(f?.reason ?? "") }))
     return out
@@ -1351,8 +1566,9 @@ export async function startDaemon(opts = {}) {
   function accountRow(a) {
     const exp = Number(a.expires) || 0
     // 读取路径 = 投影的唯一出口：缓存（无论 v2 规范还是旧版投影形态）出门前
-    // 一律 projectSnapshot 现场重投影；无法无损重建 → null（快照已过期）
-    const snap = projectSnapshot(snapshots[a.uid] ?? null)
+    // 一律 projectSnapshot 现场重投影；无法无损重建 → null（快照已过期）。
+    // 锁表（mp-locks，需求 2）按 uid 现取：锁定任务的行立刻带 locked/lockHint。
+    const snap = projectSnapshot(snapshots[a.uid] ?? null, lockedMapFor(a.uid))
     return {
       uid: a.uid ?? "",
       nickname: a.nickname ?? a.accountId ?? a.uid ?? "",
@@ -1805,9 +2021,10 @@ export async function startDaemon(opts = {}) {
         const [a, b] = body.jitterMs.map(Number)
         if (Number.isFinite(a) && Number.isFinite(b)) settings.jitterMs = [Math.max(0, a), Math.max(a, b)]
       }
-      // 排程小时窗口只收 buddy|travel|night（growth 不再由排程触发，写进来也
-      // 丢弃）。非数组值沿用旧行为「忽略该键」；数组值统一走
-      // normalizeScheduleHours 的同款校验：0–23 整数、去重升序。
+      // 排程小时窗口只收 mp|buddy|travel|night（growth 不再由排程触发，写进来
+      // 也丢弃）。非数组值沿用旧行为「忽略该键」；数组值统一走
+      // normalizeScheduleHours 的同款校验：0–23 整数、去重升序；显式写空的腿
+      // 保持空（默认值也全空，留空即不排）。
       if (body.hours && typeof body.hours === "object" && !Array.isArray(body.hours)) {
         const merged = { ...settings.hours }
         for (const leg of SCHEDULE_HOURS_LEGS) {

@@ -277,3 +277,148 @@ test("runner：腿的顺序固定 growth → travel → night；未知腿剔除"
   const done = await runner.wait(job.id);
   assert.deepEqual(done.steps.map((s) => s.leg), ["growth", "travel", "night"]);
 });
+
+// ---- 需求 1：不勾选猫猫旅行时不许跑旅行 ------------------------------------
+// 旅行只由 travel 腿触发：growth 腿显式 travel:false（runGrowthTasks 第 3 步整段
+// 跳过，一次 travel/status 都不发）。直调 runGrowthTasks 不传 travel 仍是旧行为
+//（默认检查，tests/miniprogram.test.mjs 的集成用例保持覆盖）。
+
+test("runner：legs=[growth] 绝不跑旅行（无 travel/status、无 travel 步骤）", async () => {
+  const clock = fakeClock(DAY);
+  const backend = simpleBackend(clock);
+  const runner = new JobRunner({
+    accounts: [makeAcct()],
+    now: clock.now,
+    sleep: clock.sleep,
+    fetch: backend.fetchImpl,
+  });
+  const job = runner.start({ legs: ["growth"] });
+  const done = await runner.wait(job.id);
+  assert.equal(done.state, "done");
+  assert.ok(done.steps.every((s) => s.leg === "growth"), "steps 里没有 travel 腿");
+  assert.equal(
+    backend.calls.filter((c) => c.path.startsWith("/activity/growth/buddy/travel/")).length,
+    0,
+    "growth 腿收尾不再发任何 travel 请求（status/depart/claim/config 都不发）",
+  );
+});
+
+test("runner：legs=[travel] 有且仅有一次 travel/status", async () => {
+  const clock = fakeClock(DAY);
+  const backend = simpleBackend(clock);
+  const runner = new JobRunner({
+    accounts: [makeAcct()],
+    now: clock.now,
+    sleep: clock.sleep,
+    fetch: backend.fetchImpl,
+  });
+  const job = runner.start({ legs: ["travel"] });
+  const done = await runner.wait(job.id);
+  assert.equal(done.state, "done");
+  assert.deepEqual(done.steps.map((s) => s.leg), ["travel"]);
+  const statusCalls = backend.calls.filter((c) => c.path === "/activity/growth/buddy/travel/status");
+  assert.equal(statusCalls.length, 1, "travel/status 恰好一次（travel 腿自己查）");
+});
+
+test("runner：legs=[growth,travel] travel/status 仍只有一次（growth 收尾 + travel 腿不重复）", async () => {
+  const clock = fakeClock(DAY);
+  const backend = simpleBackend(clock);
+  const runner = new JobRunner({
+    accounts: [makeAcct()],
+    now: clock.now,
+    sleep: clock.sleep,
+    fetch: backend.fetchImpl,
+  });
+  const job = runner.start({ legs: ["growth", "travel"] });
+  const done = await runner.wait(job.id);
+  assert.equal(done.state, "done");
+  assert.deepEqual(done.steps.map((s) => s.leg), ["growth", "travel"]);
+  const statusCalls = backend.calls.filter((c) => c.path === "/activity/growth/buddy/travel/status");
+  assert.equal(statusCalls.length, 1, "travel/status 只由 travel 腿发一次");
+});
+
+// ---- 需求 3：小程序链式任务进排程（mp 腿）----------------------------------
+
+function mpBackend(clock, overrides = {}) {
+  // 注意选型：runner 在每账号开跑前会发一条 chat_request_send 的「每日活跃」，
+  // litRules 若把 chat_request_send 映射到 MP 任务会把它们提前点亮 —— 这里用
+  // expert/automation 事件族的 MP 任务，避开事件码撞车（Daily 活动只发 chat）。
+  const mpSeeds = [
+    task("Sequential_Tasks_2", { title: "小程序专家对话", target: 1, reward: 200, status: "accepted" }),
+    task("Sequential_Tasks_4", { title: "小程序定时任务", target: 1, reward: 100, status: "accepted" }),
+  ];
+  return wbBackend({
+    clock,
+    tasks: [task("create_canvas", { reward: 300 }), ...mpSeeds],
+    mpOnly: mpSeeds.map((t) => t.task_code), // MP 清单口径：web 清单不含它们
+    litRules: {
+      wbx_design_canvas_task_create: "create_canvas",
+      expert_actual_use: "Sequential_Tasks_2",
+      automated_task_create_suc: "Sequential_Tasks_4",
+    },
+    ...overrides,
+  });
+}
+
+test("runner：单独 legs=[mp] 只跑小程序链路（不发 web 接取），步骤/收益正确", async () => {
+  const clock = fakeClock(DAY);
+  const backend = mpBackend(clock);
+  const runner = new JobRunner({
+    accounts: [makeAcct()],
+    now: clock.now,
+    sleep: clock.sleep,
+    fetch: backend.fetchImpl,
+  });
+  const job = runner.start({ legs: ["mp"] });
+  const done = await runner.wait(job.id);
+  assert.equal(done.state, "done");
+  assert.deepEqual(done.steps.map((s) => s.leg), ["mp"]);
+  assert.equal(done.steps[0].state, "ok");
+  // 收益：ST2 +200、ST4 +100；detail 取最后一条人读日志
+  assert.equal(done.totals.credit, 300);
+  assert.equal(done.steps[0].credit, 300);
+  assert.ok(done.steps[0].detail.includes("小程序定时任务"), `detail=${done.steps[0].detail}`);
+  // web 侧成长任务完全没动：没有任何 web 头族的接取
+  const webAccept = backend.calls.filter(
+    (c) => c.path === "/v2/activity/growth/tasks/accept" && c.headers["X-Client-Platform"] !== "miniprogram",
+  );
+  assert.equal(webAccept.length, 0, "mp 腿不发 web tasks 接取");
+  assert.deepEqual(backend.state.claims.slice().sort(), ["Sequential_Tasks_2", "Sequential_Tasks_4"], "两个 MP 任务都领奖");
+  // create_canvas（web 任务）原封不动
+  assert.equal(backend.state.tasks.find((t) => t.task_code === "create_canvas").accept_status, "not_accepted");
+});
+
+test("runner：legs=[growth,mp] 小程序任务只执行一次（growth 2b 关闭，由 mp 腿负责）", async () => {
+  const clock = fakeClock(DAY);
+  const backend = mpBackend(clock);
+  const runner = new JobRunner({
+    accounts: [makeAcct()],
+    now: clock.now,
+    sleep: clock.sleep,
+    fetch: backend.fetchImpl,
+  });
+  const job = runner.start({ legs: ["growth", "mp"] });
+  const done = await runner.wait(job.id);
+  assert.equal(done.state, "done");
+  assert.deepEqual(done.steps.map((s) => s.leg), ["growth", "mp"]);
+
+  // MP 头族只发生一轮：两个任务都是 accepted，无需接取；report 每个任务一批
+  //（共 2 批）、领奖各一次 —— 不是 growth 2b + mp 腿各跑一遍
+  const mpAccept = backend.calls.filter(
+    (c) => c.path === "/v2/activity/growth/tasks/accept" && c.headers["X-Client-Platform"] === "miniprogram",
+  );
+  assert.equal(mpAccept.length, 0, "两个 MP 任务都已接取，无接取批次");
+  const mpReports = backend.calls.filter(
+    (c) => c.path === "/v2/report" && c.headers["X-Client-Platform"] === "mp-weixin",
+  );
+  assert.equal(mpReports.length, 2, "MP 上报只跑一轮（每任务一批）");
+  assert.deepEqual(
+    backend.state.claims.slice().sort(),
+    ["Sequential_Tasks_2", "Sequential_Tasks_4", "create_canvas"],
+    "每个 MP 任务恰好领奖一次 + web 任务一次",
+  );
+
+  // growth 腿仍然处理 web 任务（勾选语义不受 mp 腿影响）
+  assert.ok(backend.state.claims.includes("create_canvas"), "web 任务由 growth 腿完成");
+  assert.equal(done.totals.credit, 300 + 300, "growth web 300 + mp 300");
+});

@@ -81,12 +81,13 @@ describe("P0-2：snapTask 投影（真实形态 19 项）", () => {
     const snaps = await snapAll(REAL_19())
     assert.equal(snaps.length, 19)
 
-    // 投影键集合逐字钉死（契约 §3）：8 个规范字段 + 6 个判断字段
+    // 投影键集合逐字钉死（契约 §3）：8 个规范字段 + 6 个判断字段 + 3 个次日锁字段
+    //（无锁调用 → locked=false、lockedUntil/lockHint 空串，需求 2）
     for (const s of snaps) {
       assert.deepEqual(Object.keys(s).sort(), [
         "acceptStatus", "canAccept", "canLight", "code", "desktopOnly", "jumpUrl",
-        "pinnedExpertId", "progress", "reason", "rewardCredit", "rewardEnergy",
-        "taskType", "title", "unforgeable",
+        "lockHint", "locked", "lockedUntil", "pinnedExpertId", "progress", "reason",
+        "rewardCredit", "rewardEnergy", "taskType", "title", "unforgeable",
       ])
     }
 
@@ -194,6 +195,77 @@ describe("P0-2：snapTask 投影（真实形态 19 项）", () => {
     // 钉死 id 与状态无关地透出
     assert.equal(byCode.get("Expert_lighthouse").pinnedExpertId, "ex_2cvvUZQhDyeJ")
     assert.equal(byCode.get("WorkBuddy_Valorant").pinnedExpertId, "ex_xQHHD1u5Jkua")
+  })
+})
+
+// ---- 次日锁投影（0.3.2）：上游字段优先，mp-locks 只是旧缓存回退 ------------
+
+describe("snapTask 次日锁投影（上游 locked/unlock_at 优先）", () => {
+  const base = () => ({
+    code: "Sequential_Tasks_2",
+    title: "小程序专家对话",
+    acceptStatus: "not_accepted",
+    taskType: "single",
+    progress: { current: 0, target: 1 },
+    rewardCredit: 200,
+    rewardEnergy: 0,
+    jumpUrl: "",
+  })
+  const mpLock = (until) => ({ until, reason: "陈旧锁" })
+
+  test("带自身字段 → 上游为准：locked:true 标锁、locked:false 覆盖 mp-locks 陈旧锁", () => {
+    // 上游明说已解锁（实测账号 ST2 实测形态）：即使 mp-locks 里有陈旧锁也不锁
+    const unlocked = snapTask({ ...base(), locked: false }, mpLock("2026-11-09"))
+    assert.equal(unlocked.locked, false)
+    assert.equal(unlocked.lockedUntil, "")
+    assert.equal(unlocked.lockHint, "")
+    assert.equal(unlocked.canAccept, true)
+
+    // 上游明说锁定（实测账号 B ST3 实测形态）：unlock_at +08:00 → 北京日
+    const locked = snapTask({ ...base(), locked: true, unlockAt: "2026-11-08T00:00:00+08:00" }, mpLock("2026-11-09"))
+    assert.equal(locked.locked, true)
+    assert.equal(locked.lockedUntil, "2026-11-08", "unlock_at 按北京时间取日")
+    assert.equal(locked.lockHint, "到第二天才能接取任务（2026-11-08 起可接）")
+    assert.equal(locked.canAccept, false)
+    assert.equal(locked.canLight, false, "canLight 等其余字段不变")
+  })
+
+  test("unlock_at 是 Z 时区 ISO 也按北京日取（不能 slice）；解析失败回退 mp-locks；无日期提示不带日期", () => {
+    // 与 "2026-11-08T00:00:00+08:00" 同一时刻的 Z 形态 —— slice 会错成 11-07
+    const z = snapTask({ ...base(), locked: true, unlockAt: "2026-11-07T16:00:00Z" })
+    assert.equal(z.lockedUntil, "2026-11-08")
+    // unlock_at 解析失败 → 回退 mp-locks 的 until
+    const fallback = snapTask({ ...base(), locked: true, unlockAt: "not-a-date" }, mpLock("2026-11-12"))
+    assert.equal(fallback.locked, true)
+    assert.equal(fallback.lockedUntil, "2026-11-12")
+    assert.equal(fallback.lockHint, "到第二天才能接取任务（2026-11-12 起可接）")
+    // 连 mp-locks 也没有 → 锁定但无日期，提示不带日期
+    const noDate = snapTask({ ...base(), locked: true, unlockAt: "" })
+    assert.equal(noDate.locked, true)
+    assert.equal(noDate.lockedUntil, "")
+    assert.equal(noDate.lockHint, "到第二天才能接取任务")
+  })
+
+  test("旧缓存（无自身锁字段）→ 回退 mp-locks 锁表；无锁表 = 不锁", () => {
+    const viaLocks = snapTask(base(), mpLock("2026-11-07"))
+    assert.equal(viaLocks.locked, true, "旧缓存 + 锁表 → 回退锁定")
+    assert.equal(viaLocks.lockedUntil, "2026-11-07")
+    assert.equal(viaLocks.canAccept, false)
+    const noLocks = snapTask(base())
+    assert.equal(noLocks.locked, false, "旧缓存 + 无锁表 → 不锁（三字段仍存在）")
+    assert.equal(noLocks.lockedUntil, "")
+    assert.equal(noLocks.lockHint, "")
+    assert.equal(noLocks.canAccept, true)
+  })
+
+  test("accepted / claimed 即使带 locked:true 也不标锁（not_accepted 门控）", () => {
+    for (const status of ["accepted", "claimed"]) {
+      const t = snapTask({ ...base(), acceptStatus: status, locked: true, unlockAt: "2026-11-08T00:00:00+08:00" }, mpLock("2026-11-09"))
+      assert.equal(t.locked, false, `${status} 绝不显示锁定徽章/提示`)
+      assert.equal(t.lockedUntil, "")
+      assert.equal(t.lockHint, "")
+      assert.equal(t.canAccept, false)
+    }
   })
 })
 

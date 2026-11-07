@@ -63,22 +63,24 @@ async function canonicalTasks() {
 
 const SNAP_KEYS = [
   "acceptStatus", "canAccept", "canLight", "code", "desktopOnly", "jumpUrl",
-  "pinnedExpertId", "progress", "reason", "rewardCredit", "rewardEnergy",
-  "taskType", "title", "unforgeable",
+  "lockHint", "locked", "lockedUntil", "pinnedExpertId", "progress", "reason",
+  "rewardCredit", "rewardEnergy", "taskType", "title", "unforgeable",
 ]
 const JUDGMENT_KEYS = ["desktopOnly", "unforgeable", "reason", "canAccept", "canLight", "pinnedExpertId"]
+// 次日锁字段（需求 2）：无锁调用 → locked=false、其余空串；重投影与直接刷新一致
+const LOCK_KEYS = ["locked", "lockedUntil", "lockHint"]
 
 // ---- 单元：snapTask 幂等 + projectSnapshot 分流 -----------------------------
 
 describe("P2 单元：缓存形态重投影 === 直接刷新投影（幂等）", () => {
-  test("旧 8 键 / 现行 14 键投影形态再投影，均与直接刷新逐字节一致", async () => {
+  test("旧 8 键 / 现行 17 键投影形态再投影，均与直接刷新逐字节一致", async () => {
     const fresh = (await canonicalTasks()).map(snapTask)
     assert.ok(fresh.length >= 5)
 
-    // 现行新版（本修复前）缓存写出的形态：投影后 14 键
+    // 现行新版缓存写出的形态：投影后 17 键（判断 + 次日锁字段齐）
     const round14 = JSON.parse(JSON.stringify(fresh))
-    // 旧版 daemon（P0-2 之前）写出的形态：8 键（无 6 个判断字段）
-    const round8 = round14.map(({ desktopOnly, unforgeable, reason, canAccept, canLight, pinnedExpertId, ...rest }) => rest)
+    // 旧版 daemon（P0-2 之前）写出的形态：8 键（无 6 个判断字段与 3 个锁字段）
+    const round8 = round14.map(({ desktopOnly, unforgeable, reason, canAccept, canLight, pinnedExpertId, locked, lockedUntil, lockHint, ...rest }) => rest)
     for (const t of round8) {
       assert.deepEqual(
         Object.keys(t).sort(),
@@ -88,7 +90,7 @@ describe("P2 单元：缓存形态重投影 === 直接刷新投影（幂等）",
     }
 
     assert.deepEqual(round8.map(snapTask), fresh, "旧 8 键缓存重算 6 个判断字段后 === 直接刷新投影")
-    assert.deepEqual(round14.map(snapTask), fresh, "14 键投影形态再投影 === 直接刷新投影（幂等）")
+    assert.deepEqual(round14.map(snapTask), fresh, "17 键投影形态再投影 === 直接刷新投影（幂等）")
   })
 
   test("canReprojectTask：8/14 键形态可重建；缺 code/taskType/acceptStatus 等一律不可", () => {
@@ -138,7 +140,7 @@ describe("P2 单元：缓存形态重投影 === 直接刷新投影（幂等）",
     // 未来版本戳（999）+ 完整条目 → 重建，既不作废也不原样吐出
     const future = projectSnapshot({ snapVersion: 999, tasks: [ok8()] })
     assert.ok(future)
-    for (const k of JUDGMENT_KEYS) assert.notEqual(future.tasks[0][k], undefined, `未来版本戳也不得漏投 ${k}`)
+    for (const k of [...JUDGMENT_KEYS, ...LOCK_KEYS]) assert.notEqual(future.tasks[0][k], undefined, `未来版本戳也不得漏投 ${k}`)
 
     // 版本不符/无版本戳 + 缺字段 → 整份过期（宁可空，不可错）
     assert.equal(projectSnapshot({ snapVersion: 999, tasks: [{ ...ok8(), taskType: undefined }] }), null)
@@ -362,13 +364,15 @@ describe("P2 集成：落盘规范 Task + snapVersion；重启后缓存读出 ==
       await hA.stop()
     }
 
-    // 落盘格式：snapVersion + 投影前规范 Task（判断字段不落盘）
+    // 落盘格式：snapVersion + 投影前规范 Task（判断字段与锁的**输出**字段不落盘；
+    // locked/unlockAt 是 0.3.2 起的投影**输入**字段——上游清单自带，随规范 Task 落盘）
     const disk = JSON.parse(readFileSync(join(stateDir, "snapshots.json"), "utf8"))
     assert.equal(disk.u1.snapVersion, SNAP_VERSION, "缓存带版本戳")
     for (const t of disk.u1.tasks) {
-      for (const k of ["desktopOnly", "canAccept", "canLight", "pinnedExpertId"]) {
-        assert.ok(!(k in t), `判断字段 ${k} 不落盘（读取时才投影）`)
+      for (const k of ["desktopOnly", "canAccept", "canLight", "pinnedExpertId", "lockedUntil", "lockHint"]) {
+        assert.ok(!(k in t), `判断/锁输出字段 ${k} 不落盘（读取时才投影）`)
       }
+      assert.ok("locked" in t && "unlockAt" in t, "上游锁输入字段 locked/unlockAt 随规范 Task 落盘（0.3.2）")
       assert.ok("description" in t && "unforgeable" in t && "reason" in t, "落盘的是规范 Task 形状")
     }
 

@@ -123,19 +123,35 @@ runGrowthTasks(acct, opts) -> GrowsResult
   // 接取/点亮/领奖；每次 fetchTasks 后都按选中集合过滤；缺失 code 警告跳过
   //（MP 专属任务除外——它们由小程序链路处理，不误报）；未传/空数组 = 全部任务
   // opts.mpTasks?: boolean —— 显式 false 关闭 2b 的小程序链式任务（缺省开启）
+  // opts.travel?: boolean —— 显式 false 关闭第 3 步的猫猫旅行检查（缺省开启；
+  // runner 批量编排里旅行只由 travel 腿负责，growth 腿显式传 false —— 只勾
+  // growth 绝不跑旅行、growth+travel 也只跑一次）
 
 // miniprogram.mjs —— 微信小程序链式任务（runGrowthTasks 2b 自动调用，普通任务
 // 处理完、猫猫旅行之前；0.3.0 起 MP 专属任务还经 refreshSnapshots 并入快照/看板、
-// 经 /api/task/accept|claim 的 isMPCode 分流被单账号操作）
+// 经 /api/task/accept|claim 的 isMPCode 分流被单账号操作；0.3.2 起也是独立 mp 腿）
 MP_HEADERS / MP_REPORT_HEADERS / MP_TASK_SPECS / MP_TASK_CODES  // 常量（§7）
 isMPCode(code) -> boolean            // MP_TASK_SPECS 命中或 Sequential_Tasks_ 前缀
 mpBase(uid, nick, nowMs) -> object   // WorkBuddy_MP 埋点指纹（每条 MP 事件都要合并）
 fetchMPTasks(acct, opts) -> MP Task[]        // GET growth/tasks，MP_HEADERS，规范 camelCase
-acceptMPTasks(acct, codes, opts) -> {ok, accepted[], failed[], msg, restricted?}
+                                     // 0.3.2 起含上游锁字段：locked（布尔，缺失归一 false）、
+                                     // unlockAt（上游 unlock_at 原样透传，缺失归一 ""）——
+                                     // 快照投影（snapTask）以上游字段为锁的唯一主依据
+parseMPLock(message) -> {until:"YYYY-MM-DD"} | null
+                                     // 从上游锁原因（"task locked until 2026-11-07"，
+                                     // 容忍中文/多余空白）解析锁到哪天；无锁语义/非法日期 → null
+acceptMPTasks(acct, codes, opts) -> {ok, accepted[], failed[], failures:[{code,message}], msg, restricted?}
+                                     // failures 与 failed 一一对应，记每个失败项的上游
+                                     // 原因；原因解析出锁时回调 opts.onLock?.(code,until,msg)
+                                     //（防御异常，不影响主流程）
 claimMPTask(acct, code, opts) -> {ok, credit, energy, reason, restricted?}  // 400 → web 回退
 reportMPEvents(acct, events, opts) -> boolean  // mpBase 合并 + MP_REPORT_HEADERS，chat 域 /v2/report
 runMiniProgramTasks(acct, opts) -> {ok, logs, earnedCredit, lit, claimed, restricted?}
   // opts.codes 非空 = 只处理选中的 MP 交集；交集为空连清单都不拉（零上游）
+  // 次日锁双来源整条跳过（不进接取批次、不点亮、不领奖，记同一行「⏳ …到第二天
+  // 才能接取任务，跳过」）：清单自带 t.locked===true（上游权威）+ opts.lockedCodes
+  //（mp-locks 台账回退）；claimed 优先判断，已领奖不被锁挡「已领奖，跳过」日志
+  // opts.onClaimed?(code) —— 每次领奖成功后回调（daemon 记领奖日期；防御异常）
 
 // buddy.mjs —— Buddy 盲盒腿（独立腿，LEG_ORDER 在 travel 之前）
 runBuddyOpen(acct, opts) -> {ok, opened, name?, logs, restricted?}
@@ -225,14 +241,18 @@ runNightTask(acct, opts) -> NightResult       // black_cat，23:00–08:00（北
 
 // runner.mjs
 class JobRunner {
-  start(spec) -> job        // spec: {uids[], legs:['growth','buddy','travel','night'], claim,
+  start(spec) -> job        // spec: {uids[], legs:['growth','mp','buddy','travel','night'], claim,
                             //       trigger:'manual'|'schedule',
                             //       taskCodes:{uid:string[]}|null}  // 任务级勾选（§3）：
-                            //       growth 腿把 taskCodes[uid] 作为 opts.codes 传给
-                            //       runGrowthTasks；null/缺 uid/空清单 = 全部任务。
-                            //       腿顺序固定 growth→buddy→travel→night（buddy 在
-                            //       travel 前，开出的 Buddy 可被旅行使用），spec.legs
-                            //       是这个顺序的子集；buddy/travel/night 腿没有任务码。
+                            //       growth/mp 腿把 taskCodes[uid] 作为 opts.codes 传给
+                            //       runGrowthTasks / runMiniProgramTasks；null/缺 uid/
+                            //       空清单 = 全部任务。腿顺序固定 growth→mp→buddy→
+                            //       travel→night（buddy 在 travel 前，开出的 Buddy 可
+                            //       被旅行使用），spec.legs 是这个顺序的子集；
+                            //       buddy/travel/night 腿没有任务码。旅行只由 travel
+                            //       腿触发（growth 腿显式 travel:false）；growth+mp
+                            //       同跑时 growth 腿传 mpTasks:false（小程序任务只由
+                            //       mp 腿跑一遍）。
                             //       归一化在两处设防：daemon.startJob（API 边界，§3）
                             //       与 runner.normalizeSpec（直接构造 runner 的调用方）
   get(id) -> Job            // Job: {id, state:'queued|running|done|error', startedAt, endedAt,
@@ -247,6 +267,10 @@ class JobRunner {
   // 回调）。每个账号开跑（任何腿）之前 runner 固定调一次 engine/daily.
   // reportDailyActivity：跳过/失败只写一行 job.log（「每日活跃：已上报 /
   // 今日已报过 / 上报失败：…」），绝不阻断腿、绝不 fail job。
+  // 小程序次日锁（0.3.2）另认：mpLockedCodes(uid)->string[]（仍锁定的 code，
+  // 引擎整条跳过）、onMPLock(uid,code,until,reason)（接取被上游锁拒时落盘）、
+  // onMPClaimed(uid,code)（领奖成功时落盘）—— runner 在 growth 腿（2b）与 mp 腿
+  // 把它们按账号透传给引擎（lockedCodes/onLock/onClaimed）。
 }
 ```
 
@@ -302,19 +326,35 @@ GET  /api/state                 -> {serveUrl, bindHost, port, reachableHint,
                                                         // /api/state 绝不为此打上游
                                              snapshot:{tasks:[{code,title,acceptStatus,progress:{current,target},
                                              rewardCredit,rewardEnergy,jumpUrl,taskType,
-                                             desktopOnly,unforgeable,reason,canAccept,canLight,pinnedExpertId}],
+                                             desktopOnly,unforgeable,reason,canAccept,canLight,pinnedExpertId,
+                                             locked,lockedUntil,lockHint}],
+                                             // locked/lockedUntil/lockHint —— 小程序链式任务次日锁
+                                             //（0.3.2，三字段**始终存在**）：locked=true =
+                                             // 现在不可接取；lockedUntil="YYYY-MM-DD"（北京
+                                             // 日期，无锁 = ""）；lockHint 固定文案
+                                             // "到第二天才能接取任务（<until> 起可接）"（无日期
+                                             // = "到第二天才能接取任务"，无锁 = ""）。锁定项
+                                             // canAccept 一律 false（其余字段不变）。
+                                             // **主依据是上游清单自带的 locked/unlock_at**
+                                             //（2026-11-07 实测上游直接下发；unlock_at 为带时区
+                                             // ISO，Date.parse 后按北京日取，绝不 slice）；locked
+                                             // 仅在 not_accepted 时为 true（accepted/claimed 不
+                                             // 标锁）；上游 locked:false 覆盖 mp-locks 陈旧锁。
+                                             // 仅旧缓存（无自身锁字段）回退 state/mp-locks.json
+                                             //（§7；锁过期即解锁，until 当天即可用）
                                              energy,streak,days,updatedISO}}],
                                     // accounts[] 只含 provider==="workbuddy"（国内版）条目；
                                     // 国际版 workbuddy-ai 一律不出现（见上方纯国内版口径）
                                     scheduler:{enabled,nextRuns[[leg,hour]],lastCycle,
                                                holds:[{uid,nickname,releasedAt}]},
                                     job:Job|null, stats:{creditsToday,energyToday,runs},
-                                    settings:{claim,legs,gapMs,hours:{buddy,travel,night},host:{chat,bill,web}}}
-                                    // hours 只有 buddy|travel|night 三个键（排程不再触发
+                                    settings:{claim,legs,gapMs,hours:{mp,buddy,travel,night},host:{chat,bill,web}}}
+                                    // hours 只有 mp|buddy|travel|night 四个键（排程不再触发
                                     // growth，§7/§8）；旧 settings.json 里的 hours.growth
-                                    // 在读取时丢弃。buddy 默认 []（开盲盒消耗成长能量，
-                                    // 默认不排程，用户显式配了小时才自动跑）。legs
-                                    //（手动默认腿）仍可含 growth。
+                                    // 在读取时丢弃。**默认全部 [] = 默认不排任何腿，留空
+                                    // 即不排**（0.3.2：某条腿显式配了小时才自动跑；用户
+                                    // settings.json 里写空的腿保持空，不会被默认值复活）。
+                                    // legs（手动默认腿）仍可含 growth。
                                     // bindHost/port/reachableHint：守护进程真实绑定的 host 与端口
                                     // （host 来自 daemon.json，由 daemon 心跳写入；port 为实际绑定端口，
                                     // 被占用顺延后可能与配置值不同）。bindHost 为 0.0.0.0/:: 时
@@ -555,8 +595,37 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
   （结果合并，形状不变）；`/api/task/claim` 对 MP code 用 `claimMPTask`，否则
   `claimTask`。引擎侧防御：tasks.progressTask 对 kind:"mp" 一律跳过 web 事件构造
   （「小程序任务由小程序链路处理」）。runGrowthTasks 2b 在普通任务之后、猫猫旅行
-  之前调用（批量执行链路不变），`opts.mpTasks===false` 可关，`opts.codes` 勾选只
+  之前调用，`opts.mpTasks===false` 可关，`opts.codes` 勾选只
   处理 MP 交集（交集为空连清单都不拉），缺失警告用 `MP_TASK_CODES` 过滤防误报。
+  **mp 独立腿（0.3.2）**：JobRunner 的 LEG_ORDER 增至 growth→mp→buddy→travel→night，
+  mp 腿直接调 `runMiniProgramTasks`（codes 勾选、restricted、收益/lit/claimed 计入
+  totals 与 growth 腿同口径，step detail 取最后一条日志）；同一次 job 同时含
+  growth 与 mp 腿时，growth 腿传 `mpTasks:false`（2b 关闭）—— 小程序任务只由 mp
+  腿跑一遍；只有 growth 腿时保持原 2b 行为。
+  **次日锁（0.3.2 修订：2026-11-07 只读实测——上游清单本身就带锁字段，实测账号 B 的
+  Sequential_Tasks_3 为 `"locked": true, "unlock_at": "2026-11-08T00:00:00+08:00"`、
+  实测账号的 Sequential_Tasks_2 为 `"locked": false`（not_accepted，当天已解锁））**：
+  - **主依据 = 任务自身字段**：fetchMPTasks 把 locked/unlock_at 原样归一进规范
+    Task（缺失归一 false/""）并随 cacheTask 落盘；snapTask 投影时任务带自身锁
+    信息（locked 是布尔或 unlockAt 非空）→ **以上游为准**，locked 仅在
+    not_accepted 时为 true（accepted/claimed 绝不标锁），lockedUntil 由 unlock_at
+    解析为北京日（Date.parse + 北京日，绝不 slice），解析失败回退 mp-locks 的
+    until；上游 `locked:false` 必须能覆盖 mp-locks 里的陈旧锁；仅旧缓存（无自身
+    锁字段）回退 mp-locks 锁表。**没有任何「按领奖日期推断链式锁」的逻辑**
+    （inferMPLockChain 已删——它会把手动/旧版本已领奖的历史任务多锁一天）；
+  - mp-locks.json 只剩两个防御/过渡用途（`{locks:{uid:{code:{until,reason,at}}},
+    claims:{uid:{code:"YYYY-MM-DD"}}}`，原子写、启动归一、损坏条目逐条丢弃）：
+    ① accept 被上游锁拒时从失败消息（`parseMPLock`，容忍中文/空白）解析落盘的
+    显式锁（onLock 回调 + doAccept 防御性二次解析，兼容假引擎/旧引擎）；
+    ② doClaim/onClaimed 领奖成功给下一环（Sequential_Tasks_N 的 N+1，N<6）记
+    「明天」的即时锁 —— 只在旧缓存回退路径可见，下一次快照刷新后必被上游字段
+    覆盖。`until > 北京今天` 才算生效（**until 当天即解锁**），同一 code 取更晚；
+  - runner 经 mpLockedCodes/onMPLock/onMPClaimed 透传给 growth 2b 与 mp 腿：
+    执行时双来源锁定任务整条跳过（不进接取批次、不点亮、不领奖，日志「⏳ …到
+    第二天才能接取任务，跳过」）—— 清单自带 t.locked===true（上游权威）与
+    lockedCodes 台账任一命中即跳，claimed 优先判断不被锁挡「已领奖」日志；
+  - 投影：snapTask(t, lock) → `locked/lockedUntil/lockHint` 三字段始终下发（§3），
+    锁定项 canAccept=false。
 - 计费侧：`POST {bill}/billing/meter/claim-gift|claim-compensation`、`POST {bill}/v2/billing/meter/daily-checkin`、
   `POST {chat}/v2/billing/meter/checkin-activity-status`。
 - **积分余额（只读，engine/credits.mjs，wb_accounts._fetch_credits_cn_detailed 口径）**：
@@ -684,15 +753,18 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
   `beijingHour(Date.UTC(...,1,0))===9`、UTC 01:00 命中 travel 而绝不能是 night、
   UTC 17:00（北京次日 01:00）命中 night、`beijingDateKey` 在 UTC 16:00 翻北京日、
   `dueWindows` 跨北京日边界不重不漏；**growth 不在任何排程窗口**——排程只触发
-  buddy/travel/night，growth 只能手动跑；buddy 默认空窗口（`hours.buddy=[]`，
-  显式配置才排程）；daemon 回归用假时钟驱动 `checkScheduler`：
-  `hours={buddy:[],travel:[9,21],night:[1]}` 时北京 09:00（UTC 01:00）启动
-  `legs:["travel"]`、
-  北京 01:00（UTC 17:00）启动 night、同一北京日同窗口只触发一次、跨北京日
-  （UTC 16:00 边界）重新允许；daemon 读旧 settings.json 时
+  mp/buddy/travel/night，growth 只能手动跑；**默认 hours 全空 = 默认不排任何腿**
+  （0.3.2：`DEFAULT_SETTINGS.hours={mp:[],buddy:[],travel:[],night:[]}`，留空即
+  不排；用户显式写空的腿保持空、不会被默认值复活，升级用户已配置的 travel/
+  night 窗口照常生效）；daemon 回归用假时钟驱动 `checkScheduler`：
+  hours 全空 + scheduler=true 时任何北京整点都不触发、settings.json 只写
+  `hours:{travel:[]}` 时北京 09:00 不触发、显式配 `travel:[9]` 后北京 09:00
+  （UTC 01:00）启动 `legs:["travel"]`、
+  显式配 night 后北京 01:00（UTC 17:00）启动 night、同一北京日同窗口只触发一次、
+  跨北京日（UTC 16:00 边界）重新允许；daemon 读旧 settings.json 时
   丢弃 `hours.growth`、`/api/state` 的 hours/nextRuns 无 growth、tick 不触发 growth job、
-  手动 `legs:["growth"]` 照常启动；buddy 显式配小时后 nextRuns 含 buddy、tick 触发
-  `legs:["buddy"]` job；
+  手动 `legs:["growth"]` 照常启动；buddy/mp 显式配小时后 nextRuns 含对应腿、tick 触发
+  对应 job；
 - 去重：`expert_5` 五个事件用 5 个不同 id；
 - 资料库（Library_read）：reportLibraryEvent 的事件字段/头逐字断言（web 域、
   Referer/UA/X-User-Id 覆盖、Authorization 保留）；callJSON 的 init.headers 合并
@@ -715,12 +787,19 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
 - store：回写只改 access/refresh/expires，保留未知字段，产出合法 JSON 且权限 600；
 - runner：两个 `start()` → 第二个 409；`stop()` 能在步骤边界中止；
 - Buddy 盲盒（engine/buddy.mjs）：quota/open 两跳的批量口径（count=min）、能量
-  不足零开盒请求、restricted 透传、不领积分；runner 腿顺序 growth→buddy→travel→night
+  不足零开盒请求、restricted 透传、不领积分；runner 腿顺序 growth→mp→buddy→travel→night
   （乱序入参归一、未知腿剔除）、buddy 步骤 detail=最后一条日志且 credit=0；
 - 小程序链式任务（engine/miniprogram.mjs）：MP 头族与 mpBase 逐字断言、per-code
   事件族（1/3/6/school/2/4/5；Sequential_Tasks_7 无事件）、claimed/completed/
   not_accepted 三态、codes 交集过滤（交集为空零上游）、≥1s 节流、runGrowthTasks
-  集成（2b 顺序、收益并入 totals、mpTasks=false 关闭、MP code 不误报缺失）；
+  集成（2b 顺序、收益并入 totals、mpTasks=false 关闭、MP code 不误报缺失）、
+  次日锁（fetchMPTasks 透传 locked/unlock_at、parseMPLock 正/异常输入、
+  failures+onLock、lockedCodes 整条跳过、上游字段优先——locked:false 覆盖
+  mp-locks 陈旧锁、Z 时区 unlock_at 按北京日取、accepted/claimed 不标锁、
+  accept 失败落盘 + doClaim 即时锁下一环→刷新后被上游覆盖、snapTask 17 键含
+  locked/lockedUntil/lockHint）、
+  旅行只由 travel 腿触发（legs=[growth] 零 travel/status、legs=[growth,travel]
+  恰好一次）、mp 腿（单独 legs=[mp] 不发 web 接取；growth+mp 只执行一遍 MP）；
 - 沙箱卫生：测试 temp 沙箱一律走 `tests/helpers.mjs` 的 `makeSandbox()`（用完即删 + after/exit 兜底），跑完套件 temp 不残留 `wb-*` 沙箱（`tests/sandbox-hygiene.test.mjs` 钉死）。
 
 ## 9. 账号 JSON 导入 / 导出（hub 移植口径；engine/accountio.mjs）

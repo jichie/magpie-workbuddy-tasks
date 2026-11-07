@@ -5,22 +5,26 @@
 //
 // 同一时刻只允许 1 个 job（current() 全局闸门；第二个 start() 抛 409）。
 // 账号与账号之间按 trigger 间隔（manual 1.5 s / schedule 2–5 s 抖动，见
-// schedule.accountGapMs）；腿的顺序固定 growth → buddy → travel → night（buddy
-// 在 travel 前：开出的 Buddy 可被随后一轮旅行使用），spec.legs 是这个顺序的
-// 子集。spec.taskCodes（{uid: string[]} | null，任务级勾选）只在 growth 腿生效。
+// schedule.accountGapMs）；腿的顺序固定 growth → mp → buddy → travel → night
+// （mp 在 growth 后：小程序链式任务也是成长体系的一部分；buddy 在 travel 前：
+// 开出的 Buddy 可被随后一轮旅行使用），spec.legs 是这个顺序的子集。
+// spec.taskCodes（{uid: string[]} | null，任务级勾选）只在 growth/mp 腿生效。
+// 旅行只由 travel 腿触发（growth 腿显式 travel:false）；growth+mp 同跑时 growth
+// 腿传 mpTasks:false（2b 关闭），避免小程序任务被两条腿各跑一遍。
 // stop() 只在步骤边界生效（abort 信号在腿/账号之间检查）。
 
 import { runBuddyOpen } from "./buddy.mjs";
 import { DEFAULT_GAP_MS, REFRESH_LEAD_MS, RESTRICTED_COOLDOWN_MS } from "./constants.mjs";
 import { reportDailyActivity } from "./daily.mjs"; // 每日活跃（点亮成长中心连登，CONTRACT §7）
 import { uuidHex } from "./fingerprint.mjs";
+import { runMiniProgramTasks } from "./miniprogram.mjs"; // 小程序链式任务腿（CONTRACT §7）
 import { accountGapMs } from "./schedule.mjs";
 import { eligibleAccounts } from "./store.mjs";
 import { runGrowthTasks } from "./tasks.mjs";
 import { runCatTravel, runNightTask } from "./travel.mjs";
 import { clock, refreshAccount } from "./upstream.mjs";
 
-const LEG_ORDER = ["growth", "buddy", "travel", "night"];
+const LEG_ORDER = ["growth", "mp", "buddy", "travel", "night"];
 
 // 任务级勾选（CONTRACT §2/§3）每个账号清单的上限与 daemon.startJob 同款。
 const TASK_CODES_CAP = 500;
@@ -49,14 +53,14 @@ function normalizeTaskCodes(raw) {
 function normalizeSpec(spec = {}) {
   const legs = (Array.isArray(spec.legs) && spec.legs.length ? spec.legs : [...LEG_ORDER])
     .filter((l) => LEG_ORDER.includes(l))
-    .sort((a, b) => LEG_ORDER.indexOf(a) - LEG_ORDER.indexOf(b)); // 顺序固定 growth→buddy→travel→night
+    .sort((a, b) => LEG_ORDER.indexOf(a) - LEG_ORDER.indexOf(b)); // 顺序固定 growth→mp→buddy→travel→night
   return {
     uids: Array.isArray(spec.uids) && spec.uids.length ? [...spec.uids] : null,
     legs: legs.length ? legs : [...LEG_ORDER],
     claim: spec.claim !== false,
     trigger: spec.trigger === "schedule" ? "schedule" : "manual",
-    // 任务级勾选（CONTRACT §3）：{uid: string[]} | null；growth 腿据此只处理
-    // 选中任务，travel/night 腿没有任务码，不受影响。
+    // 任务级勾选（CONTRACT §3）：{uid: string[]} | null；growth/mp 腿据此只处理
+    // 选中任务，buddy/travel/night 腿没有任务码，不受影响。
     taskCodes: normalizeTaskCodes(spec.taskCodes),
   };
 }
@@ -221,6 +225,16 @@ export class JobRunner {
     }
   }
 
+  // 小程序次日锁（CONTRACT §7）的引擎注入件：daemon 可选提供 mpLockedCodes/
+  // onMPLock/onMPClaimed（测试/嵌入未注入时全部为可选链，行为退化为「无锁」）。
+  _mpLockOpts(acct) {
+    return {
+      lockedCodes: this.opts.mpLockedCodes?.(acct.uid),
+      onLock: (code, until, reason) => this.opts.onMPLock?.(acct.uid, code, until, reason),
+      onClaimed: (code) => this.opts.onMPClaimed?.(acct.uid, code),
+    };
+  }
+
   _step(job, acct, leg, state, detail = "") {
     const step = {
       uid: acct.uid,
@@ -322,13 +336,28 @@ export class JobRunner {
             log: logFn,
             claim: job.spec.claim,
             signal: ctrl.signal,
-            // 任务级勾选（CONTRACT §3）：growth 腿把该账号的选中清单作为
-            // opts.codes 传给 runGrowthTasks；未勾选（taskCodes=null）、该账号
-            // 不在映射里或清单为空 → undefined = 全部任务（旧行为）。buddy/
-            // travel/night 腿没有任务码，不传。
-            ...(leg === "growth" && job.spec.taskCodes ? { codes: job.spec.taskCodes[acct.uid] } : {}),
+            // 任务级勾选（CONTRACT §3）：growth/mp 腿把该账号的选中清单作为
+            // opts.codes 传给引擎；未勾选（taskCodes=null）、该账号不在映射里
+            // 或清单为空 → undefined = 全部任务（旧行为）。buddy/travel/night
+            // 腿没有任务码，不传。
+            ...((leg === "growth" || leg === "mp") && job.spec.taskCodes
+              ? { codes: job.spec.taskCodes[acct.uid] }
+              : {}),
+            // 猫猫旅行只由 travel 腿触发：growth 腿显式 travel:false（runGrowthTasks
+            // 第 3 步据此整段跳过）——只勾 growth 绝不跑旅行、growth+travel 也只跑
+            // 一次，步骤 detail/收益由 travel 腿自己记。
+            ...(leg === "growth" ? { travel: false } : {}),
+            // 小程序链式任务去重：本次 job 同时含 growth 与 mp 腿时，growth 腿的
+            // 2b（runGrowthTasks 内嵌的小程序链路）关闭，交给 mp 腿；只有 growth
+            // 时保持原 2b 行为（mp 腿不在 spec.legs 里）。
+            ...(leg === "growth" && job.spec.legs.includes("mp") ? { mpTasks: false } : {}),
+            // 小程序次日锁（CONTRACT §7）：daemon 注入的锁查询与回调透传给引擎，
+            // growth 腿的 2b 与 mp 腿都要带 —— 锁定的任务整条跳过（不接取/不点亮），
+            // 接取被上游锁拒时落盘锁原因，领奖成功时记领奖日期并锁下一环。
+            ...((leg === "growth" || leg === "mp") ? this._mpLockOpts(acct) : {}),
           };
           if (leg === "growth") res = await runGrowthTasks(acct, legOpts);
+          else if (leg === "mp") res = await runMiniProgramTasks(acct, legOpts);
           else if (leg === "buddy") res = await runBuddyOpen(acct, legOpts);
           else if (leg === "travel") res = await runCatTravel(acct, legOpts);
           else res = await runNightTask(acct, legOpts);
@@ -351,7 +380,7 @@ export class JobRunner {
         } else if (leg === "travel") {
           detail = res?.msg || (ok ? "完成" : "失败");
         } else {
-          // buddy / night 腿返回 logs：步骤 detail 取最后一条人读日志
+          // mp / buddy / night 腿返回 logs：步骤 detail 取最后一条人读日志
           detail = (res?.logs ?? []).slice(-1)[0] || (ok ? "完成" : "失败");
         }
         this._finishStep(job, step, ok ? "ok" : "fail", detail, credit, energy);

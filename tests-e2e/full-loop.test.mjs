@@ -470,12 +470,17 @@ test("主回路：job 完成，步骤/结算/日志/上游调用顺序全部对�
     "chat 域对该任务先 400",
   );
 
-  // 猫猫旅行：旅行归来领奖（成长腿内）→ 派出（travel 腿），body 带 location_id
-  assert.ok(c.some((x) => x.path === "/activity/growth/buddy/travel/claim" && x.uid === UID_OK));
-  const depart = c.find((x) => x.path === "/activity/growth/buddy/travel/depart" && x.uid === UID_OK);
-  assert.ok(depart, "travel 腿应派出猫猫");
-  assert.equal(depart.body.location_id, 1);
-  assert.equal(stub.travel.get(UID_OK).state, "traveling");
+  // 猫猫旅行（需求 1 新口径：旅行只由 travel 腿触发，growth 腿不再顺手跑）：
+  // travel 腿查一次状态（arrived）→ 领奖归位（idle）；一条腿只查一次状态，
+  // 本轮不再派出 —— 下轮 travel 腿才会 depart（growth+travel 不重复跑）。
+  const travelStatuses = c.filter((x) => x.path === "/activity/growth/buddy/travel/status" && x.uid === UID_OK);
+  assert.equal(travelStatuses.length, 1, "travel/status 恰好一次（growth 收尾不再跑旅行）");
+  assert.ok(c.some((x) => x.path === "/activity/growth/buddy/travel/claim" && x.uid === UID_OK), "travel 腿领奖（旅行归来）");
+  assert.ok(
+    !c.some((x) => x.path === "/activity/growth/buddy/travel/depart" && x.uid === UID_OK),
+    "arrived 领奖后本轮不再派出（下轮 travel 腿才 depart）",
+  );
+  assert.equal(stub.travel.get(UID_OK).state, "idle");
 
   // 上游请求身分：全部是两个 OAuth 账号的 Bearer，API key 从不出现在线上
   for (const call of c) {
@@ -577,6 +582,9 @@ test("/api/history 记录该轮；job 结束后自动快照回填 /api/state", a
         "code",
         "desktopOnly",
         "jumpUrl",
+        "lockHint",
+        "locked",
+        "lockedUntil",
         "pinnedExpertId",
         "progress",
         "reason",

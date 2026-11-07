@@ -15,7 +15,10 @@
 //        jumpUrl,taskType("single"|"auto"|"")} + 六个引擎判断字段（daemon.snapTask 投影自
 //        engine/taskkind.resolveTaskKind，与流水线决策同一判断源）：
 //        {desktopOnly,unforgeable,reason,canAccept,canLight,pinnedExpertId}
-//        —— 任务表的所有「能不能自动化」判断只来自这六个字段，前端不再自己拼规则
+//        + 锁定三元组 {locked,lockedUntil,lockHint}：locked=true 表示现在不能接取
+//        （小程序链式任务次日解锁），lockedUntil 为北京时间解锁日期，lockHint 为提示文案；
+//        老后端缺这三个字段按 false/空串处理。
+//        —— 任务表的所有「能不能自动化」判断只来自这些字段，前端不再自己拼规则
 //        （详见下方 taskFlags）。老后端字段缺失时按 legacy 回退，绝不报错。
 //        snapshot.expired 若为 true（后端将来下发）按「快照已过期」渲染；前端不发明字段。
 //   GET  /api/events           -> SSE {kind:'job'|'step'|'log'|'scheduler'|'accounts'}（只读流）
@@ -55,7 +58,7 @@ const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
 // ---- 文案映射（领域词汇对齐 daemon/engine 与 CONTRACT） -----------------------
 
-const LEG_NAMES = { growth: "成长任务", buddy: "Buddy 盲盒", travel: "猫猫旅行", night: "夜猫子" };
+const LEG_NAMES = { growth: "成长任务", mp: "小程序链式任务", buddy: "Buddy 盲盒", travel: "猫猫旅行", night: "夜猫子" };
 const ACCEPT_NAMES = {
   not_accepted: "未接取",
   accepted: "已接取",
@@ -562,6 +565,9 @@ function rewardCell(t) {
 //   canAccept      true = 能进「批量接取」（引擎口径，已排除 auto / unforgeable / 未收录）
 //   canLight       true = 能被自动化点亮（上报进度事件）
 //   pinnedExpertId 非空 = 事件 id 钉死该专家（ex_…）；空串 = 走池子轮换
+//   locked         true = 现在不能接取（小程序链式任务次日解锁）；lockedUntil / lockHint 是
+//                  解锁日期（北京时间 YYYY-MM-DD）与提示文案。老后端没有这三个字段时按
+//                  false / 空串处理 —— 锁定只影响接取与勾选，不影响 completed 领奖。
 // 纪律：**绝不**拿 jumpUrl 形状猜「需桌面端完成」—— 真实账号 19 项 jumpUrl 全部非空
 // （14 项 workbuddy:// 深链、5 项 https），其中只有 3 项真是桌面端专属。
 // 老后端（六个字段 undefined）→ legacy 回退：不显示桌面端 / 无法自动化标注，接取按钮照旧
@@ -586,6 +592,10 @@ export function taskFlags(t) {
       ? t.canAccept === true && code !== "" && !unforgeable
       : status === "not_accepted" && t?.taskType !== "auto" && code !== "",
     pinnedExpertId: String(t?.pinnedExpertId ?? "").trim(),
+    // 排程/接取锁定：只读后端真值字段，老后端缺字段 = 不锁定
+    locked: t?.locked === true,
+    lockedUntil: String(t?.lockedUntil ?? "").trim(),
+    lockHint: String(t?.lockHint ?? "").trim(),
   };
 }
 
@@ -701,7 +711,9 @@ async function claimOne(uid, code, btn) {
 // ---- 任务级勾选（只收窄批量操作，不影响单任务「接取 / 领奖」按钮） -----------------
 // state.taskSel = { [uid]: Set(code) }：按账号保存勾选的任务码，只存在内存里。
 // · 跨 renderAll()/快照刷新保留；某账号的集合清空时删掉该键（不勾选 = 全部任务）。
-// · 无 code 的行不可勾选（无从提交）；勾选不影响 buddy / travel / night 腿（它们没有任务码）。
+// · 无 code 的行不可勾选（无从提交）；locked === true 的行（小程序链式任务次日解锁）
+//   同样不可勾选，且不计入「全选 / 已选 N 项」。
+// · 勾选不影响 buddy / travel / night 腿（它们没有任务码）；小程序链式任务随 growth 腿内嵌执行。
 // · 批量请求只把「有勾选」的 uid 放进 body.codes，未出现的账号 = 全部任务。
 
 function pickedSet(uid) {
@@ -713,15 +725,46 @@ function isPicked(uid, code) {
   return !!set && set.has(String(code ?? ""));
 }
 
-// 该账号勾选的任务码（原样，供 /api/run 的 body.codes 用）；没有勾选 → null
-function pickedCodes(uid) {
-  const set = pickedSet(uid);
-  return set && set.size ? [...set] : null;
-}
-
+// 快照里仍可勾选的任务：有 code 且未锁定（locked 只来自后端字段，老后端 = false）
 function selectableCodes(a) {
   const tasks = Array.isArray(a?.snapshot?.tasks) ? a.snapshot.tasks : [];
-  return tasks.map((t) => String(t?.code ?? "")).filter(Boolean);
+  return tasks.filter((t) => !taskFlags(t).locked).map((t) => String(t?.code ?? "")).filter(Boolean);
+}
+
+// 该账号勾选的任务码（供 /api/run 的 body.codes 用）；没有勾选 → null。
+// 只返回「当前仍可勾选」的项：锁定 / 已从快照消失的 code 一律不提交，避免把次日才
+// 解锁的任务塞进批量接取。没有快照时无从比对，保留原集合（维持老行为）。
+function pickedCodes(uid) {
+  const set = pickedSet(uid);
+  if (!set || !set.size) return null;
+  const a = accountByUid(uid);
+  const tasks = Array.isArray(a?.snapshot?.tasks) ? a.snapshot.tasks : null;
+  if (!tasks) return [...set];
+  const avail = new Set(selectableCodes(a));
+  const codes = [...set].filter((c) => avail.has(c));
+  return codes.length ? codes : null;
+}
+
+// 快照刷新后把已选集合里「已锁定」的任务码剔除（只剔这些，不动用户其它勾选）。
+// 没有快照可比对时什么都不做。
+function pruneLockedPicks(uid) {
+  const set = pickedSet(uid);
+  if (!set || !set.size) return;
+  const a = accountByUid(uid);
+  const tasks = Array.isArray(a?.snapshot?.tasks) ? a.snapshot.tasks : null;
+  if (!tasks) return;
+  const locked = new Set(
+    tasks.filter((t) => taskFlags(t).locked).map((t) => String(t?.code ?? "")).filter(Boolean),
+  );
+  if (!locked.size) return;
+  let changed = false;
+  for (const c of [...set]) {
+    if (locked.has(c)) {
+      set.delete(c);
+      changed = true;
+    }
+  }
+  if (changed && !set.size) delete state.taskSel[uid];
 }
 
 // 「已选 N 项」只数当前快照里真实存在的任务码；没有快照时才退回集合大小
@@ -772,11 +815,16 @@ function taskRowBoxes(uid) {
 
 // 同步某账号的勾选控件（行 checkbox / 表头与提示条的「全选」/ 已选计数），不整页重绘
 function updateTaskSelUI(uid) {
+  // 快照刷新后锁定的任务码从内存勾选里剔除（只剔锁定项，其它勾选保持原样）
+  pruneLockedPicks(uid);
   const set = pickedSet(uid);
-  for (const cb of taskRowBoxes(uid)) {
-    cb.checked = !!set && set.has(String(cb.dataset.code ?? ""));
-  }
   const avail = selectableCodes(accountByUid(uid));
+  const availSet = new Set(avail);
+  for (const cb of taskRowBoxes(uid)) {
+    const c = String(cb.dataset.code ?? "");
+    // 锁定 / 缺码的勾选框显示为未选（DOM 里已 disabled）
+    cb.checked = availSet.has(c) && !!set && set.has(c);
+  }
   const n = pickedVisibleCount(uid);
   for (const box of taskAllBoxes(uid)) {
     box.checked = avail.length > 0 && n >= avail.length;
@@ -842,9 +890,14 @@ function taskRow(a, t) {
   const status = String(t.acceptStatus ?? "");
   const isAuto = t.taskType === "auto";
   const actions = el("div", { class: "row-actions" });
+  // 锁定提示：后端锁定说明优先，缺省给一句通用文案（老后端 locked 恒 false，不会走到这里）
+  const lockText = f.lockHint || "到第二天才能接取任务";
 
-  // 接取：仅当后端 canAccept === true（老后端回退旧口径，见 taskFlags）
-  if (f.canAccept) {
+  // 接取：锁定行一律不显示「接取」按钮（即使老数据里 canAccept 仍为 true）；
+  // 否则仅当后端 canAccept === true（老后端回退旧口径，见 taskFlags）
+  if (f.locked) {
+    actions.append(el("span", { class: "muted", text: lockText, title: lockText }));
+  } else if (f.canAccept) {
     actions.append(
       el("button", {
         type: "button",
@@ -885,8 +938,8 @@ function taskRow(a, t) {
   }
 
   // 规则 3：canLight === false 且既非桌面端也非不可自动化 → 没有「点亮」类操作可给，
-  // 说明原因（reason 原文优先）。已领奖的行不再堆提示。
-  if (f.canLight === false && !f.desktopOnly && !f.unforgeable && status !== "claimed") {
+  // 说明原因（reason 原文优先）。已领奖 / 已锁定的行不再堆提示。
+  if (f.canLight === false && !f.desktopOnly && !f.unforgeable && !f.locked && status !== "claimed") {
     actions.append(
       el("span", {
         class: "muted",
@@ -899,12 +952,18 @@ function taskRow(a, t) {
   actions.append(jumpCell(t));
 
   // 任务列标注：小程序徽章 ⇐ code 命中 MP 口径（Sequential_Tasks_ 前缀 / school_season）；
-  // 桌面端徽章 ⇐ desktopOnly === true；无法自动化徽章 ⇐ unforgeable === true
-  //（附 reason 原文）；pinnedExpertId 非空时给一个等宽短串（次要信息，全值在 title）。
+  // 锁定徽章 ⇐ locked === true；桌面端徽章 ⇐ desktopOnly === true；
+  // 无法自动化徽章 ⇐ unforgeable === true（附 reason 原文）；
+  // pinnedExpertId 非空时给一个等宽短串（次要信息，全值在 title）。
   const marks = [];
   if (isMPTask(t)) {
     const b = badge("小程序", "badge-quiet");
     b.title = "通过微信小程序埋点链路执行";
+    marks.push(b);
+  }
+  if (f.locked) {
+    const b = badge("次日可接取", "badge-warn");
+    b.title = lockText;
     marks.push(b);
   }
   if (f.desktopOnly) {
@@ -927,6 +986,18 @@ function taskRow(a, t) {
     );
   }
   const reasonNote = f.reason && (f.unforgeable || f.desktopOnly) ? f.reason : "";
+  // 锁定行在任务标题下给可见提示（不只放 title）；reason 原文仍单独展示
+  const lockNote = f.locked ? lockText : "";
+  const pickTitle = f.locked
+    ? lockText
+    : code
+      ? "勾选后批量操作只作用于选中任务；不勾选 = 全部"
+      : "快照缺任务码，无法勾选";
+  const pickAria = f.locked
+    ? `任务已锁定：${lockText}`
+    : code
+      ? `选择任务 ${String(t.title ?? code)}`
+      : "该任务无任务码，无法勾选";
 
   return el(
     "tr",
@@ -936,13 +1007,13 @@ function taskRow(a, t) {
       { "data-label": "选", class: "pick-cell" },
       el(
         "label",
-        { class: "check", title: code ? "勾选后批量操作只作用于选中任务；不勾选 = 全部" : "快照缺任务码，无法勾选" },
+        { class: "check", title: pickTitle },
         el("input", {
           type: "checkbox",
           dataset: { taskPick: a.uid, code },
-          checked: !!code && isPicked(a.uid, code),
-          disabled: !code,
-          "aria-label": code ? `选择任务 ${String(t.title ?? code)}` : "该任务无任务码，无法勾选",
+          checked: !f.locked && !!code && isPicked(a.uid, code),
+          disabled: !code || f.locked,
+          "aria-label": pickAria,
           onchange: (ev) => setPicked(a.uid, code, ev.target.checked),
         }),
       ),
@@ -953,6 +1024,7 @@ function taskRow(a, t) {
       el("span", { class: "cell-main", text: String(t.title ?? code ?? "（无标题）") }),
       code ? el("span", { class: "cell-sub", text: code }) : null,
       marks.length ? el("div", { class: "cell-badges" }, marks) : null,
+      lockNote ? el("div", { class: "row-note", text: lockNote }) : null,
       reasonNote ? el("div", { class: "row-note", text: reasonNote }) : null,
     ),
     el("td", { "data-label": "状态" }, acceptBadge(status)),
@@ -1061,11 +1133,16 @@ export function acceptPlan(tasks) {
   let blocked = 0; // 桌面端 / 未收录 / 引擎判定不可接
   let auto = 0; // taskType:"auto"：上游无需接取
   let noCode = 0; // 快照真缺任务码
+  let locked = 0; // locked === true：次日才解锁，不算「不可自动接取」
   let pending = 0; // 未接取项总数
   for (const t of list) {
     if (String(t?.acceptStatus ?? "") !== "not_accepted") continue;
     pending++;
     const f = taskFlags(t);
+    if (f.locked) {
+      locked++;
+      continue;
+    }
     if (!String(t?.code ?? "")) {
       noCode++;
       continue;
@@ -1077,7 +1154,7 @@ export function acceptPlan(tasks) {
     if (t?.taskType === "auto") auto++;
     else blocked++;
   }
-  return { codes, blocked, auto, noCode, pending };
+  return { codes, blocked, auto, noCode, pending, locked };
 }
 
 async function refreshSnap(uid, btn) {
@@ -2163,6 +2240,7 @@ function renderAcceptNote() {
   const box = $("#acceptNote");
   if (!box) return;
   let blocked = 0;
+  let locked = 0;
   let noSnap = 0;
   let modern = false;
   for (const a of targetAccounts()) {
@@ -2175,10 +2253,13 @@ function renderAcceptNote() {
     const set = pickedSet(a.uid);
     const tasks = set && set.size ? all.filter((t) => set.has(String(t?.code ?? ""))) : all;
     if (tasks.some((t) => taskFlags(t).modern)) modern = true;
-    blocked += acceptPlan(tasks).blocked;
+    const plan = acceptPlan(tasks);
+    blocked += plan.blocked;
+    locked += plan.locked;
   }
   const parts = [];
   if (modern && blocked > 0) parts.push(`${blocked} 项不可自动接取（桌面端/未收录）`);
+  if (locked > 0) parts.push(`${locked} 项次日可接取（锁定中，批量接取会跳过）`);
   if (noSnap > 0) parts.push(`${noSnap} 个账号无快照（接取前会先只读刷新）`);
   box.textContent = parts.join(" · ");
   box.hidden = parts.length === 0;
@@ -2388,7 +2469,8 @@ async function runFull() {
   await withBusy(async () => {
     const uids = [...state.selected];
     // 任务级勾选按 uid 提交：只有「该账号有勾选」的 uid 进 codes，未出现的账号 = 全部任务。
-    // buddy / travel / night 腿没有任务码，后端会忽略 codes，不受勾选影响。
+    // buddy / travel / night 腿没有任务码，后端会忽略 codes，不受勾选影响；
+    // 小程序链式任务由 growth 腿内嵌执行（2b），不作为独立腿提交。
     const codes = selectionBody(targetAccounts());
     const picked = selectionCount(codes);
     const body = { legs, claim: $("#claimToggle").checked };
@@ -2466,9 +2548,11 @@ async function acceptSelected() {
           ? "快照缺任务码"
           : plan.blocked
             ? `${plan.blocked} 项不可自动接取（桌面端/未收录）`
-            : plan.auto
-              ? `仅 ${plan.auto} 项自动任务，无需接取`
-              : "无未接任务";
+            : plan.locked
+              ? `${plan.locked} 项次日可接取（已跳过）`
+              : plan.auto
+                ? `仅 ${plan.auto} 项自动任务，无需接取`
+                : "无未接任务";
         noCode.push(`${a.nickname || a.uid}（${why}）`);
         continue;
       }
@@ -3143,8 +3227,10 @@ function renderScheduler() {
   const settings = d.settings ?? {};
 
   setChecked($("#schedEnabled"), sch.enabled);
-  // 小时窗口只保留 Buddy 盲盒 / 猫猫旅行 / 夜猫子；settings.hours.growth 即使老后端还带也一律忽略。
+  // 小时窗口只保留 Buddy 盲盒 / 小程序链式任务 / 猫猫旅行 / 夜猫子；
+  // settings.hours.growth 即使老后端还带也一律忽略。mp 默认 []（不排程）。
   const hours = settings.hours ?? {};
+  setVal($("#hoursMp"), (hours.mp ?? []).join(","));
   setVal($("#hoursBuddy"), (hours.buddy ?? []).join(","));
   setVal($("#hoursTravel"), (hours.travel ?? []).join(","));
   setVal($("#hoursNight"), (hours.night ?? []).join(","));
@@ -3224,9 +3310,11 @@ function parseHoursInput(v) {
 }
 
 async function saveHours() {
-  // 排程服务三条无任务码的腿；成长任务已从排程里移除（手工运行仍可选它）。
-  // buddy 留空 = []（不排程）；该腿会消耗成长能量，是否真正开盒由后端决定。
+  // 排程服务四条无任务码的腿：小程序链式任务 / Buddy 盲盒 / 猫猫旅行 / 夜猫子；
+  // 成长任务已从排程里移除（手工运行仍可选它）。所有输入框留空 = []（不排程）；
+  // mp 默认不排程（按天解锁），buddy 会消耗成长能量（是否真正开盒由后端决定）。
   const hours = {
+    mp: parseHoursInput($("#hoursMp").value),
     buddy: parseHoursInput($("#hoursBuddy").value),
     travel: parseHoursInput($("#hoursTravel").value),
     night: parseHoursInput($("#hoursNight").value),

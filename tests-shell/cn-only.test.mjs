@@ -155,14 +155,15 @@ describe("纯国内版口径：国际版账号彻底不出现", () => {
       assert.equal(env.started.length, 1)
       assert.deepEqual([...env.started[0].uids].sort(), CN_UIDS, "job 名单只有国内版 uid")
 
-      // 排程：开排程 + 拨到北京 09:00（UTC 01:00；引擎把窗口小时按北京时间
-      // UTC+8 解释，CONTRACT §7/§8。默认 growth/travel 的小时列表含 9）→
-      // 触发的 job 同样只含 cn（断言的是 runner.start 收到的 spec —— 账号名单）
-      const st = await post(env.h.port, "/api/settings", { scheduler: true })
+      // 排程：开排程 + 显式配 travel:[9]（默认 hours 全空 = 默认不排，需求 4）+
+      // 拨到北京 09:00（UTC 01:00；引擎把窗口小时按北京时间 UTC+8 解释，
+      // CONTRACT §7/§8）→ 触发的 job 同样只含 cn（断言的是 runner.start 收到的
+      // spec —— 账号名单）
+      const st = await post(env.h.port, "/api/settings", { scheduler: true, hours: { travel: [9] } })
       assert.equal(st.status, 200)
       const at9 = Date.UTC(2026, 9, 31, 1, 0) // 北京 2026-10-31 09:00
       const fired = env.h.ticks.checkScheduler(at9)
-      assert.ok(fired, "9 点在默认 growth/travel 窗口内应触发")
+      assert.ok(fired, "9 点在显式配置的 travel 窗口内应触发")
       assert.deepEqual([...env.started[1].uids].sort(), CN_UIDS, "排程触发的 job 名单只有国内版 uid")
       assert.equal(env.started.length, 2)
     } finally {
