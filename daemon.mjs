@@ -83,6 +83,11 @@ const VERSION = (() => {
 
 const LEGS = ["growth", "mp", "streak", "buddy", "travel", "night"]
 const LEG_NAMES = { growth: "成长任务", mp: "小程序链式任务", streak: "连登管家", buddy: "Buddy 盲盒", travel: "猫猫旅行", night: "夜猫子" }
+// 未知路由 404 的 hint（issue #3 的真实症状）：看板比守护进程新时，旧进程没有
+// 新路由（如 GET /api/streak），用户只看到「未知 API」一头雾水 —— hint 指路重启。
+// 只追加字段，error 原文不变（既有测试与前端按原文断言/匹配）。
+const UNKNOWN_API_HINT =
+  "守护进程可能还在跑更新前的旧代码：在 magpie 里关掉再开启本插件即可重启（看板顶栏「停止守护进程」后重开也行）"
 const HISTORY_CAP = 2000
 
 // 积分缓存的有效期（GET /api/credits，CONTRACT §3）：缓存年龄小于它且未要求
@@ -961,6 +966,26 @@ export async function startDaemon(opts = {}) {
     return all.filter((a) => a.provider === "workbuddy-ai").length
   }
 
+  // 企业版账号（社区 issue #3）：acct.enterpriseId 非空 = 企业版，没有成长任务与
+  // 签到。与国际版完全同口径：不进 /api/state 的 accounts[]（statePayload 同一处
+  // 过滤点追加）、不进任何 job 与单账号操作（accountByUid 一律「找不到」，不从
+  // 侧门进引擎）；计数只给数量与去向说明（enterpriseSkipped），绝不列出企业版
+  // 账号内容（uid/昵称/域名/enterpriseId 都不给）。过滤同样只发生在 daemon 使用
+  // 侧：engine/store.loadAccounts 与 accountio 的导入/导出（导出行本就带
+  // enterpriseId 字段，契约 §9）仍可见全量数据 —— 别把过滤下沉进 store 层。
+  const isEnterpriseAcct = (a) => !!a?.enterpriseId
+  function enterpriseSkippedCountOf(all) {
+    // 计数与 intlSkipped 各自独立（provider 分域）：国际版账号只进 intlSkipped，
+    // 企业版只统计 provider==="workbuddy" 的条目，绝不互相重复计数。
+    return all.filter((a) => a.provider === "workbuddy" && isEnterpriseAcct(a)).length
+  }
+  const enterpriseSkippedNote = (n) =>
+    `已忽略 ${n} 个企业版账号：企业版没有成长任务与签到，本插件只服务个人版`
+  // /api/credits 与 /api/streak 对企业版 uid 的 404 专属文案（镜像同一段，§10.8）：
+  // 说清「为什么看不到」与「去哪里看」，绝不泄露昵称/域名/enterpriseId 等额外信息。
+  const ENTERPRISE_NO_GROWTH_MSG =
+    "企业版账号没有成长体系（无任务与积分查询），已从看板隐藏；如需查看请在 magpie 里切换个人版账号"
+
   function cfgEnvLike() {
     const envLike = { ...process.env, WB_CONFIG_DIR: cfgDir, WB_STATE_DIR: stateDir }
     return envLike
@@ -1117,8 +1142,9 @@ export async function startDaemon(opts = {}) {
   }
 
   function accountByUid(uid) {
-    // 与列表同源：只在国内版账号里找（intl uid 一律「找不到」，不会从侧门进引擎）
-    return loadAccountsCn().find((a) => a.uid === uid) || null
+    // 与列表同源：只在国内个人版账号里找（intl 与企业版 uid 一律「找不到」，
+    // 不会从侧门进引擎；企业版口径见上方 enterpriseSkippedCountOf 注释）。
+    return loadAccountsCn().find((a) => a.uid === uid && !isEnterpriseAcct(a)) || null
   }
 
   // ---- 快照（/api/state 的 tasks/energy/streak；只在闲时刷新，限流） ------
@@ -1701,9 +1727,16 @@ export async function startDaemon(opts = {}) {
 
   async function fetchCreditsForUid(uid, force = false) {
     // 可参与口径与 eligibleAccounts 一致：找不到 / API key / 企业号 / 已停用
-    // 一律 404（intl 账号在 accountByUid 里就已经是「找不到」）。
+    // 一律 404（intl 与企业版账号在 accountByUid 里就已经是「找不到」）。
+    // 企业版给专属文案（issue #3）：账号在 magpie 里确实存在，只是企业版没有
+    // 成长体系 —— 404 说清「为什么看不到」与「去哪里看」（ENTERPRISE_NO_GROWTH_MSG），
+    // 绝不泄露昵称/域名/enterpriseId 等额外信息。
+    const raw = loadAccountsAll().find((a) => a.uid === uid && isEnterpriseAcct(a))
+    if (raw) {
+      return { status: 404, body: { error: ENTERPRISE_NO_GROWTH_MSG } }
+    }
     const acct = accountByUid(uid)
-    if (!acct || acct.isApiKey || acct.enterpriseId || acct.tasksEnabled === false) {
+    if (!acct || acct.isApiKey || acct.tasksEnabled === false) {
       return { status: 404, body: { error: `找不到可参与任务的国内版账号：${uid}` } }
     }
     const nickname = acct.nickname || acct.accountId || uid
@@ -1764,9 +1797,14 @@ export async function startDaemon(opts = {}) {
 
   async function fetchStreakForUid(uid, force = false) {
     // 可参与口径与 eligibleAccounts 一致：找不到 / API key / 企业号 / 已停用
-    // 一律 404（intl 账号在 accountByUid 里就已经是「找不到」）。
+    // 一律 404（intl 与企业版账号在 accountByUid 里就已经是「找不到」）；
+    // 企业版专属文案与 /api/credits 同一段（§10.8 镜像口径）。
+    const raw = loadAccountsAll().find((a) => a.uid === uid && isEnterpriseAcct(a))
+    if (raw) {
+      return { status: 404, body: { error: ENTERPRISE_NO_GROWTH_MSG } }
+    }
     const acct = accountByUid(uid)
-    if (!acct || acct.isApiKey || acct.enterpriseId || acct.tasksEnabled === false) {
+    if (!acct || acct.isApiKey || acct.tasksEnabled === false) {
       return { status: 404, body: { error: `找不到可参与任务的国内版账号：${uid}` } }
     }
     const cached = cachedStreakOf(uid)
@@ -1966,7 +2004,10 @@ export async function startDaemon(opts = {}) {
 
   function statePayload(hostHeader) {
     const all = loadAccountsAll()
-    const accts = loadAccountsCn(all)
+    // accounts[] 过滤点（与国际版同一处）：loadAccountsCn 只留国内版，再追加
+    // 企业版排除（issue #3）——企业版没有成长任务与签到，不进看板列表。
+    const accts = loadAccountsCn(all).filter((a) => !isEnterpriseAcct(a))
+    const entSkipped = enterpriseSkippedCountOf(all)
     const cur = runner?.current?.() ?? null
     const payload = {
       // 绑定信息（B）：bindHost 是真实监听 host，绑定 0.0.0.0/:: 时 reachableHint
@@ -1989,6 +2030,11 @@ export async function startDaemon(opts = {}) {
       // 纯国内版诊断计数（只读）：国际版账号的数量与去向说明。绝不列出 intl
       // 账号内容（uid/昵称都不给）—— 用户明确要求国际版账号「彻底不出现」。
       intlSkipped: { count: intlSkippedCountOf(all), note: INTL_SKIPPED_NOTE },
+      // 企业版诊断计数（issue #3，与 intlSkipped 同口径同形状）：count=0 时字段
+      // 保留（{count:0,note:…}）；note 只给数量与去向说明，绝不列出企业版账号
+      // 内容（uid/昵称/域名/enterpriseId 都不给）。账号「不存在」（引擎未就绪/
+      // 读取失败 → all 为空）时取值口径与 intlSkipped 相同 = {count:0,note}。
+      enterpriseSkipped: { count: entSkipped, note: enterpriseSkippedNote(entSkipped) },
       // 冻结总览（CONTRACT §10.3，替代原 scheduler.holds）：403/11140 冻结名单，
       // 数据源 = runner.frozen()（初始数据来自 state/frozen.json，经 onFrozen/
       // onUnfrozen 双向同步）。冻结账号不进缺省目标、绝不自动恢复 —— 「恢复」
@@ -2586,7 +2632,10 @@ export async function startDaemon(opts = {}) {
       return
     }
 
-    json(res, 404, { error: `未知 API：${req.method} ${p}` })
+    // 未知路由（issue #3）：error 原文保持逐字不变（既有测试与前端按原文断言/
+    // 匹配），只追加 hint 指路重启 —— 看板比守护进程新时的真实症状见
+    // UNKNOWN_API_HINT 注释。
+    json(res, 404, { error: `未知 API：${req.method} ${p}`, hint: UNKNOWN_API_HINT })
   }
 
   const handler = async (req, res) => {

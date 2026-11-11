@@ -321,6 +321,21 @@ accessToken/refreshToken 的导出并关停守护进程（README 安全段如实
 下沉进 store 层**。诊断计数：`/api/state` 顶层 `intlSkipped:{count,note}` 只给数量与说明，
 绝不列出国际版账号内容（uid/昵称/域名都不给）。
 
+**企业版同口径（issue #3）**：`acct.enterpriseId` 非空的企业版账号（provider 仍是 `workbuddy`）
+没有成长任务与签到，与国际版完全同口径处理 —— 不进 `/api/state` 的 `accounts[]`（statePayload
+的 accounts 过滤点追加企业版排除）、不进 `eligibleNow()`（`eligibleAccounts` 本就排除
+`enterpriseId`）/ `/api/run` 缺省 uids / 排程选号 / 快照刷新 / 任何 job；单账号操作
+（claim/accept/checkin/streak/run/toggle/快照点名 uid）经 `accountByUid()` 一律「找不到」，
+显式点名如实失败（/api/run 混选时企业版被剔除、只点企业版回 400；单账号操作回
+「找不到账号」）、绝不静默、零上游。诊断计数：`/api/state` 顶层 `enterpriseSkipped:{count,note}`
+（与 `intlSkipped` 同形状，count=0 时字段保留；账号「不存在」/引擎未就绪时同为
+`{count:0,note}`），note 只给数量与去向说明（「已忽略 N 个企业版账号：企业版没有成长任务与
+签到，本插件只服务个人版」，N 为实际数量），绝不列出企业版账号内容（uid/昵称/域名/
+enterpriseId 都不给）。两个计数按 provider 分域、各自独立：国际版只进 `intlSkipped`，
+企业版只统计 `provider==="workbuddy"` 的条目，绝不互相重复计数。过滤同样只发生在 daemon
+使用侧：导入/导出（§9，导出行本就带 `enterpriseId` 字段）与 `engine/store.loadAccounts`
+仍可见企业版条目——**数据面不拦，使用面全拦**。
+
 绑定：`127.0.0.1` 默认；链路 `options.listenAddress → WB_DAEMON_ADDR → --addr`，设 `0.0.0.0`/`::` 才对外
 （**免密钥口径下这就是唯一的安全边界**：对外绑定 = 同一局域网内任何主机都能执行上文全部路由，
 包括写入凭据与下载 token；README 安全段如实写明风险与建议；真实绑定 host 由 daemon 心跳写进
@@ -333,6 +348,14 @@ GET  /api/state                 -> {serveUrl, bindHost, port, reachableHint,
                                     // 的数量与去向说明（note="本插件只服务国内版 workbuddy，
                                     // 国际版账号不列出、不参与任务、不默认导出"）；绝不列出
                                     // 国际版账号内容（uid/昵称/域名都不给）
+                                    enterpriseSkipped:{count,note},
+                                    // 只读诊断计数（issue #3）：企业版账号（provider===
+                                    // "workbuddy" 且 enterpriseId 非空）的数量与去向说明
+                                    //（note="已忽略 N 个企业版账号：企业版没有成长任务与
+                                    // 签到，本插件只服务个人版"，N=实际数量；count=0 时
+                                    // 字段保留）。与 intlSkipped 同形状同口径、各自独立
+                                    // 计数；绝不列出企业版账号内容（uid/昵称/域名/
+                                    // enterpriseId 都不给）
                                     accounts:[{uid,nickname,masked,domain,expiresInMs,expiresInDays,tasksEnabled,
                                              imported,eligible,
                                              credits,   // 该账号的积分缓存（state/credits.json 投影，
@@ -358,8 +381,10 @@ GET  /api/state                 -> {serveUrl, bindHost, port, reachableHint,
                                              // 仅旧缓存（无自身锁字段）回退 state/mp-locks.json
                                              //（§7；锁过期即解锁，until 当天即可用）
                                              energy,streak,days,updatedISO}}],
-                                    // accounts[] 只含 provider==="workbuddy"（国内版）条目；
-                                    // 国际版 workbuddy-ai 一律不出现（见上方纯国内版口径）
+                                    // accounts[] 只含 provider==="workbuddy" 的国内个人版
+                                    // 条目；国际版 workbuddy-ai 一律不出现（见上方纯国内版
+                                    // 口径），企业版（enterpriseId 非空）同样不出现
+                                    //（见上方企业版同口径）
                                     scheduler:{enabled,nextRuns[[leg,hour]],lastCycle,
                                                holds:[{uid,nickname,releasedAt}]},
                                     job:Job|null, stats:{creditsToday,energyToday,runs},
@@ -489,8 +514,16 @@ GET  /api/jobs/:id              -> Job
 GET  /api/credits?uid=<uid>&refresh=0|1
                                     -> 200 {ok:true, uid, nickname, credits}
                                     | 200 {ok:false, uid, nickname, error, needRelogin?, credits?旧缓存}
-                                    | 404 {error}   // uid 找不到 / API key / 企业号 / 已停用
-                                                    //（可参与口径与 eligibleAccounts 一致）
+                                    | 404 {error}   // uid 找不到 / API key / 已停用 →
+                                                    //   "找不到可参与任务的国内版账号：<uid>"
+                                                    //   （可参与口径与 eligibleAccounts 一致；
+                                                    //   intl 与企业版账号在 accountByUid 里就已经
+                                                    //   是「找不到」）；
+                                                    //   企业版（enterpriseId 非空，issue #3）→ 专属
+                                                    //   文案 "企业版账号没有成长体系（无任务与积分
+                                                    //   查询），已从看板隐藏；如需查看请在 magpie 里
+                                                    //   切换个人版账号"（说清「为什么看不到」与
+                                                    //   「去哪里看」，绝不泄露昵称/域名等额外信息）
                                     | 409 {error:"busy"}  // 要拉取时 job 在跑（或已在拉取中）
                                     | 503 {error}   // 引擎不可用
                                     // 国内版「积分余额 + 套餐权益包明细」（看板 剩余/总额 与明细
@@ -515,6 +548,14 @@ GET  /api/history?limit=200     -> 每次尝试一行（对齐 hub 的 /activity
                                     // 的 trigger，非法值/缺失一律按 "manual"，绝不透出第三种拼写。
                                     // 已写入的旧行不迁移（无法可靠回溯）。
 GET  /api/events                -> SSE：{kind:'job'|'step'|'log'|'scheduler', ...}
+其余未知 /api/* 路由            -> 404 {error:"未知 API：<METHOD> <path>", hint}
+                                    // error 原文逐字不变（既有测试与前端按原文断言/匹配），
+                                    // 只追加 hint 指路重启（issue #3 的真实症状：看板比
+                                    // 守护进程新时，旧进程没有新路由如 GET /api/streak，
+                                    // 用户看到「未知 API」一头雾水）—— hint =
+                                    // "守护进程可能还在跑更新前的旧代码：在 magpie 里关掉
+                                    // 再开启本插件即可重启（看板顶栏「停止守护进程」后
+                                    // 重开也行）"
 其余 GET /                      -> dashboard/index.html（静态，同源，无构建）
 ```
 
@@ -1089,7 +1130,10 @@ hub `v2.1.0` 口径：HTTP 403 / code 11140 不是可自动恢复的风控冷却
   `data.credit ?? data.points`（容错解析，尚未拿到真实到账报文 —— 2026-11-11 该账号
   `tier_*_status` 全为未达成、`chances=0`，所以还没验证过兑换/抽奖的到账字段）。
 - **`GET /api/streak` 的错误口径**（镜像 `/api/credits`）：缺 `uid` → 400；uid 找不到 /
-  API key / 企业号 / `tasksEnabled:false` → 404；引擎缺文件 → 503。上游查询失败 → **200 +
+  API key / `tasksEnabled:false` → 404（「找不到可参与任务的国内版账号：<uid>」）；
+  企业版（`enterpriseId` 非空，issue #3）→ 404 且给与 `/api/credits` 同一段的专属文案
+  （「企业版账号没有成长体系……切换个人版账号」，§3 企业版同口径）；引擎缺文件 → 503。
+  上游查询失败 → **200 +
   `error`**（有旧缓存时一并带回 `streak`），HTTP 状态不表示上游结果。
 - **`GET /api/state` 不打上游**：`accounts[].streak` 只是 `state/streak.json` 的只读投影
   （没有缓存 = `null`，看板显示「未查询」）。

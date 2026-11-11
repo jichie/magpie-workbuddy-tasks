@@ -4,6 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex">
+  <!-- 静态文件版本：必须与 package.json 的 version 一致（后端测试比对四处：
+       package.json / index.mjs 的 VERSION / page 页脚 / 这个 meta）。app.js 读它做版本一致性检查。 -->
+  <meta name="wb-version" content="0.3.3">
   <title>WorkBuddy 任务 · 看板</title>
   <link rel="icon" href="logo-mark.png" type="image/png">
   <link rel="stylesheet" href="style.css">
@@ -27,6 +30,9 @@
       <div class="status-group" role="group" aria-label="连接状态">
         <span class="pill pill-quiet" id="daemonPill" role="status" aria-live="polite">检查中…</span>
         <span class="pill pill-quiet" id="feedPill">未连接</span>
+        <!-- 版本不一致提示（0.3.3）：插件文件更新了、守护进程还在跑旧代码时挂在这里
+             （「实时 · SSE」右边）。可见文案取短句，完整解释放 title。 -->
+        <span class="pill pill-warn" id="verPill" hidden></span>
       </div>
 
       <div class="appbar-actions">
@@ -158,6 +164,10 @@
         <div id="accountsList" class="accounts-list"></div>
       </div>
       <p class="acct-intl" id="intlNote" hidden></p>
+      <!-- 企业版说明行：与 #intlNote 同款样式与位置。后端把企业版账号（acct.enterpriseId
+           非空）从 accounts[] 过滤掉，并在 /api/state 顶层给 enterpriseSkipped:{count,note}。
+           有 count>0 才显示；绝不列出任何企业版账号的 uid / 昵称 / 域名。 -->
+      <p class="acct-intl" id="enterpriseNote" hidden></p>
 
       <div class="batchbar">
         <!-- 任务腿勾选是唯一选择源：初始勾选由 app.js 按 settings.legs 回写，HTML 里不写死 checked。 -->

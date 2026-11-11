@@ -2,8 +2,12 @@
 //
 // 数据面（只消费 daemon.mjs 真实存在的路由，绝不发明接口）：
 //   GET  /api/hello            -> {name, version, ready}
+//        看板启动时查一次，拿 version 与静态文件版本（<meta name="wb-version">）比对：
+//        不一致 → 版本一致性横幅（插件文件更新了但老进程还在跑）。不为此每 3 秒轮询。
 //   GET  /api/state[?refresh=1|<uid>] -> {serveUrl, bindHost, port, reachableHint,
-//                                        accounts, intlSkipped, scheduler, job, stats, settings, notice?, engineErrors?}
+//                                        accounts, intlSkipped, enterpriseSkipped, scheduler, job, stats, settings, notice?, engineErrors?}
+//        enterpriseSkipped = {count, note}：被过滤掉的企业版账号数量与说明（只给数字/一句说明，
+//        绝不列出任何企业版账号的 uid / 昵称 / 域名）。
 //        看板地址块已按需求整块移除：页面不渲染地址块、不复制 serveUrl。
 //        接口里的 serveUrl/bindHost/port/reachableHint 保留（守护进程侧兼容），
 //        addrModel 纯函数仅为 tests-shell/serve-url.test.mjs 的形状校验而保留。
@@ -105,6 +109,7 @@ const LS_THEME = "wbt.theme"; // 主题：localStorage 持久化
 
 const state = {
   hello: null,
+  helloBusy: false, // /api/hello 首次拉取中（防并发；拿到后不再重复请求）
   conn: "checking", // checking | online | down | stopped
   feed: "idle", // sse | poll | idle
   data: null, // 最近一次 /api/state
@@ -319,6 +324,45 @@ async function api(path, opts = {}) {
   return await apiOnce(path, opts);
 }
 
+// 静态文件（看板）自己的版本：读 <head> 里的 <meta name="wb-version">。
+// 与守护进程 /api/hello 的 version 不同 = 插件文件更新了但老进程还在跑。
+// 导出仅为 Node 下单元验证；浏览器里 <script type="module"> 不受影响。
+export function staticVersion(root = typeof document !== "undefined" ? document : null) {
+  const m = root?.querySelector?.('meta[name="wb-version"]');
+  const v = m ? String(m.getAttribute("content") || "").trim() : "";
+  return v;
+}
+
+// 「未知 API」展示层改写（0.3.4）：守护进程文件更新后端口上仍是老进程健康，
+// 新路由(如 /api/streak)在老进程里一律回 404 {error:"未知 API：GET /api/xxx"}。
+// 这句看着像看板坏了，其实只是没重启 —— 改写成「重启插件」的人话。
+// 纪律：
+//   · 这是纯展示改写，绝不改 ApiError 语义；原始 error 仍 console.error 进控制台。
+//   · 后端新加的 hint 字段（响应体 {error, hint}）优先，没有 hint 时用兜底句。
+//   · 文本里不含「未知 API」时原样返回（不做任何多余改动）。
+const UNKNOWN_API_RE = /未知\s*API/;
+
+// 从「未知 API：GET /api/streak」里取路径（兼容半角/全角冒号与有无 HTTP 方法）。
+// 导出仅为 Node 下单元验证；浏览器里 <script type="module"> 不受影响。
+export function unknownApiPath(text) {
+  const m = /未知\s*API\s*[：:]\s*(?:[A-Za-z]+\s+)?(\S+)/.exec(String(text ?? ""));
+  return m ? m[1] : "";
+}
+
+// 统一改写函数：所有展示错误的地方都走它（humanErr / 连登查询 / 积分查询 /
+// 单账号与批量操作 / 导入导出 / 历史）。返回可直接显示的文案。
+// 导出仅为 Node 下单元验证；浏览器里 <script type="module"> 不受影响。
+export function humanizeApiErr(text, hint) {
+  const raw = String(text ?? "");
+  if (!UNKNOWN_API_RE.test(raw)) return raw;
+  // 不吞错误：原始 error 打进控制台，便于分辨「真坏了」还是「只是没重启」。
+  try { console.error("[看板] 接口返回原始错误（屏幕已改写为友好提示）：", raw); } catch {}
+  const h = String(hint ?? "").trim();
+  if (h) return h;
+  const path = unknownApiPath(raw);
+  return `守护进程版本落后（缺少 ${path || "该"} 接口）—— 关掉再开启本插件让它重启。`;
+}
+
 // 把异常翻译成人话（后端给的中文原样透出，绝不显示堆栈）
 function humanErr(e, prefix = "操作失败") {
   if (e instanceof ApiError) {
@@ -326,7 +370,7 @@ function humanErr(e, prefix = "操作失败") {
       toast("已有批量任务在跑：同一时刻只允许一个 job。等它结束，或先点「停止当前任务」。", "warn", 7000);
       return;
     }
-    toast(`${prefix}（HTTP ${e.status}）：${e.message}`, "warn", 8000);
+    toast(`${prefix}（HTTP ${e.status}）：${humanizeApiErr(e.message, e.data?.hint)}`, "warn", 8000);
     return;
   }
   if (e && e.network) {
@@ -335,7 +379,7 @@ function humanErr(e, prefix = "操作失败") {
     toast("连不上守护进程：它可能已停止。可在 magpie 里重开本插件自动拉起，或用顶栏「启动命令」手动启动。", "warn", 9000);
     return;
   }
-  toast(`${prefix}：${e && e.message ? e.message : String(e)}`, "warn", 8000);
+  toast(`${prefix}：${humanizeApiErr(e && e.message ? e.message : String(e))}`, "warn", 8000);
 }
 
 // ---- 主题（默认跟随系统；显式选择持久化到 localStorage） -----------------------------
@@ -1553,7 +1597,32 @@ function accountRow(a) {
   );
 }
 
+// 版本一致性横幅（0.3.4）：静态文件版本（<meta name="wb-version">）vs 守护进程
+// /api/hello 的 version。不一致 = 「插件文件更新了、端口上还是老进程健康复用」这个坑 ——
+// 报「重启插件」这一步。一致 / hello 没拿到（引擎与守护进程都没起来）→ 不显示，不多报。
+// 版本不一致提示：挂在 appbar 的「实时 · SSE」右边（用户 2026-11-11 指定位置），
+// 做成一颗告警胶囊 —— 顶栏是横条，放整段解释会把状态栏撑高，所以可见文案只留
+// 短句（两个版本号），完整解释进 title。守护进程健康（版本一致）时整颗隐藏。
+function renderVersionPill() {
+  const pill = $("#verPill");
+  if (!pill) return;
+  const fileV = staticVersion();
+  const svcV = String(state.hello?.version ?? "").trim();
+  if (!fileV || !svcV || fileV === svcV) {
+    pill.hidden = true;
+    pill.textContent = "";
+    pill.removeAttribute("title");
+    return;
+  }
+  pill.hidden = false;
+  pill.textContent = `守护进程版本落后（v${svcV} ≠ v${fileV}）`;
+  pill.title =
+    `插件文件是 v${fileV}，守护进程还在跑 v${svcV} —— 通常是更新后没重启守护进程；` +
+    "在 magpie 里关掉再开启本插件即可（或点看板顶栏「停止守护进程」后重新拉起）。";
+}
+
 function renderBanners() {
+  renderVersionPill(); // 顶栏胶囊，与账号区横幅无关；每次都按当前 hello 重算
   const box = $("#accountsBanners");
   box.replaceChildren();
   const d = state.data;
@@ -1592,6 +1661,24 @@ function renderIntlNote() {
   box.hidden = false;
 }
 
+// 企业版说明行：与 #intlNote 一模一样的样式与位置。数字取 /api/state 顶层
+// enterpriseSkipped.count，文案优先用后端的 note；缺失或为 0 时整行不显示。
+// 纪律：绝不渲染任何企业版账号内容（uid / 昵称 / 域名），只出计数与说明。
+function renderEnterpriseNote() {
+  const box = $("#enterpriseNote");
+  if (!box) return;
+  const count = Number(state.data?.enterpriseSkipped?.count);
+  if (!Number.isFinite(count) || count <= 0) {
+    box.hidden = true;
+    box.textContent = "";
+    return;
+  }
+  const note = String(state.data?.enterpriseSkipped?.note ?? "").trim();
+  box.textContent =
+    note || `已忽略 ${count} 个企业版账号：企业版没有成长任务与签到，本插件只服务个人版`;
+  box.hidden = false;
+}
+
 function renderAccounts() {
   const box = $("#accountsList");
   box.replaceChildren();
@@ -1604,6 +1691,7 @@ function renderAccounts() {
     count.textContent = accounts.length ? `${accounts.length} 个账号 · ${eligible} 个参与` : "暂无账号";
   }
   renderIntlNote();
+  renderEnterpriseNote();
   renderFrozenNote();
   if (!accounts.length) {
     box.append(
@@ -1859,7 +1947,7 @@ async function requestCredits(uid, refresh = false) {
       return {
         ok: false,
         kind: "upstream",
-        error: String(d.error || "上游查询失败"),
+        error: humanizeApiErr(String(d.error || "上游查询失败"), d.hint),
         needRelogin: !!d.needRelogin,
         nickname: d.nickname,
       };
@@ -1868,11 +1956,15 @@ async function requestCredits(uid, refresh = false) {
   } catch (e) {
     if (e instanceof ApiError) {
       if (e.status === 409) return { ok: false, kind: "busy", error: "批量任务运行中，稍后再查" };
-      if (e.status === 404) return { ok: false, kind: "notfound", error: "未知账号（可能已被移除）" };
-      return { ok: false, kind: "http", error: e.message || `HTTP ${e.status}` };
+      // 404 既可能是「账号不存在」，也可能是「老守护进程没这个路由（未知 API）」。
+      // 后者是版本落后，不能误报成账号不存在 —— 交给统一改写函数区分。
+      if (e.status === 404 && !UNKNOWN_API_RE.test(e.message)) {
+        return { ok: false, kind: "notfound", error: "未知账号（可能已被移除）" };
+      }
+      return { ok: false, kind: "http", error: humanizeApiErr(e.message || `HTTP ${e.status}`, e.data?.hint) };
     }
     if (e && e.network) return { ok: false, kind: "network", error: "连不上守护进程" };
-    return { ok: false, kind: "error", error: String((e && e.message) || e) };
+    return { ok: false, kind: "error", error: humanizeApiErr(String((e && e.message) || e)) };
   }
 }
 
@@ -2599,24 +2691,26 @@ async function requestStreak(uid, refresh) {
     const s = d?.streak;
     if (s && typeof s === "object") return { ok: true, streak: s };
     // streak:null + error = 上游读不到；streak:null 无 error = 该账号还没查过（后端也没缓存）
-    return { ok: false, kind: "empty", error: String(d?.error || "上游没有返回连登状态") };
+    return { ok: false, kind: "empty", error: humanizeApiErr(String(d?.error || "上游没有返回连登状态"), d?.hint) };
   } catch (e) {
     if (e instanceof ApiError) {
       if (e.status === 409) return { ok: false, kind: "busy", error: "批量任务运行中，稍后再查" };
       if (e.status === 404) {
+        // 「未知 API：GET /api/streak」= 老守护进程没有这个路由（版本落后，改写成人话）；
+        // 其余 404 = 账号不存在。两者都如实说，后者保留原文兜底。
+        const hasBody = e.message && e.message !== "HTTP 404";
         return {
           ok: false,
           kind: "absent",
-          error:
-            e.message && e.message !== "HTTP 404"
-              ? e.message
-              : "账号不存在，或 /api/streak 还没实现（后端需 0.3.3）",
+          error: hasBody
+            ? humanizeApiErr(e.message, e.data?.hint)
+            : "账号不存在，或 /api/streak 还没实现（后端需 0.3.3）",
         };
       }
-      return { ok: false, kind: "http", error: e.message || `HTTP ${e.status}` };
+      return { ok: false, kind: "http", error: humanizeApiErr(e.message || `HTTP ${e.status}`, e.data?.hint) };
     }
     if (e && e.network) return { ok: false, kind: "network", error: "连不上守护进程" };
-    return { ok: false, kind: "error", error: String((e && e.message) || e) };
+    return { ok: false, kind: "error", error: humanizeApiErr(String((e && e.message) || e)) };
   }
 }
 
@@ -3182,7 +3276,7 @@ async function acceptSelected() {
           setBatchStatus("已有批量任务在跑，接取中止（守护进程限速保护）。");
           return;
         }
-        notes.push(`${a0.nickname || a0.uid}：快照刷新失败（${e.message}）`);
+        notes.push(`${a0.nickname || a0.uid}：快照刷新失败（${humanizeApiErr(e.message, e.data?.hint)}）`);
         continue;
       }
       let plan = acceptPlan(a.snapshot?.tasks);
@@ -3206,7 +3300,7 @@ async function acceptSelected() {
             setBatchStatus("已有批量任务在跑，接取中止（守护进程限速保护）。");
             return;
           }
-          notes.push(`${a.nickname || a.uid}：快照刷新失败（${e.message}）`);
+          notes.push(`${a.nickname || a.uid}：快照刷新失败（${humanizeApiErr(e.message, e.data?.hint)}）`);
           continue;
         }
         if (!fresh) {
@@ -3251,7 +3345,7 @@ async function acceptSelected() {
           setBatchStatus("已有批量任务在跑，接取中止（守护进程限速保护）。");
           return;
         }
-        notes.push(`${a.nickname || a.uid}：${e.message}`);
+        notes.push(`${a.nickname || a.uid}：${humanizeApiErr(e.message, e.data?.hint)}`);
       }
     }
     const parts = [
@@ -3350,7 +3444,7 @@ async function claimSelected() {
             setBatchStatus("已有批量任务在跑，领奖中止。");
             return;
           }
-          failNotes.push(`${a.nickname || a.uid}/${code}：${e.message}`);
+          failNotes.push(`${a.nickname || a.uid}/${code}：${humanizeApiErr(e.message, e.data?.hint)}`);
         }
       }
     }
@@ -3576,10 +3670,10 @@ async function exportAccounts(btn) {
       status.textContent = "";
       humanErr(e, "导出失败");
     } else if (e instanceof ApiError) {
-      // 后端中文 error 原样透出（如 404 no such account），不显示堆栈
-      status.textContent = `导出失败（HTTP ${e.status}）：${e.message}`;
+      // 后端中文 error 原样透出（如 404 no such account），不显示堆栈；未知 API → 人话改写
+      status.textContent = `导出失败（HTTP ${e.status}）：${humanizeApiErr(e.message, e.data?.hint)}`;
     } else {
-      status.textContent = `导出失败：${e?.message ?? e}`;
+      status.textContent = `导出失败：${humanizeApiErr(String(e?.message ?? e))}`;
     }
   } finally {
     btn.disabled = false;
@@ -3828,8 +3922,8 @@ function renderImportError(e, prefix) {
   }
   box.replaceChildren();
   if (e instanceof ApiError) {
-    // 400 无可导入账号 / 409 auth 解析失败 等：后端中文 error 原样透出，不显示堆栈
-    setImpStatus(`${prefix}（HTTP ${e.status}）：${e.message}`);
+    // 400 无可导入账号 / 409 auth 解析失败 等：后端中文 error 原样透出，不显示堆栈；未知 API → 人话改写
+    setImpStatus(`${prefix}（HTTP ${e.status}）：${humanizeApiErr(e.message, e.data?.hint)}`);
     return;
   }
   if (e && e.network) {
@@ -3837,7 +3931,7 @@ function renderImportError(e, prefix) {
     humanErr(e, prefix);
     return;
   }
-  setImpStatus(`${prefix}：${e?.message ?? e}`);
+  setImpStatus(`${prefix}：${humanizeApiErr(String(e?.message ?? e))}`);
 }
 
 // ---- 导入 / 导出抽屉（已合并进账号卡片） ------------------------------------------------
@@ -4135,7 +4229,7 @@ async function loadHistory() {
 
 function renderHistoryError(e) {
   $("#histBody").replaceChildren(
-    el("div", { class: "empty", text: `历史读取失败：${e?.message ?? e}` }),
+    el("div", { class: "empty", text: `历史读取失败：${humanizeApiErr(String(e?.message ?? e), e?.data?.hint)}` }),
   );
   $("#histPager").replaceChildren();
 }
@@ -4224,6 +4318,8 @@ function startPolling() {
   if (state.pollTimer) return;
   state.pollTimer = setInterval(() => {
     loadState({ quiet: true });
+    // /api/hello 只在启动探一次；失败后按这个既有轮询节奏（3s）重试，绝不为版本检查另开快循环。
+    ensureHello();
   }, 3000);
 }
 function stopPolling() {
@@ -4491,29 +4587,43 @@ function wireStatic() {
   } catch {}
 }
 
+// 拉一次 /api/hello 做版本一致性检查。拿到结果就不再打（不为版本检查每 3 秒发请求）；
+// 失败返回错误实例交给调用方判断，并由 3s 轮询里的同一次调用重试。
+async function ensureHello() {
+  if (state.hello || state.helloBusy) return null;
+  state.helloBusy = true;
+  try {
+    state.hello = await api("api/hello");
+    renderTop();
+    renderBanners();
+    return null;
+  } catch (e) {
+    return e;
+  } finally {
+    state.helloBusy = false;
+  }
+}
+
 async function boot() {
   renderTop();
   // 守护进程无鉴权：首屏直接渲染，hello / state / history / SSE 都不需要任何凭据。
-  try {
-    state.hello = await api("api/hello");
-  } catch (e) {
-    if (e.network) {
-      state.conn = "down";
-      renderTop();
-      $("#accountsList").replaceChildren(
-        el("div", { class: "empty" },
-          el("strong", {}, "连不上守护进程。"),
-          "它可能没有启动：magpie 开启本插件时会自动拉起；也可在插件目录手动执行 ",
-          el("code", { text: "node daemon.mjs" }),
-          "，启动后刷新本页。实际端口与绑定地址写在 ",
-          el("code", { text: "<状态目录>/daemon.json" }),
-          "。",
-        ),
-      );
-      return;
-    }
-    // 其余错误：继续读 state，让它把话说全
+  const helloErr = await ensureHello();
+  if (helloErr && helloErr.network) {
+    state.conn = "down";
+    renderTop();
+    $("#accountsList").replaceChildren(
+      el("div", { class: "empty" },
+        el("strong", {}, "连不上守护进程。"),
+        "它可能没有启动：magpie 开启本插件时会自动拉起；也可在插件目录手动执行 ",
+        el("code", { text: "node daemon.mjs" }),
+        "，启动后刷新本页。实际端口与绑定地址写在 ",
+        el("code", { text: "<状态目录>/daemon.json" }),
+        "。",
+      ),
+    );
+    return;
   }
+  // 其余错误（含 hello 暂时拿不到）：继续读 state，让它把话说全
   if (state.conn !== "stopped") state.conn = "checking";
   await loadState();
   if (state.conn === "online") {
