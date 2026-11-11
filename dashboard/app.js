@@ -628,9 +628,13 @@ export function taskFlags(t) {
 // 微信小程序任务识别（纯展示：只决定任务行「小程序」徽章，不参与勾选 / 接取 / 领奖门控）。
 // MP 专属任务码口径与 engine/miniprogram.mjs 的 isMPCode 一致：Sequential_Tasks_ 前缀，
 // 或校园日 school_season。后端把 MP-only 任务并入快照后，前端据此标注执行通道。
+// 显式排除 Sequential_Tasks_7：它在 engine/constants.mjs 的 TASK_SPECS 里是
+// kind:"playbook"（PC 灵感功能），不走小程序链路。前端不引 constants，故此码在此硬编码排除，
+// 与后端 isMPCode「前缀命中但在 TASK_SPECS 里就不算 MP」的口径对齐。
 // 导出仅为 Node 下单元验证；浏览器里 <script type="module"> 不受影响。
 export function isMPTask(t) {
   const code = String(t?.code ?? "");
+  if (code === "Sequential_Tasks_7") return false;
   return code === "school_season" || code.startsWith("Sequential_Tasks_");
 }
 
@@ -918,11 +922,11 @@ function taskRow(a, t) {
   // 锁定提示：后端锁定说明优先，缺省给一句通用文案（老后端 locked 恒 false，不会走到这里）
   const lockText = f.lockHint || "到第二天才能接取任务";
 
-  // 接取：锁定行一律不显示「接取」按钮（即使老数据里 canAccept 仍为 true）；
-  // 否则仅当后端 canAccept === true（老后端回退旧口径，见 taskFlags）
-  if (f.locked) {
-    actions.append(el("span", { class: "muted", text: lockText, title: lockText }));
-  } else if (f.canAccept) {
+  // 接取：锁定行不在这里输出任何提示（锁文案只在任务列渲染：row-note / 「次日可接取」徽章 /
+  // 勾选框 title，见下方 lockNote）——操作列对锁定行只留 jumpCell(t)。
+  // 锁定行一律不显示「接取」按钮（即使老数据里 canAccept 仍为 true）；
+  // 非锁定行仅当后端 canAccept === true（老后端回退旧口径，见 taskFlags）
+  if (!f.locked && f.canAccept) {
     actions.append(
       el("button", {
         type: "button",
@@ -950,8 +954,10 @@ function taskRow(a, t) {
   } else if (status === "not_accepted" && code === "") {
     // 窄守卫：快照真缺任务码时才提示（规范化后的快照 code 恒非空）
     actions.append(el("span", { class: "muted", text: "快照缺任务码，无法接取" }));
-  } else if (status === "not_accepted" && f.modern) {
-    // 引擎判定现在不能接（已接过 / 未收录 / 桌面端族）—— 不静默，给一句说明
+  } else if (status === "not_accepted" && f.modern && !f.locked) {
+    // 引擎判定现在不能接（已接过 / 未收录 / 桌面端族）—— 不静默，给一句说明。
+    // 锁定行排除在外：锁文案已由任务列承担，这里再放一句就是重复（reason 为空时还会退化成
+    // 「引擎判定不可自动接取」，对锁定行是误导）。
     actions.append(el("span", { class: "muted", text: f.reason || "引擎判定不可自动接取" }));
   }
 

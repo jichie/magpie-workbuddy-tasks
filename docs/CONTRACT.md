@@ -100,6 +100,9 @@ fetchTasks(acct) -> Task[]
   // 绝不做双拼写回退链。raw 为非枚举字段（不进 JSON），保留上游原始对象调试用。
   // Task = { code, title, description, jumpUrl,
   //          acceptStatus /*"not_accepted"|"accepted"|"completed"|"claimed"*/,
+  //          locked /*上游清单自带，缺失归一 false；2026-11-11 实测 web 清单也带
+  //                  （Sequential_Tasks_7 locked:true + unlock_at）*/,
+  //          unlockAt /*上游 unlock_at 原样透传，缺失归一 ""*/,
   //          taskType /*""|"single"|"auto"|…*/, progress:{current,target},
   //          rewardCredit, rewardEnergy, unforgeable, reason, raw?(非枚举) }
 acceptTasks(acct, codes) -> {accepted[], already[], failed[]}   // 20 个一批
@@ -126,12 +129,20 @@ runGrowthTasks(acct, opts) -> GrowsResult
   // opts.travel?: boolean —— 显式 false 关闭第 3 步的猫猫旅行检查（缺省开启；
   // runner 批量编排里旅行只由 travel 腿负责，growth 腿显式传 false —— 只勾
   // growth 绝不跑旅行、growth+travel 也只跑一次）
+  // 次日锁（0.3.2/2026-11-11 实测）：web 清单也带 locked/unlock_at —— locked:true
+  // 的任务整条跳过（不进接取批次、不上报、不领奖，日志「⏳ 任务 [title] 到第二天
+  // 才能接取任务，跳过」；claimed 优先不被陈旧锁挡住）；needsAccept 排除锁定项，
+  // 复查/重试/「仍有 N 个未接取」不再被锁定任务误报；解锁（locked:false）后照常
 
 // miniprogram.mjs —— 微信小程序链式任务（runGrowthTasks 2b 自动调用，普通任务
 // 处理完、猫猫旅行之前；0.3.0 起 MP 专属任务还经 refreshSnapshots 并入快照/看板、
 // 经 /api/task/accept|claim 的 isMPCode 分流被单账号操作；0.3.2 起也是独立 mp 腿）
 MP_HEADERS / MP_REPORT_HEADERS / MP_TASK_SPECS / MP_TASK_CODES  // 常量（§7）
-isMPCode(code) -> boolean            // MP_TASK_SPECS 命中或 Sequential_Tasks_ 前缀
+isMPCode(code) -> boolean            // MP_TASK_SPECS 命中，或 Sequential_Tasks_ 前缀
+                                     // 且不在 TASK_SPECS —— Sequential_Tasks_7 在
+                                     // TASK_SPECS（web playbook/PC 灵感功能）绝不算
+                                     // MP（否则 MP 链路吃掉它、web 流水线接取必败）；
+                                     // Sequential_Tasks_99 等未收录前缀仍算 MP
 mpBase(uid, nick, nowMs) -> object   // WorkBuddy_MP 埋点指纹（每条 MP 事件都要合并）
 fetchMPTasks(acct, opts) -> MP Task[]        // GET growth/tasks，MP_HEADERS，规范 camelCase
                                      // 0.3.2 起含上游锁字段：locked（布尔，缺失归一 false）、
@@ -592,6 +603,11 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
   + `requestModelId:"glm-5.2"`/`requestModelName:"GLM-5.2"`。整个 need 的事件一次
   report 发完（不逐条轮询进度），等 1.5s 直接领，领不到顺延下轮。web 侧的
   `Sequential_Tasks_7`（PC灵感功能，playbook 双事件）在 TASK_SPECS，不在 MP_TASK_SPECS。
+  **2026-11-11 生产实测：ST7 同时出现在 web 清单与 MP 清单**（两份原始 JSON 均带
+  `accept_status`/`locked`/`unlock_at`，MP 侧 jump_url 是 settings 桌面下载页）——
+  `isMPCode` 的前缀兼容分支**排除 TASK_SPECS 命中**，ST7 在两条链路里都只按 web
+  playbook 任务处理：MP 清单过滤直接无视它（不进「发现 N 个小程序任务」），daemon
+  doAccept/doClaim 分流归 web 组，执行走 tasks.buildEvent 的 playbook 双事件链。
   **小程序任务进任务快照/看板（0.3.0 起，生产实测 MP 清单 12 项含
   Sequential_Tasks_1）**：daemon.refreshSnapshots 在 web fetchTasks 之后用
   `fetchMPTasks`（MP_HEADERS）再拉一份 MP 清单，**只合并 web 清单里没有的 code**
@@ -614,9 +630,11 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
   腿跑一遍；只有 growth 腿时保持原 2b 行为。
   **次日锁（0.3.2 修订：2026-11-07 只读实测——上游清单本身就带锁字段，实测账号 B 的
   Sequential_Tasks_3 为 `"locked": true, "unlock_at": "2026-11-08T00:00:00+08:00"`、
-  实测账号的 Sequential_Tasks_2 为 `"locked": false`（not_accepted，当天已解锁））**：
-  - **主依据 = 任务自身字段**：fetchMPTasks 把 locked/unlock_at 原样归一进规范
-    Task（缺失归一 false/""）并随 cacheTask 落盘；snapTask 投影时任务带自身锁
+  实测账号的 Sequential_Tasks_2 为 `"locked": false`（not_accepted，当天已解锁）；
+  2026-11-11 再实测：**web 清单任务同样带锁字段**——Sequential_Tasks_7 为
+  `"locked": true, "unlock_at": "2026-11-12T00:00:00+08:00"`）**：
+  - **主依据 = 任务自身字段**：fetchMPTasks 与 fetchTasks 都把 locked/unlock_at
+    原样归一进规范 Task（缺失归一 false/""）并随 cacheTask 落盘；snapTask 投影时任务带自身锁
     信息（locked 是布尔或 unlockAt 非空）→ **以上游为准**，locked 仅在
     not_accepted 时为 true（accepted/claimed 绝不标锁），lockedUntil 由 unlock_at
     解析为北京日（Date.parse + 北京日，绝不 slice），解析失败回退 mp-locks 的
@@ -658,7 +676,9 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
   处理规则（engine/taskkind.resolveTaskKind，优先级从高到低）：
   1. TASK_SPECS 命中 → 沿用 spec（`Expert_lighthouse`/`WorkBuddy_Valorant` 的 jump_url
      只有 `workbuddy://expert`，不含 expertId —— 钉死常量仍是唯一来源，绝不被 jump_url 覆盖）；
-  2. MP_TASK_SPECS 命中或 `Sequential_Tasks_` 前缀 → 小程序链式任务（0.3.0 起进快照/
+  2. MP_TASK_SPECS 命中或 `Sequential_Tasks_` 前缀（**不在 TASK_SPECS**——
+     Sequential_Tasks_7 在 TASK_SPECS，是 web playbook 任务，绝不被本条吃掉，
+     2026-11-11 实测它同时出现在两份清单）→ 小程序链式任务（0.3.0 起进快照/
      看板）：`source:"mp"`、`kind:"mp"`，desktopOnly/unforgeable=false，接取/点亮结论
      按状态收敛；执行与领奖在 miniprogram 模块的小程序头族链路（见下）；
   3. 未命中但 `jump_url` 解出 `expertId=ex_…`（`expert_use_*` 一族：URL 编码的 deeplink
@@ -808,6 +828,12 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
   mp-locks 陈旧锁、Z 时区 unlock_at 按北京日取、accepted/claimed 不标锁、
   accept 失败落盘 + doClaim 即时锁下一环→刷新后被上游覆盖、snapTask 17 键含
   locked/lockedUntil/lockHint）、
+  isMPCode 的 TASK_SPECS 排除（Sequential_Tasks_7=false、Sequential_Tasks_99=true、
+  MP_TASK_SPECS 全 true；taskkind 对 ST7 仍 source:"spec"/kind:"playbook"）、
+  web 清单锁字段（fetchTasks 透传 locked/unlock_at，缺失归一 false/""）、
+  web 流水线锁定跳过（locked:true 不进 accept 批次、不 report、不 claim，
+  日志「⏳ …到第二天才能接取任务，跳过」，needsAccept 复查不再误报「仍有 N 个
+  未接取」；locked:false 解锁后照常接取/点亮/领奖）、
   旅行只由 travel 腿触发（legs=[growth] 零 travel/status、legs=[growth,travel]
   恰好一次）、mp 腿（单独 legs=[mp] 不发 web 接取；growth+mp 只执行一遍 MP）；
 - 沙箱卫生：测试 temp 沙箱一律走 `tests/helpers.mjs` 的 `makeSandbox()`（用完即删 + after/exit 兜底），跑完套件 temp 不残留 `wb-*` 沙箱（`tests/sandbox-hygiene.test.mjs` 钉死）。

@@ -277,10 +277,12 @@ test("fetchTasks：未收录/派生任务的 unforgeable+reason 落到规范 Tas
   assert.equal(wechat.unforgeable, true, "spec.unforgeable 语义沿用");
   assert.match(wechat.reason, /微信/);
 
-  // 规范 Task 的键集合不变（taskkind 只改 unforgeable/reason 的取值来源）
+  // 规范 Task 的键集合不变（taskkind 只改 unforgeable/reason 的取值来源；
+  // locked/unlockAt 是 2026-11-11 起的锁字段——web 清单也带，与 fetchMPTasks
+  // 同口径归一）
   assert.deepEqual(Object.keys(unknown).sort(), [
-    "acceptStatus", "code", "description", "jumpUrl", "progress",
-    "reason", "rewardCredit", "rewardEnergy", "taskType", "title", "unforgeable",
+    "acceptStatus", "code", "description", "jumpUrl", "locked", "progress",
+    "reason", "rewardCredit", "rewardEnergy", "taskType", "title", "unforgeable", "unlockAt",
   ]);
 });
 

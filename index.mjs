@@ -284,7 +284,7 @@ export const WorkBuddyTasksPlugin = async (input, options) => {
           args: {
             uids: optArr().describe("要跑的账号 uid 列表；不填 = 全部可参与账号"),
             legs: optArr().describe(
-              "任务腿：growth（成长）、mp（小程序链式任务，次日解锁）、streak（连登管家：补签/档位兑换/抽奖/礼包）、buddy（Buddy 盲盒，消耗成长能量）、travel（猫猫旅行）、night（夜猫子）；不填 = 设置里的默认。growth 与 mp 同时指定时小程序任务只由 mp 腿跑一遍",
+              "任务腿：growth（成长）、mp（小程序链式任务 Sequential_Tasks_1–6 + school_season，次日解锁；Sequential_Tasks_7=PC灵感功能是 web playbook 任务，走 growth 腿，不走小程序链路）、streak（连登管家：补签/档位兑换/抽奖/礼包）、buddy（Buddy 盲盒，消耗成长能量）、travel（猫猫旅行）、night（夜猫子）；不填 = 设置里的默认。growth 与 mp 同时指定时小程序任务只由 mp 腿跑一遍",
             ),
             claim: optBool().describe("完成后自动领奖，默认跟随设置"),
             codes: optArr().describe(

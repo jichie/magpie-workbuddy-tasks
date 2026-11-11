@@ -345,8 +345,9 @@ export const SNAP_VERSION = 2
 // 落盘用：规范 Task 的可序列化形状（只挑契约 §2 字段，raw/多余键不落盘）。
 // ?? 兜底保证 v2 条目「字段完备」——哪怕引擎违约给了缺字段的 Task，落盘后
 // 依然是可完整重投影的规范形状（v2 读取端因此可以信任条目）。
-// 次日锁（0.3.2）：locked/unlockAt 是**投影的输入字段**（上游清单自带，MP 任务
-// 专属；web 清单任务恒 false/""），随规范 Task 落盘 —— v2 重投影直接以上游为
+// 次日锁（0.3.2）：locked/unlockAt 是**投影的输入字段**（上游清单自带；MP 任务
+// 与 web 任务都可能带 —— 2026-11-11 实测 web 清单的 Sequential_Tasks_7 也带
+// locked:true + unlock_at），随规范 Task 落盘 —— v2 重投影直接以上游为
 // 准，不依赖 mp-locks 推断。lockedUntil/lockHint 是投影输出，不落盘。
 function cacheTask(t) {
   const p = t?.progress ?? {}
