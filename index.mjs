@@ -190,6 +190,42 @@ function fmtTasks(acct) {
 
 // ---- 插件函数 --------------------------------------------------------------
 
+// ---- 插件宿主 SDK（@opencode-ai/plugin）的加载守卫 ------------------------------
+//
+// SDK 由 magpie 的插件宿主提供；拿不到就跳过工具注册，生命周期照常工作。
+// **但这句 import 绝不能拖住插件加载**（2026-11-12 实测的真实故障）：本地文件夹安装
+// 时宿主并没有在磁盘上提供这个包（全盘 find 找不到 `@opencode-ai/plugin`），而 Bun
+// 对缺失的裸导入会**尝试联网自动安装** —— 走代理时能卡到 20s 以上，magpie 随即判
+// 「the plugin's load didn't finish in 20s」，整张插件卡报错。同一环境下也有解析得够快、
+// 只打一行「工具未注册」就继续的时候，所以表现为偶发。
+// 处理：给 import 套一层硬超时；超时就当「宿主没提供」，日志说清楚，照常往下走。
+// 抽成模块级 + 可注入 importer，是为了让 tests/sdk-import.test.mjs 能零网络地钉住
+// 「超时/失败都不阻塞、且后台那条 import 的失败不会变成 unhandledRejection」。
+export const SDK_IMPORT_TIMEOUT_MS = 6000
+
+export async function importPluginSdk({
+  timeoutMs = SDK_IMPORT_TIMEOUT_MS,
+  importer = () => import("@opencode-ai/plugin"),
+} = {}) {
+  let timer = null
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(
+      () => resolve({ ok: false, why: `加载 @opencode-ai/plugin 超过 ${timeoutMs}ms（宿主未提供 SDK），跳过工具注册` }),
+      timeoutMs,
+    )
+  })
+  // 超时后这条 import 仍在后台跑：catch 挂在它自己身上，绝不会变成 unhandled rejection
+  const load = Promise.resolve()
+    .then(importer)
+    .then((mod) => ({ ok: true, mod }))
+    .catch((e) => ({ ok: false, why: `加载 @opencode-ai/plugin 失败，工具未注册：${short(e)}` }))
+  try {
+    return await Promise.race([load, timeout])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 export const WorkBuddyTasksPlugin = async (input, options) => {
   const cfgDir = input?.directory || input?.worktree || resolveCfgDir(process.env) || null
   const dir = hereDir()
@@ -239,11 +275,13 @@ export const WorkBuddyTasksPlugin = async (input, options) => {
   })
 
   // ---- tool 钩子（契约 §6） ----
-  // SDK（@opencode-ai/plugin）由 magpie 的插件宿主提供；拿不到时跳过工具注册，
-  // 生命周期照常工作（入口被调用时 ensureDaemon 已经跑过），不让整个插件加载失败。
+  // SDK 由宿主提供；importPluginSdk 自带硬超时（见模块顶部说明），拿不到就只少工具，
+  // 绝不影响插件加载与看板。
   let toolHook = undefined
   try {
-    const sdk = await import("@opencode-ai/plugin")
+    const sdkRes = await importPluginSdk()
+    if (!sdkRes.ok) log(sdkRes.why)
+    const sdk = sdkRes.mod
     const tool = sdk?.tool
     const schema = tool?.schema
     if (typeof tool === "function" && schema) {
@@ -435,7 +473,9 @@ export const WorkBuddyTasksPlugin = async (input, options) => {
       log("未找到 @opencode-ai/plugin 的 tool 导出，工具未注册（守护进程生命周期不受影响）")
     }
   } catch (e) {
-    log(`加载 @opencode-ai/plugin 失败，工具未注册：${short(e)}`)
+    // 走到这里 = SDK 拿到了但注册工具时出错（拿不到 SDK 已在 importPluginSdk 里记过日志，
+    // 不再重复报同一句）。注册失败不影响生命周期与看板，只少工具。
+    log(`注册工具失败（不影响插件加载与看板）：${short(e)}`)
   }
 
   // 本插件只声明 tool 钩子（契约 §5：不声明 provider，避免 magpie 在供应商卡里
