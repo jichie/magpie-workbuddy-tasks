@@ -9,7 +9,7 @@
 2. **凭据不外泄**：access/refresh token 永不出现在任何 HTTP 响应、页面、日志里（只显示 `uid`、昵称、掩码）。
 3. **单一凭据血统**：刷新 token 后必须原子回写 `plugin-auth.json`，保证社区插件与我们用的是同一对 token，避免 refresh 轮换把对方踢下线。
 4. **限速不可省**：任何两次上游调用之间最少 1.0 s；账号之间 1.5 s（手动）/ 2–5 s 抖动（排程）。这是风控红线，不并行跑成长任务。**全局节流器的唯一归属与并发策略**：daemon 进程创建唯一的 `engine/upstream.makeSpacer` 实例（gap 动态取 `settings.gapMs`），经 `engineOpts()` 与 runner ctx 注入**所有**打上游的路径——job 腿、token 临期刷新（`refreshAccount`）、快照刷新（`finalizeJob → refreshSnapshots` 与 `GET /api/state?refresh=`）、手动操作（claim/accept/checkin）；任何路径都不得新建 ctx 后绕开它直接打上游。spacer 记录「上次上游调用真正发出的时刻」，调用前先补足到 ≥gap（跨路径对齐，start-to-start 口径），并把并发入口**排队串行**（前一个调用完整结束后才放行下一个，绝不允许两个调用同时在途）。固定 sleep（腿间 gap、账号间隔、manualOp 的 1 s）保留作为节奏设计，但跨路径的正确性由 spacer 保证——各路径的等待窗重叠时后者等待，而不是贴着发。同一逻辑调用内的重试退避与主机回退同样算「两次上游调用」，间隔同样 ≥1.0 s。
-5. **纯 ESM、零运行时依赖**：只用 Bun/Node 内置（`node:fs`、`node:crypto`、`node:http`、`zlib`）。插件宿主里没有构建步骤。
+5. **纯 ESM、无构建步骤**：业务引擎仍只用 Bun/Node 内置；账户代理传输是唯一依赖例外，使用 `package.json` 声明并锁定的 `node-fetch`、`http-proxy-agent`、`https-proxy-agent`、`socks-proxy-agent`。代理传输按需加载，不允许手工 vendor 或依赖安装目录内的补丁；正常包管理升级必须携带这些依赖。此例外不接管 Auth 或对话链路。
 6. `index.mjs` **只导出一个函数**（magpie 会把入口文件里每个导出函数当插件跑）。辅助导出必须挂在 `export const _internal = {...}` 上。
 
 ## 1. 目录结构

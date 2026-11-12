@@ -38,7 +38,7 @@ magpie plugin add github:<owner>/<repo>
 
 > **首次 add 可能提示 `the plugin's load didn't finish in 20s` —— 冷启动一次性开销，不是插件坏了。**
 > magpie 的插件宿主给每个插件 **20 s** 的加载时限（宿主代码 `loadWait = 20 * 1000`），而首次加载时
-> Bun 运行时要**现场从 npm 源拉取 `@opencode-ai/plugin`**（注册工具必须用它，插件自身零依赖也要走这一步）。
+> Bun 运行时要**现场从 npm 源拉取 `@opencode-ai/plugin`**（注册工具必须用它）；账户代理功能的运行时依赖由包管理器按本项目 `package.json` 安装，不需要手动复制或修改 `node_modules`。离线交付时须一并携带已安装的依赖。
 > 在群晖 Docker（x86_64，magpie v0.1.1876）实测：冷缓存首次解析 **45.5 s**，热缓存 **23 ms**；
 > 本插件自身的 `import index.mjs` 仅 12 ms、工厂函数仅 4 ms（守护进程已在跑的复用路径），都不是瓶颈。
 > 第一次 add 超时后，Bun 的拉取仍在后台完成并写入缓存，**再 add 一次（或在插件管理里停用→启用一次）即可
