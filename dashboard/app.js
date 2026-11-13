@@ -806,12 +806,13 @@ async function claimOne(uid, code, btn) {
 }
 
 // ---- 任务级勾选（只收窄批量操作，不影响单任务「接取 / 领奖」按钮） -----------------
-// state.taskSel = { [uid]: Set(code) }：按账号保存勾选的任务码，只存在内存里。
-// · 跨 renderAll()/快照刷新保留；某账号的集合清空时删掉该键（不勾选 = 全部任务）。
+// state.taskSel = { [uid]: Set(code) }：按账号保存勾选的任务码，只存在内存里（UI 仍按账号勾选）。
+// · 跨 renderAll()/快照刷新保留；某账号的集合清空时删掉该键。
 // · 无 code 的行不可勾选（无从提交）；locked === true 的行（小程序链式任务次日解锁）
 //   同样不可勾选，且不计入「全选 / 已选 N 项」。
 // · 勾选不影响 buddy / travel / night 腿（它们没有任务码）；小程序链式任务随 growth 腿内嵌执行。
-// · 批量请求只把「有勾选」的 uid 放进 body.codes，未出现的账号 = 全部任务。
+// · 2026-11-14 起：勾选 = 本轮 job 的【全局任务范围】—— 只要任一账号有勾选，就把所有账号勾选的
+//   并集下发给每个目标账号（见 pickedUnion）；完全无勾选才回落到「未勾选 = 全部任务」。
 
 function pickedSet(uid) {
   return state.taskSel[uid] ?? null;
@@ -846,18 +847,18 @@ function campaignPickCodes(a) {
   return out;
 }
 
-// 该账号勾选的任务码（供 /api/run 的 body.codes 用）；没有勾选 → null。
-// 只返回「当前仍可勾选」的项：锁定 / 已从快照消失的 code 一律不提交，避免把次日才
-// 解锁的任务塞进批量接取。没有快照时无从比对，保留原集合（维持老行为）。
-function pickedCodes(uid) {
-  const set = pickedSet(uid);
-  if (!set || !set.size) return null;
-  const a = accountByUid(uid);
-  const tasks = Array.isArray(a?.snapshot?.tasks) ? a.snapshot.tasks : null;
-  if (!tasks) return [...set];
-  const avail = new Set(selectableCodes(a));
-  const codes = [...set].filter((c) => avail.has(c));
-  return codes.length ? codes : null;
+// 勾选的全局并集（跨所有账号）—— 「勾选 = 本轮 job 的全局任务范围」的唯一来源：
+// 批量做任务 / 批量接任务 / 只领奖 三个入口都从这里取范围，别再各写一套（用户 2026-11-14）。
+// 语义（用户明确确认，勿当 bug）：账号 A 勾 A、账号 B 勾 B → 两个目标账号都做 A+B（并集）；
+// 无任何勾选 → 空集，各入口回落到「未勾选 = 全部任务」的老口径。
+function pickedUnion() {
+  const out = new Set();
+  const all = state.taskSel ?? {};
+  for (const uid of Object.keys(all)) {
+    const set = all[uid];
+    if (set && set.size) for (const c of set) out.add(String(c));
+  }
+  return out;
 }
 
 // 快照刷新后把已选集合里「已锁定」的任务码剔除（只剔这些，不动用户其它勾选）。
@@ -890,13 +891,6 @@ function pickedVisibleCount(uid) {
   if (!avail.length) return set.size;
   let n = 0;
   for (const c of avail) if (set.has(c)) n++;
-  return n;
-}
-
-function totalPickedCount() {
-  let n = 0;
-  // 只统计真正会进入批量操作的可参与账号（与 targetAccounts 同口径）
-  for (const a of eligibleAccounts()) n += pickedVisibleCount(a.uid);
   return n;
 }
 
@@ -953,27 +947,27 @@ function updateTaskSelUI(uid) {
   updateTaskSelNote();
 }
 
-// 批量条上的全局提示：有任何任务级勾选时显示「已选 N 项任务」
+// 批量条上的全局提示：有任何任务级勾选时显示
+// 「已选 N 项任务 · 本轮所有目标账号只做这些」。N = 勾选并集（跨账号去重），
+// 与真正下发给每个目标账号的 codes 一致；勾选生效时绝不静默。
 function updateTaskSelNote() {
   const box = $("#taskSelSummary");
   if (!box) return;
-  const n = totalPickedCount();
-  box.textContent = n ? `已选 ${n} 项任务` : "";
+  const n = pickedUnion().size;
+  box.textContent = n ? `已选 ${n} 项任务 · 本轮所有目标账号只做这些` : "";
   box.hidden = n === 0;
 }
 
-// 批量请求的 codes 形状：{ [uid]: string[] }；只收目标账号里有勾选的那些
+// 批量请求的 codes 形状：{ [uid]: string[] }（后端形状不变，仍是按 uid 的对象）。
+// 2026-11-14 语义：勾选 = 全局范围 —— 任一账号有勾选 → 每个目标账号都带同一份并集；
+// 完全无勾选 → {}（不提交 codes，保持「未勾选 = 全部任务」的老口径）。
 function selectionBody(accounts) {
+  const union = pickedUnion();
+  if (!union.size) return {};
+  const codes = [...union];
   const out = {};
-  for (const a of accounts) {
-    const codes = pickedCodes(a.uid);
-    if (codes) out[a.uid] = codes;
-  }
+  for (const a of accounts) out[a.uid] = codes.slice();
   return out;
-}
-
-function selectionCount(codes) {
-  return Object.values(codes).reduce((n, arr) => n + (Array.isArray(arr) ? arr.length : 0), 0);
 }
 
 // 表格上方的短提示条：全选 + 说明 + 已选计数（窄屏 thead 被隐藏时也能全选）
@@ -992,7 +986,7 @@ function taskSelBar(uid) {
       }),
       el("span", { text: "全选" }),
     ),
-    el("span", { class: "task-sel-hint", text: "勾选后批量操作只作用于选中任务；不勾选 = 全部" }),
+    el("span", { class: "task-sel-hint", text: "勾选 = 本轮所有目标账号只做选中任务（取并集）；不勾选 = 全部" }),
     el("span", { class: "task-sel-count", text: "已选 0 项" }),
   );
 }
@@ -1627,17 +1621,42 @@ function accountBadge(a) {
   };
 }
 
-// 快照计数（与 taskSummary 同源）：账号行展示「已领奖 / 总数」与「待接取 · 待领奖」两行
-function snapCounts(snap) {
-  const tasks = snap && Array.isArray(snap.tasks) ? snap.tasks : null;
-  if (!tasks) return null;
-  const count = (st) => tasks.filter((t) => t.acceptStatus === st).length;
+// 账号任务总量【统一口径】（成长 + 小程序 + 活动）—— 账号行进度条 / 账号行「待接取 · 待领奖」/
+// 任务明细汇总 三处共用同一份统计，杜绝「进度条满了但明细里还有未完成」这类自相矛盾
+// （用户 2026-11-14：进度条 26/26 而明细 32 项）。字段与消费者（谁用哪些）：
+//   · hasSnap              —— 无快照时各消费方显示「无快照」而不是 0（不再各写一套判空）；
+//   · total / claimed      —— 账号行进度条（`已领奖 claimed / total` + 百分比）；
+//   · total / pending      —— 账号行「待领奖」、明细折叠标题「N 项 · 待领奖 y」；
+//   · notAccepted/accepted —— 账号行「待接取」、明细汇总；
+//   · canAccept/snapModern —— 明细里「可接取」一项（活动任务无「接取」概念，只算成长/小程序）；
+//   · desktopOnly/unforgeable —— 明细里后端判断字段的计数。
+// 口径：total = 成长 + 小程序 + 活动；claimed 含活动里 claimedAt 非空的项；
+//   pending = 成长/小程序 completed + 活动里 completedAt 非空且 claimedAt 空（campaignTaskClaimable）的项。
+function taskTotals(a) {
+  const hasSnap = Array.isArray(a?.snapshot?.tasks);
+  const tasks = hasSnap ? a.snapshot.tasks : [];
+  const flags = tasks.map(taskFlags);
+  const count = (st) => tasks.filter((t) => String(t?.acceptStatus ?? "") === st).length;
+  let campTotal = 0;
+  let campPending = 0;
+  let campClaimed = 0;
+  for (const act of campaignActivities(campaignOf(a))) {
+    const ts = Array.isArray(act?.tasks) ? act.tasks : [];
+    campTotal += ts.length;
+    campPending += ts.filter(campaignTaskClaimable).length;
+    campClaimed += ts.filter(campaignTaskClaimed).length;
+  }
   return {
-    total: tasks.length,
+    hasSnap,
+    total: tasks.length + campTotal,
     notAccepted: count("not_accepted"),
     accepted: count("accepted"),
-    pending: count("completed"),
-    claimed: count("claimed"),
+    pending: count("completed") + campPending,
+    claimed: count("claimed") + campClaimed,
+    canAccept: flags.filter((f) => f.canAccept).length,
+    desktopOnly: flags.filter((f) => f.desktopOnly).length,
+    unforgeable: flags.filter((f) => f.unforgeable).length,
+    snapModern: flags.some((f) => f.modern),
   };
 }
 
@@ -1651,53 +1670,26 @@ function metric(value, label) {
   );
 }
 
-// 任务明细三组（成长/小程序/活动）的合并计数（用户 2026-11-13 追加口径）：
-//   total     = 成长 + 小程序 + 活动 三项之和（活动任务来自 accounts[].campaign 投影）；
-//   canAccept = 成长/小程序里 canAccept 的项数（活动任务没有「接取」概念，不计入）；
-//   pending   = 成长/小程序里 completed 的项数 + 活动任务里 completedAt 非空且 claimedAt 空 的项数；
-//   snapModern = 快照带判断字段才展示「可接取」那一项（老后端没有 canAccept 时不硬编造）。
-// 快照为空时只按活动算（campaign 存在也能出数字）。
-function detailTotals(a) {
-  const tasks = Array.isArray(a?.snapshot?.tasks) ? a.snapshot.tasks : [];
-  const flags = tasks.map(taskFlags);
-  let campTotal = 0;
-  let campPending = 0;
-  for (const act of campaignActivities(campaignOf(a))) {
-    const ts = Array.isArray(act?.tasks) ? act.tasks : [];
-    campTotal += ts.length;
-    campPending += ts.filter(campaignTaskClaimable).length;
-  }
-  return {
-    total: tasks.length + campTotal,
-    canAccept: flags.filter((f) => f.canAccept).length,
-    pending: tasks.filter((t) => String(t?.acceptStatus ?? "") === "completed").length + campPending,
-    snapModern: flags.some((f) => f.modern),
-  };
-}
-
+// 任务明细三组的合并计数统一走 taskTotals(a)（同上），此处只负责渲染。
 function snapMetrics(a) {
-  const snap = a?.snapshot;
-  const c = snapCounts(snap);
-  if (!c) {
+  const t = taskTotals(a);
+  if (!t.hasSnap) {
     return el("span", {
       class: "acct-metrics-empty",
       text: "无快照：点「刷新快照」读取（只读，不接取、不上报）",
     });
   }
-  const t = detailTotals(a);
   const cells = [
     metric(t.total, "任务总量"), // 三组之和（成长 + 小程序 + 活动）
-    metric(c.notAccepted, "未接取"),
-    metric(c.accepted, "已接取"),
+    metric(t.notAccepted, "未接取"),
+    metric(t.accepted, "已接取"),
     metric(t.pending, "待领奖"), // 成长/小程序 completed + 活动可领
-    metric(c.claimed, "已领奖"),
+    metric(t.claimed, "已领奖"), // 成长/小程序 claimed + 活动已领
   ];
-  const flags = (snap.tasks ?? []).map(taskFlags);
-  if (flags.some((f) => f.modern)) {
-    const n = (pred) => flags.filter(pred).length;
+  if (t.snapModern) {
     cells.push(
-      metric(n((f) => f.desktopOnly), "桌面端"),
-      metric(n((f) => f.unforgeable), "无法自动化"),
+      metric(t.desktopOnly, "桌面端"),
+      metric(t.unforgeable, "无法自动化"),
       metric(t.canAccept, "可接取"), // 成长/小程序 canAccept（活动无「接取」概念）
     );
   }
@@ -1706,12 +1698,10 @@ function snapMetrics(a) {
 
 // 折叠标题只留一行紧凑文字（完整汇总在 title）：任务明细 · N 项 · 可接取 x · 待领奖 y。
 // N / 待领奖按三组之和（成长 + 小程序 + 活动），可接取只算成长/小程序（活动任务没有「接取」
-// 概念）。仅当快照带判断字段时才展示「可接取」这一项（老后端不硬编造）。
+// 概念）。仅当快照带判断字段时才展示「可接取」这一项（老后端不硬编造）。数字全部来自 taskTotals。
 function snapBrief(a) {
-  const snap = a?.snapshot;
-  const c = snapCounts(snap);
-  if (!c) return "任务明细 · 无快照";
-  const t = detailTotals(a);
+  const t = taskTotals(a);
+  if (!t.hasSnap) return "任务明细 · 无快照";
   const parts = ["任务明细", `${t.total} 项`];
   if (t.snapModern) parts.push(`可接取 ${t.canAccept}`);
   parts.push(`待领奖 ${t.pending}`);
@@ -1757,8 +1747,9 @@ function accountRow(a) {
     ),
   );
 
-  const c = snapCounts(a.snapshot);
-  const claimedPct = c && c.total > 0 ? Math.round((c.claimed / c.total) * 100) : 0;
+  // 账号行进度与「待接取 · 待领奖」一律走 taskTotals（与任务明细同一口径，含活动任务）
+  const t = taskTotals(a);
+  const claimedPct = t.total > 0 ? Math.round((t.claimed / t.total) * 100) : 0;
   const progressCell = el(
     "div",
     {
@@ -1766,17 +1757,17 @@ function accountRow(a) {
       dataset: { label: "任务" },
       title: isApiKey ? "API key 账号不参与任务，没有任务快照" : taskSummary(a.snapshot),
     },
-    el("span", { class: "acct-prog-main", text: c ? `已领奖 ${c.claimed} / ${c.total}` : "无快照" }),
-    c
+    el("span", { class: "acct-prog-main", text: t.hasSnap ? `已领奖 ${t.claimed} / ${t.total}` : "无快照" }),
+    t.hasSnap
       ? svgEl(
           "svg",
           {
             class: "acct-bar",
             role: "progressbar",
             "aria-valuemin": "0",
-            "aria-valuemax": String(c.total),
-            "aria-valuenow": String(c.claimed),
-            "aria-label": `已领奖 ${c.claimed} / ${c.total}`,
+            "aria-valuemax": String(t.total),
+            "aria-valuenow": String(t.claimed),
+            "aria-label": `已领奖 ${t.claimed} / ${t.total}`,
             width: "100%",
             height: "4",
             "shape-rendering": "crispEdges",
@@ -1804,8 +1795,8 @@ function accountRow(a) {
       : null,
     el("span", {
       class: "acct-prog-sub",
-      text: c
-        ? `待接取 ${c.notAccepted} · 待领奖 ${c.pending}`
+      text: t.hasSnap
+        ? `待接取 ${t.notAccepted} · 待领奖 ${t.pending}`
         : isApiKey
           ? "不参与任务"
           : "刷新快照后可查看",
@@ -3592,15 +3583,15 @@ function renderAcceptNote() {
   let locked = 0;
   let noSnap = 0;
   let modern = false;
+  // 勾选 = 全局范围：说明文字按「全账号勾选并集」算，与实际会提交的范围保持一致
+  const union = pickedUnion();
   for (const a of targetAccounts()) {
     const all = a.snapshot?.tasks;
     if (!Array.isArray(all)) {
       noSnap++;
       continue;
     }
-    // 只看当前勾选（没勾选 = 全部）——说明文字与实际会提交的范围保持一致
-    const set = pickedSet(a.uid);
-    const tasks = set && set.size ? all.filter((t) => set.has(String(t?.code ?? ""))) : all;
+    const tasks = union.size ? all.filter((t) => union.has(String(t?.code ?? ""))) : all;
     if (tasks.some((t) => taskFlags(t).modern)) modern = true;
     const plan = acceptPlan(tasks);
     blocked += plan.blocked;
@@ -3647,8 +3638,9 @@ function updateSelectionUI() {
   $("#btnRun").textContent = jobRunning ? "任务运行中…" : "批量做任务";
   if (noElig && !offline) {
     $("#btnRun").title = "没有可参与任务的账号";
-  } else if (totalPickedCount() > 0) {
-    $("#btnRun").title = "完整流水线：接取 → 点亮（上报进度）→ 领奖；只做各账号勾选的任务（旅行/夜猫子/Buddy 腿不受影响）";
+  } else if (pickedUnion().size > 0) {
+    $("#btnRun").title =
+      "完整流水线：接取 → 点亮（上报进度）→ 领奖；仅做勾选并集里的任务，对本轮所有目标账号生效（旅行/夜猫子/Buddy 腿不受影响）";
   } else {
     $("#btnRun").title = "完整流水线：接取 → 点亮（上报进度）→ 领奖";
   }
@@ -3953,17 +3945,18 @@ async function runFull() {
   }
   await withBusy(async () => {
     const uids = [...state.selected];
-    // 任务级勾选按 uid 提交：只有「该账号有勾选」的 uid 进 codes，未出现的账号 = 全部任务。
+    // 任务级勾选 = 全局范围（2026-11-14）：任一账号有勾选 → 每个目标账号都带同一份并集
+    // （selectionBody 取并集下发到每个 uid）；完全无勾选才不带 codes = 全部任务。
     // buddy / travel / night 腿没有任务码，后端会忽略 codes，不受勾选影响；
     // 小程序链式任务由 growth 腿内嵌执行（2b），不作为独立腿提交。
     const codes = selectionBody(targetAccounts());
-    const picked = selectionCount(codes);
+    const picked = pickedUnion().size;
     const body = { legs, claim: $("#claimToggle").checked };
     if (uids.length) body.uids = uids;
     if (picked) body.codes = codes;
     setBatchStatus(
       `正在启动批量任务：${legs.map(legName).join(" + ")}，${uids.length ? `${uids.length} 个账号` : "全部可参与账号"}，` +
-        `${picked ? `仅选中任务（${picked} 项），` : ""}${body.claim ? "自动领奖" : "手动领奖（做完不领，之后可「只领奖」）"}…`,
+        `${picked ? `仅选中任务（${picked} 项 · 本轮所有目标账号只做这些），` : ""}${body.claim ? "自动领奖" : "手动领奖（做完不领，之后可「只领奖」）"}…`,
     );
     try {
       const r = await api("api/run", { method: "POST", body });
@@ -4005,6 +3998,11 @@ async function acceptSelected() {
     const pickedEmpty = [];
     const notes = [];
     let usedPicked = false;
+    // 勾选 = 全局范围（2026-11-14）：范围取自「全账号勾选并集」，对本轮每个目标账号生效。
+    // 无勾选 → 空集 = 接该账号全部（老口径）。活动码不在 acceptPlan.codes 里，天然被过滤。
+    const union0 = pickedUnion();
+    const hadPick = union0.size > 0;
+    if (hadPick) usedPicked = true;
     for (let i = 0; i < targets.length; i++) {
       const a0 = targets[i];
       setBatchStatus(`批量接取（${i + 1}/${targets.length}）：${a0.nickname || a0.uid} …`);
@@ -4020,14 +4018,9 @@ async function acceptSelected() {
         continue;
       }
       let plan = acceptPlan(a.snapshot?.tasks);
-      // 任务级勾选：只提交与 acceptPlan.codes 的交集；勾选项全被过滤掉时明确说明，
-      // 绝不静默退回「接该账号全部」（未勾选的账号不受影响 = 全部）。
-      // 这里直接用内存里的原始勾选集合：pickedCodes 会剔除锁定项，若勾选恰好只剩锁定项，
-      // 它返回 null 会被误判成「没有勾选」→ 反而接全部。
-      const sel = pickedSet(a.uid);
-      const hadPick = !!sel && sel.size > 0;
-      if (hadPick) usedPicked = true;
-      let codes = hadPick ? plan.codes.filter((c) => sel.has(c)) : plan.codes;
+      // 只提交本账号可接项与「全账号勾选并集」的交集；勾选项全被过滤掉时明确说明，
+      // 绝不静默退回「接该账号全部」（无勾选才是全部）。
+      let codes = hadPick ? plan.codes.filter((c) => union0.has(c)) : plan.codes;
       let refreshed = false;
       // 有勾选但按当前快照筛不出可接项：本地快照可能停在旧状态（上游已接取、快照仍显示
       // 未接）。强制刷新一次最新快照再判断；已有可接项 / 本来就没有待接项时不做无谓刷新。
@@ -4050,9 +4043,9 @@ async function acceptSelected() {
         a = fresh;
         refreshed = true;
         plan = acceptPlan(a.snapshot?.tasks);
-        // 刷新后重新读勾选（renderAll 可能把锁定项剔除）；勾选没了 = 无待接项，不退回全部
-        const sel2 = pickedSet(a.uid);
-        codes = sel2 && sel2.size ? plan.codes.filter((c) => sel2.has(c)) : [];
+        // 刷新后重读并集（renderAll 可能把锁定项剔除）；并集空了 = 无待接项，不退回全部
+        const union2 = pickedUnion();
+        codes = union2.size ? plan.codes.filter((c) => union2.has(c)) : [];
       }
       // 规则 4：不可自动接取的项要说出来，不能静默少接
       if (plan.blocked) {
@@ -4089,7 +4082,7 @@ async function acceptSelected() {
       }
     }
     const parts = [
-      `批量接取完成${usedPicked ? "（仅选中任务）" : ""}：新接 ${accepted} · 已接过 ${already} · 失败 ${failed}`,
+      `批量接取完成${usedPicked ? "（仅选中任务 · 本轮所有目标账号只做这些）" : ""}：新接 ${accepted} · 已接过 ${already} · 失败 ${failed}`,
     ];
     if (blockedNotes.length) parts.push(`不可自动接取：${blockedNotes.join("、")}`);
     if (pickedEmpty.length) parts.push(`按勾选跳过：${pickedEmpty.join("、")}`);
@@ -4112,6 +4105,11 @@ async function claimSelected() {
     const noCode = [];
     const pickedEmpty = [];
     let usedPicked = false;
+    // 勾选 = 全局范围（2026-11-14）：范围取自「全账号勾选并集」，对本轮每个目标账号生效。
+    // 无勾选 → null = 领该账号全部可领项（老口径）。活动码不在快照 tasks 里，天然被过滤。
+    const union0 = pickedUnion();
+    const hadPick = union0.size > 0;
+    if (hadPick) usedPicked = true;
     for (let i = 0; i < targets.length; i++) {
       const a0 = targets[i];
       setBatchStatus(`只领奖（${i + 1}/${targets.length}）：${a0.nickname || a0.uid} …`);
@@ -4126,13 +4124,9 @@ async function claimSelected() {
         failNotes.push(`${a0.nickname || a0.uid}：快照刷新失败`);
         continue;
       }
-      // 任务级勾选：pending 任务按勾选过滤；有勾选但无匹配待领奖时明确说明。
-      // 领奖不受 locked 限制，勾选范围直接用内存里的原始集合（pickedCodes 会剔除锁定项，
-      // 若勾选恰好只剩锁定项会返回 null → 被误判成「没有勾选」→ 反而领全部）。
-      const sel = pickedSet(a.uid);
-      const hadPick = !!sel && sel.size > 0;
-      if (hadPick) usedPicked = true;
-      let pick = hadPick ? new Set(sel) : null;
+      // pending 任务按「全账号勾选并集」过滤；有勾选但无匹配待领奖时明确说明。
+      // 领奖不受 locked 限制，直接用内存里的原始并集（不剔除锁定项）。
+      let pick = hadPick ? union0 : null;
       // 与单行「领奖」按钮同一口径：completed，或进度已达标（current >= target > 0）
       let pending = (a.snapshot?.tasks ?? []).filter((t) => claimableTask(t));
       let scoped = pick ? pending.filter((t) => pick.has(String(t?.code ?? ""))) : pending;
@@ -4156,9 +4150,9 @@ async function claimSelected() {
           continue;
         }
         a = fresh;
-        // 刷新后重新读勾选（renderAll 可能把锁定项剔除）；勾选没了 = 无可领项，不退回全部
-        const sel2 = pickedSet(a.uid);
-        pick = sel2 && sel2.size ? new Set(sel2) : null;
+        // 刷新后重读并集（renderAll 可能把锁定项剔除）；并集空了 = 无可领项，不退回全部
+        const union2 = pickedUnion();
+        pick = union2.size ? union2 : null;
         pending = (a.snapshot?.tasks ?? []).filter((t) => claimableTask(t));
         scoped = pick ? pending.filter((t) => pick.has(String(t?.code ?? ""))) : [];
         if (!scoped.length) {
@@ -4189,7 +4183,7 @@ async function claimSelected() {
       }
     }
     const parts = [
-      `领奖完成${usedPicked ? "（仅选中任务）" : ""}：成功 ${okCount} 项，+${fmtNum(credit)} 积分，+${fmtNum(energy)} 能量`,
+      `领奖完成${usedPicked ? "（仅选中任务 · 本轮所有目标账号只做这些）" : ""}：成功 ${okCount} 项，+${fmtNum(credit)} 积分，+${fmtNum(energy)} 能量`,
     ];
     if (viaWeb) parts.push(`其中 ${viaWeb} 项已走网页通道（桌面端领奖被拒，网页兜底成功）`);
     if (pickedEmpty.length) parts.push(`按勾选跳过：${pickedEmpty.join("、")}`);
