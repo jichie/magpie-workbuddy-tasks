@@ -3897,6 +3897,9 @@ function setBatchStatus(text) {
 // ["growth","streak","travel"]（连登管家是幂等纯收益，默认做）—— 老后端不给 legs 时
 // 前端兜底同一份默认；用户存过 legs 的实例由服务端值决定，不受这里影响。
 const DEFAULT_LEGS = ["growth", "streak", "travel"];
+// 「积分任务」胶囊（value="points"）= 一次控制 growth + mp + campaign 三条腿：
+// 界面上是一个胶囊，settings.legs 里仍写真实腿名，/api/run 的 legs 也仍是三个名字。
+const POINTS_LEGS = ["growth", "mp", "campaign"];
 let syncedLegsKey = null; // 最近一次从 settings.legs 同步到顶部的值（排序后拼接）
 
 function legsFromSettings(v) {
@@ -3911,11 +3914,22 @@ function syncLegChecks(legs, { force = false } = {}) {
   const key = [...list].sort().join(",");
   if (!force && key === syncedLegsKey) return;
   syncedLegsKey = key;
-  for (const cb of $$(".leg-check")) setChecked(cb, list.includes(cb.value));
+  for (const cb of $$(".leg-check")) {
+    // 「积分任务」= growth / mp / campaign 任一条存在即显示为已勾选
+    // （老设置里只存了 growth 的实例也要显示勾上，不能显示成没选）。
+    const on = cb.value === "points" ? POINTS_LEGS.some((l) => list.includes(l)) : list.includes(cb.value);
+    setChecked(cb, on);
+  }
 }
 
 function selectedLegs() {
-  return $$(".leg-check:checked").map((i) => i.value);
+  // 「积分任务」胶囊展开成 growth + mp + campaign 三条真实腿（唯一来源，不再另设隐藏 input）。
+  const out = [];
+  for (const i of $$(".leg-check:checked")) {
+    if (i.value === "points") out.push(...POINTS_LEGS);
+    else out.push(i.value);
+  }
+  return out;
 }
 
 function withBusy(fn) {
@@ -3934,7 +3948,7 @@ function withBusy(fn) {
 async function runFull() {
   const legs = selectedLegs();
   if (!legs.length) {
-    toast("请至少勾选一条任务腿（成长任务 / 连登管家 / Buddy 盲盒 / 猫猫旅行 / 夜猫子）。", "warn");
+    toast("请至少勾选一条任务腿（积分任务 / 连登管家 / Buddy 盲盒 / 猫猫旅行 / 夜猫子）。", "warn");
     return;
   }
   await withBusy(async () => {
@@ -4896,7 +4910,7 @@ async function saveDefaults() {
   // 顶部 .leg-check 是唯一选择源：「保存默认」保存的就是此刻顶部的勾选。
   const legs = selectedLegs();
   if (!legs.length) {
-    toast("请至少勾选一条任务腿（成长任务 / 连登管家 / Buddy 盲盒 / 猫猫旅行 / 夜猫子）。", "warn");
+    toast("请至少勾选一条任务腿（积分任务 / 连登管家 / Buddy 盲盒 / 猫猫旅行 / 夜猫子）。", "warn");
     return;
   }
   const gapMs = Number($("#gapMs").value);

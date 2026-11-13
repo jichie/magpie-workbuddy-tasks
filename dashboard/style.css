@@ -2258,6 +2258,10 @@ details[open] > .heat-summary::before { transform: rotate(45deg); margin-top: 0;
       "pick toggle toggle";
   }
   .acct-side { align-self: start; }
+  /* 成长任务 / 活动任务合并成「积分任务」后批量条更窄：420px 下五个胶囊收紧间距与内边距，
+     仍压在同一行（不换行、无横向溢出）。 */
+  .segments { gap: 5px; }
+  .segment span { padding: 4px 6px; }
 }
 
 /* 积分明细：窄屏下权益包表格保持横向滚动，不跟随通用 .tbl 的卡片化 */

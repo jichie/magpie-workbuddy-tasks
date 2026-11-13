@@ -173,8 +173,7 @@
         <!-- 任务腿勾选是唯一选择源：初始勾选由 app.js 按 settings.legs 回写，HTML 里不写死 checked。 -->
         <fieldset class="segments" id="legsBox">
           <legend class="sr-only">任务腿</legend>
-          <label class="segment" title="成长任务（含微信小程序链式任务 Sequential_Tasks_1–6；小程序任务随成长任务一起跑）"><input type="checkbox" class="leg-check" value="growth"><span>成长任务</span></label>
-          <label class="segment" title="活动任务：运营活动专用链路（星巴克协作 / 记者节福利等）。与成长任务解耦 —— 独立跑、独立记账，成长清单为空/失败时活动照跑"><input type="checkbox" class="leg-check" value="campaign"><span>活动任务</span></label>
+          <label class="segment" title="积分任务 = 成长任务 + 小程序链式任务 + 活动任务（一次跑完这三类；小程序任务次日解锁、活动任务独立记账）"><input type="checkbox" class="leg-check" value="points"><span>积分任务</span></label>
           <label class="segment" title="连登管家：补签昨日 → 领新手礼包/活动补偿 → 兑换可用连登档位 → 抽奖（幂等、纯收益，已领的静默跳过）"><input type="checkbox" class="leg-check" value="streak"><span>连登管家</span></label>
           <label class="segment" title="Buddy 盲盒：消耗成长能量开盲盒（不是领奖）；无能量时后端会跳过"><input type="checkbox" class="leg-check" value="buddy"><span>Buddy 盲盒</span></label>
           <label class="segment"><input type="checkbox" class="leg-check" value="travel"><span>猫猫旅行</span></label>
