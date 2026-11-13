@@ -637,7 +637,7 @@ export async function runCampaignTasks(acct, opts = {}) {
   if (sel.empty) {
     // 勾选清单里一条活动任务都没有（全是成长/小程序 code 或未知 code）：
     // 本腿无事可做，零上游（一次 /portal/activity/* 都不读）。
-    emit("🎪 勾选的任务里没有运营活动任务（活动任务勾选格式：<活动code>:<任务code>），本腿跳过");
+    emit("☕️ 勾选的任务里没有运营活动任务（活动任务勾选格式：<活动code>:<任务code>），本腿跳过");
     return {
       ok: true,
       earned: 0,
@@ -681,11 +681,11 @@ export async function runCampaignTasks(acct, opts = {}) {
     }
     const rows = read.rows;
     if (!Object.keys(rows).length) {
-      emit(`🎪 ${spec.label}: 活动未下发/已结束，跳过`);
+      emit(`☕️ ${spec.label}: 活动未下发/已结束，跳过`);
       continue;
     }
     available += 1;
-    emit(`🎪 ${spec.label}（${spec.code}）`);
+    emit(`☕️ ${spec.label}（${spec.code}）`);
     for (const taskSpec of spec.tasks) {
       if (restricted) break;
       if (tset && !tset.has(taskSpec.task)) continue;
@@ -829,7 +829,7 @@ export async function runCampaignTasks(acct, opts = {}) {
         return n ? `${spec.label}×${n}` : "";
       })
       .filter(Boolean);
-    emit(`🎪 活动任务本轮入账 ${earned} 积分${parts.length ? `（${parts.join("、")}）` : ""}`);
+    emit(`☕️ 活动任务本轮入账 ${earned} 积分${parts.length ? `（${parts.join("、")}）` : ""}`);
   }
   const result = {
     ok: !failed && !restricted,

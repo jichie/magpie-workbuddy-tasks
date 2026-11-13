@@ -313,7 +313,7 @@ test("campaign：全判据跑通 —— viewed/事件/领奖回执/app 只提示
   // 日志：app 只提示
   assert.ok(res.logs.some((l) => l.includes("需手机端 App 登录后与 AI 对话一次，脚本不伪造")));
   assert.ok(res.logs.some((l) => l.includes("尚未完成（0/1）")));
-  assert.ok(res.logs.some((l) => l.includes("🎪 活动任务本轮入账 400 积分")));
+  assert.ok(res.logs.some((l) => l.includes("☕️ 活动任务本轮入账 400 积分")));
 });
 
 test("campaign：星巴克 expert 判据走市场挑选（MP_EXPERT_CATEGORY + 回落），reporter 判据 id 钉死", async () => {
@@ -346,7 +346,7 @@ test("campaign：读取失败 vs 没下发 —— 严格区分（HTTP 状态 + �
     ra.logs.some((l) => l.includes("活动任务读取失败[campaign_starbucks_2026]: HTTP 500")),
     ra.logs.join("\n"),
   );
-  assert.ok(ra.logs.some((l) => l.includes("🎪 记者节福利活动")), "另一个活动照跑");
+  assert.ok(ra.logs.some((l) => l.includes("☕️ 记者节福利活动")), "另一个活动照跑");
   // state：失败活动 error 非空、tasks 空；正常活动 tasks 3 条
   const starA = ra.state.activities.find((x) => x.code === "campaign_starbucks_2026");
   const repA = ra.state.activities.find((x) => x.code === "campaign_reporter_2026");
@@ -376,7 +376,7 @@ test("campaign：读取失败 vs 没下发 —— 严格区分（HTTP 状态 + �
   const c = campaignStub({ noIssue: { campaign_starbucks_2026: true } });
   const rc = await run(c);
   assert.equal(rc.ok, true);
-  assert.ok(rc.logs.some((l) => l.includes("🎪 星巴克协作: 活动未下发/已结束，跳过")));
+  assert.ok(rc.logs.some((l) => l.includes("☕️ 星巴克协作: 活动未下发/已结束，跳过")));
   assert.ok(!rc.logs.some((l) => l.includes("读取失败")), "没下发绝不写成读取失败");
   const starC = rc.state.activities.find((x) => x.code === "campaign_starbucks_2026");
   assert.equal(starC.error, "", "没下发不是错误");

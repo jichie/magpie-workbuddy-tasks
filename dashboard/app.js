@@ -4730,15 +4730,16 @@ function renderScheduler() {
   const settings = d.settings ?? {};
 
   setChecked($("#schedEnabled"), sch.enabled);
-  // 小时窗口只保留 Buddy 盲盒 / 小程序链式任务 / 活动任务 / 连登管家 / 猫猫旅行 / 夜猫子；
+  // 小时窗口只暴露四条腿：小程序链式任务 / 连登管家 / Buddy 盲盒 / 猫猫旅行
+  //（2026-11-13 用户要求：排程里去掉「活动任务」与「夜猫子」两行）。
+  // **活动任务与夜猫子仍在后端支持排程**（hours.campaign / hours.night），只是没有输入框：
+  // 保存时不显示的那两条腿按当前设置原样回传，绝不因为「界面上看不见」就被清成 []。
   // settings.hours.growth 即使老后端还带也一律忽略。mp 默认 []（不排程）。
   const hours = settings.hours ?? {};
   setVal($("#hoursMp"), (hours.mp ?? []).join(","));
-  setVal($("#hoursCampaign"), (hours.campaign ?? []).join(","));
   setVal($("#hoursStreak"), (hours.streak ?? []).join(","));
   setVal($("#hoursBuddy"), (hours.buddy ?? []).join(","));
   setVal($("#hoursTravel"), (hours.travel ?? []).join(","));
-  setVal($("#hoursNight"), (hours.night ?? []).join(","));
   setChecked($("#defClaim"), settings.claim);
   setVal($("#gapMs"), settings.gapMs);
   // 顶部任务腿跟 settings.legs 同步（唯一选择源；不再有独立的默认腿控件）
@@ -4815,18 +4816,17 @@ function parseHoursInput(v) {
 }
 
 async function saveHours() {
-  // 排程服务六条无任务码的腿：小程序链式任务 / 活动任务 / 连登管家 / Buddy 盲盒 / 猫猫旅行 / 夜猫子；
-  // 成长任务已从排程里移除（手工运行仍可选它）。所有输入框留空 = []（不排程）；
-  // mp 默认不排程（按天解锁），campaign 默认不排程（独立记账的活动任务），
-  // streak 是幂等的纯收益（默认不排，需要时显式配小时窗口），
-  // buddy 会消耗成长能量（是否真正开盒由后端决定）。
+  // 排程界面只暴露四条腿：小程序链式任务 / 连登管家 / Buddy 盲盒 / 猫猫旅行（留空 = 不排程）。
+  // 成长任务不在排程里（手工运行仍可选它）；**活动任务与夜猫子没有输入框**（用户 2026-11-13 要求去掉），
+  // 但后端仍支持它们的小时窗口。这里**故意不传这两条腿**：daemon 的 /api/settings 对 hours 是
+  // **按键合并**（`{...settings.hours}` 只覆盖 body 里出现的腿），所以省略 = 保留现值。
+  // 绝不能「回传页面缓存的旧值」—— 页面缓存在别处改过设置后会过期，那样保存一次就会把
+  // 别处刚配好的窗口清掉（2026-11-13 实测踩到过：night=[5] 被清成 []）。
   const hours = {
     mp: parseHoursInput($("#hoursMp").value),
-    campaign: parseHoursInput($("#hoursCampaign").value),
     streak: parseHoursInput($("#hoursStreak").value),
     buddy: parseHoursInput($("#hoursBuddy").value),
     travel: parseHoursInput($("#hoursTravel").value),
-    night: parseHoursInput($("#hoursNight").value),
   };
   try {
     const s = await api("api/settings", { method: "POST", body: { hours } });

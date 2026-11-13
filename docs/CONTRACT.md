@@ -1194,6 +1194,9 @@ hub `v2.1.0` 口径：HTTP 403 / code 11140 不是可自动恢复的风控冷却
   - `LEGS = ["growth","mp","campaign","streak","buddy","travel","night"]`（顺序定死；
     活动任务独立于成长体系，排在 mp 之后、streak 之前；runner 的 `LEG_ORDER` 同序）；
     `LEG_NAMES.campaign = "活动任务"`；`SCHEDULE_HOURS_LEGS` 增 `campaign`，**默认 `[]`（留空=不排）**。
+  **2026-11-13 用户要求：看板排程区去掉「活动任务」与「夜猫子」两行输入框** —— 后端仍支持
+  `hours.campaign` / `hours.night`（`POST /api/settings` 可配），看板保存时对这两条腿**原样回传当前值**，
+  绝不因为「界面上看不见」而被清成 `[]`。
   - `GET /api/campaign?uid=<uid>[&refresh=1]` → `{uid, cached, campaign:<11.1 state 形状>|null, error?}`；
     缓存 `state/campaign.json`，10 分钟新鲜期，节流口径与 `/api/streak` **完全一致**（含 409 busy）。
   - `POST /api/campaign/run {"uids":[…]}` → `{results:[{uid, outcome:"ok"|"skipped"|"failed", earned,

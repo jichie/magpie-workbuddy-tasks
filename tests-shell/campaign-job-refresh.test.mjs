@@ -274,7 +274,7 @@ describe("job 收尾刷新活动缓存（CONTRACT §11.5）", () => {
       `step.detail 应点名活动与项数，实际：${step.detail}`,
     );
     // 逐项行进 job.log（SSE 的 kind:"log" 事件实时流的就是这些）
-    assert.ok(job.log.some((l) => l.includes("🎪 星巴克协作（campaign_starbucks_2026）")), "活动头行");
+    assert.ok(job.log.some((l) => l.includes("☕️ 星巴克协作（campaign_starbucks_2026）")), "活动头行");
     assert.ok(job.log.some((l) => l.includes("✅ 与 AI 对话3次")), "逐项完成行");
     assert.ok(job.log.some((l) => l.includes("🎁 领奖")), "逐项领奖行");
   });
