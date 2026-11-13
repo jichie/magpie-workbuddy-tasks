@@ -12,6 +12,13 @@
 //   - runCampaignTasks 的 opts.codes 升级为**任务级**勾选
 //     （`<activityCode>:<taskCode>`；裸 activityCode 整活动兼容保留）。
 //
+// 2026-11-13 追加（用户反馈「批量做任务像卡住了」）：判据轮询/领奖回读的
+//   **每一轮**都打一行进度日志（生命迹象）—— 判据是异步落库的，点亮等待最长
+//   6×3s、慢轮询 6×10s、桌面类 10×6s、领奖回执 5×4s，此前整段只在收尾打一行，
+//   看板「实时进度」长时间没有新行。见 campaignPoll / campaignClaim；节奏常量
+//   2026-11-13 对照 hub v2.1.3（CAMPAIGN_GAP=3/POLL=6/SLOW_GAP=10/SLOW_POLL=6/
+//   CLAIM_GAP=4/CLAIM_POLL=5/DESKTOP_WAIT=60/DESKTOP_POLL=6）逐一复核，一致未改。
+//
 // 与 hub 的移植差异（我们的架构要求，逐条对齐）：
 //   - hub 的 urllib 直连换我们的 engine/upstream.callJSON（自带 breathe + 全局
 //     spacer 排队 + 重试/退避 + 403/11140 restricted 透传 + chat 主机回退）——
@@ -484,8 +491,12 @@ async function campaignClaim(acct, campaign, task, credit, opts = {}, log = null
       reason: `领奖提交失败[${campaign}/${task}]: HTTP ${res.status ?? 0} ${snippet}`.trim(),
     };
   }
-  for (let i = 0; i < Math.max(1, CAMPAIGN_CLAIM_POLL_TRIES); i++) {
+  const total = Math.max(1, CAMPAIGN_CLAIM_POLL_TRIES);
+  for (let i = 0; i < total; i++) {
     if (i) await ctx.breathe(CAMPAIGN_CLAIM_GAP_MS);
+    // 生命迹象（2026-11-13 用户反馈）：每轮一行 —— 回执异步落库最长 5×4s，
+    // 期间看板要有新行；文案与下面成功/失败行同前缀（领奖[活动/任务]）。
+    if (log) log(`   🎁 领奖[${campaign}/${task}]: 已提交，等待回执（第 ${i + 1}/${total} 次）`);
     const read = await fetchCampaignRows(acct, campaign, opts, log);
     if (read.restricted) return { ok: false, restricted: true, reason: read.error || "账号已被风控限制" };
     const row = (read.ok ? read.rows[task] : null) || {};
@@ -546,15 +557,21 @@ export async function claimCampaignTask(acct, target, opts = {}) {
 
 // 判据轮询（hub `_campaign_poll`）：每次 breathe(gap) 后重读活动，completed_at
 // 或 progress >= target 即达标；预算耗尽返回最新值（可能仍是旧值 —— 判据延迟）。
-async function campaignPoll(acct, campaign, task, target, tries, gapMs, opts = {}, log = null) {
+// 每一轮都打一行进度（2026-11-13 用户反馈「点亮后像卡住了」）：一轮一条（间隔
+// 即轮询间隔，≥1s 铁律之上），带本轮读到的进度与「第 i/n 次检查」；label 是任务
+// 人话名，note 说明在等什么（等待上游落库 / 慢轮询加等 / 桌面端动作需等待）。
+async function campaignPoll(acct, campaign, task, target, tries, gapMs, opts = {}, log = null, label = "", note = "等待上游落库") {
   const ctx = ctxOf(opts);
   let current = 0;
-  for (let i = 0; i < Math.max(1, tries ?? CAMPAIGN_POLL_TRIES); i++) {
+  const total = Math.max(1, tries ?? CAMPAIGN_POLL_TRIES);
+  for (let i = 0; i < total; i++) {
     await ctx.breathe(gapMs ?? CAMPAIGN_GAP_MS);
     const read = await fetchCampaignRows(acct, campaign, opts, log);
     if (read.restricted) return { value: current, restricted: true };
     const row = (read.ok ? read.rows[task] : null) || {};
     current = row.progress || 0;
+    // 生命迹象：先打点再判达标（落库那一轮也有一行 —— 行数 = 检查次数）
+    if (log && label) log(`   ⏳ ${label}: ${note}（${current}/${target}，第 ${i + 1}/${total} 次检查）`);
     if (row.completedAt || current >= target) return { value: Math.max(current, target) };
   }
   return { value: current };
@@ -751,7 +768,8 @@ export async function runCampaignTasks(acct, opts = {}) {
         const poll = await campaignPoll(
           acct, spec.code, code, target,
           Math.max(2, Math.floor(CAMPAIGN_DESKTOP_WAIT_MS / CAMPAIGN_DESKTOP_POLL_MS)),
-          CAMPAIGN_DESKTOP_POLL_MS, opts, emit,
+          CAMPAIGN_DESKTOP_POLL_MS, opts, emit, label,
+          `桌面端动作需等待，最多 ${Math.round(CAMPAIGN_DESKTOP_WAIT_MS / 1000)}s`,
         );
         if (poll.restricted) {
           restricted = true;
@@ -769,7 +787,7 @@ export async function runCampaignTasks(acct, opts = {}) {
           }
           if (!r.ok) break;
           if (!actions.fired.includes(code)) actions.fired.push(code);
-          const poll = await campaignPoll(acct, spec.code, code, target, CAMPAIGN_POLL_TRIES, CAMPAIGN_GAP_MS, opts, emit);
+          const poll = await campaignPoll(acct, spec.code, code, target, CAMPAIGN_POLL_TRIES, CAMPAIGN_GAP_MS, opts, emit, label);
           if (poll.restricted) {
             restricted = true;
             break;
@@ -779,7 +797,11 @@ export async function runCampaignTasks(acct, opts = {}) {
         if (restricted) break;
         if (current < target) {
           // 判据落库慢：慢轮询再等一轮（10s × 6），仍没到位就顺延下次运行
-          const poll = await campaignPoll(acct, spec.code, code, target, CAMPAIGN_SLOW_POLL_TRIES, CAMPAIGN_SLOW_GAP_MS, opts, emit);
+          const poll = await campaignPoll(
+            acct, spec.code, code, target,
+            CAMPAIGN_SLOW_POLL_TRIES, CAMPAIGN_SLOW_GAP_MS, opts, emit,
+            label, "判据延迟，慢轮询加等",
+          );
           if (poll.restricted) {
             restricted = true;
             break;

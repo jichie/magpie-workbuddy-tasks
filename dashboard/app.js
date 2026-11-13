@@ -151,6 +151,9 @@ const state = {
   esRetryTimer: 0,
   pollTimer: 0,
   jobTimer: 0,
+  elapsedTimer: 0, // 运行时长 1s 计时器（只改既有文本节点，不重绘 —— 见 tickElapsed）
+  jobSeenAt: new Map(), // jobId -> ms：前端首次看到该 job 在跑的时刻（job.startedAt 缺失时兜底计时）
+  stepSeenAt: new Map(), // `${jobId}#${idx}` -> ms：前端首次看到该步骤 running 的时刻（step.at 缺失时兜底）
   history: { rows: [], page: 0, pageSize: 25, limit: 200 },
 };
 
@@ -994,8 +997,9 @@ function taskSelBar(uid) {
   );
 }
 
-// 单行任务：所有「能不能自动化」的标注与门控都来自 taskFlags（后端字段），
-// 服务端字符串（title / code / reason / id）一律走 textContent。
+// 单行任务（2026-11-13 重做为清单行 .trow：div 网格六格 —— 勾选 | 主 | 状态 | 进度 | 奖励 | 操作；
+// 不再是 <table> 里的六列，见 style.css 的 .trow）。所有「能不能自动化」的标注与门控都来自
+// taskFlags（后端字段），服务端字符串（title / code / reason / id）一律走 textContent。
 function taskRow(a, t) {
   const code = String(t.code ?? "");
   const f = taskFlags(t);
@@ -1133,11 +1137,11 @@ function taskRow(a, t) {
       : "该任务无任务码，无法勾选";
 
   return el(
-    "tr",
-    {},
+    "div",
+    { class: "trow", role: "listitem" },
     el(
-      "td",
-      { "data-label": "选", class: "pick-cell" },
+      "div",
+      { class: "trow-pick" },
       el(
         "label",
         { class: "check", title: pickTitle },
@@ -1152,19 +1156,19 @@ function taskRow(a, t) {
       ),
     ),
     el(
-      "td",
-      { "data-label": "任务" },
-      el("span", { class: "cell-main", text: String(t.title ?? code ?? "（无标题）") }),
-      code ? el("span", { class: "cell-sub", text: code }) : null,
+      "div",
+      { class: "trow-main" },
+      el("span", { class: "trow-title", text: String(t.title ?? code ?? "（无标题）") }),
+      code ? el("span", { class: "trow-code", text: code }) : null,
       marks.length ? el("div", { class: "cell-badges" }, marks) : null,
       lockNote ? el("div", { class: "row-note", text: lockNote }) : null,
       reasonNote ? el("div", { class: "row-note", text: reasonNote }) : null,
       descNote ? el("div", { class: "row-note row-desc", text: descNote, title: descNote }) : null,
     ),
-    el("td", { "data-label": "状态" }, acceptBadge(status)),
-    el("td", { "data-label": "进度" }, progressCell(t.progress)),
-    el("td", { "data-label": "奖励", class: "num" }, rewardCell(t)),
-    el("td", { "data-label": "操作" }, actions),
+    el("div", { class: "trow-status" }, acceptBadge(status)),
+    el("div", { class: "trow-prog" }, progressCell(t.progress)),
+    el("div", { class: "trow-reward" }, rewardCell(t)),
+    el("div", { class: "trow-act" }, actions),
   );
 }
 
@@ -1196,7 +1200,7 @@ function taskTable(a) {
   wrap.append(taskSelBar(a.uid));
 
   if (!groups.length) {
-    wrap.append(el("p", { class: "muted", style: { padding: "10px 14px" } }, emptyTaskText(snap)));
+    wrap.append(el("p", { class: "muted", style: { padding: "10px 20px" } }, emptyTaskText(snap)));
     return wrap;
   }
   // 后端标记过期：数据仍展示（比空白有用），但明确说明陈旧并给只读刷新入口
@@ -1232,93 +1236,62 @@ function groupCountText(g) {
   return `· ${g.tasks.length} 项 · 待领 ${pending}`;
 }
 
-// 列头 + 定宽列（三个分组各一张表，colgroup 让它们的列宽一致、跨组对齐）。
-function taskCols() {
-  return [
-    el(
-      "colgroup",
-      {},
-      el("col", { class: "col-pick" }),
-      el("col", { class: "col-task" }),
-      el("col", { class: "col-status" }),
-      el("col", { class: "col-prog" }),
-      el("col", { class: "col-reward" }),
-      el("col", { class: "col-act" }),
-    ),
-    el(
-      "thead",
-      {},
-      el(
-        "tr",
-        {},
-        el("th", { class: "pick-col" }),
-        el("th", { text: "任务" }),
-        el("th", { text: "状态" }),
-        el("th", { text: "进度" }),
-        el("th", { text: "奖励", class: "num" }),
-        el("th", { text: "操作" }),
-      ),
-    ),
-  ];
-}
-
-// 一组的表体（任务行）。rows 已是 <tr> 数组。
-function taskRowsTable(rows) {
-  return el(
-    "div",
-    { class: "tbl-wrap" },
-    el("table", { class: "tbl tbl-tasks" }, ...taskCols(), el("tbody", {}, ...rows)),
-  );
+// 一组任务行的容器（rows 已是 .trow 数组）：清单重做（2026-11-13）后不再是「每组一张
+// 带列头的表」，而是同一条清单里的连续行 —— 所有 .trow 共用同一份网格模板
+// （style.css .trow 的 grid-template-areas），列跨行、跨组自然对齐，不再需要 colgroup/thead。
+function taskRowList(rows) {
+  return el("div", { class: "trows", role: "list" }, ...rows);
 }
 
 // 「已完成 N 项」折叠块：默认收起；用户手动展开过就记住（state.taskDoneFold）。
 // 块内每行都是已领奖的行，一律不给勾选框（见 stripPickCell）。
 function taskDoneBlock(key, rows) {
   const dk = `${key}::done`;
-  const details = el("details", { class: "task-done", dataset: { taskDone: key } });
+  const details = el("details", { class: "tdone", dataset: { taskDone: key } });
   if (state.taskDoneFold.get(dk) === true) details.open = true;
   details.append(
     el(
       "summary",
-      { class: "task-done-summary", title: "已领奖的任务（默认收起；展开后 3 秒轮询重绘不丢）" },
+      { class: "tdone-summary", title: "已领奖的任务（默认收起；展开后 3 秒轮询重绘不丢）" },
       el("span", { text: `已完成 ${rows.length} 项` }),
     ),
   );
-  if (rows.length) details.append(taskRowsTable(rows.map(stripPickCell)));
+  if (rows.length) details.append(taskRowList(rows.map(stripPickCell)));
   details.addEventListener("toggle", () => state.taskDoneFold.set(dk, details.open));
   return details;
 }
 
-// 已领奖的行去掉勾选框：清空行首勾选单元格的内容（空 <td> 保留 —— 桌面端列宽与窄屏卡片
-// 的占位都不乱，只是这一格不再有 checkbox / 「选」提示）。
-function stripPickCell(tr) {
-  const td = tr && tr.firstElementChild;
-  if (td && td.classList && td.classList.contains("pick-cell")) td.replaceChildren();
-  return tr;
+// 已领奖的行去掉勾选框：清空行首勾选格的内容（空 .trow-pick 保留 —— 网格列宽与未完成行
+// 完全一致，只是这一格不再有 checkbox / 「选」提示）。
+function stripPickCell(row) {
+  const cell = row && row.querySelector ? row.querySelector(".trow-pick") : null;
+  if (cell) cell.replaceChildren();
+  return row;
 }
 
 // 一个分组：纯标题头（**恒展开、不可折叠** —— 无 <details>/折叠箭头/点击行为）+ 组体
-// （未完成在前，已领奖收进「已完成」折叠块）。标题头的视觉与任务行、活动子标题明显分层，
-// 见 style.css 的 .task-group-head。
+// （未完成在前，已领奖收进「已完成」折叠块）。重做（2026-11-13）后组头只靠排版分层：
+// 加粗标题 + 等宽计数 + 一条 hairline，不再有底色块与左侧色条；与「活动子标题」
+// （.tact-head：缩进、更小、更轻）和「任务行」（.trow）三层分明，见 style.css。
 function taskGroupBlock(a, g) {
   const head = el(
     "div",
-    { class: `task-group-head task-group-head-${g.key}`, dataset: { taskGroup: `${a.uid}::${g.key}` } },
-    el("span", { class: "task-group-title", text: g.title }),
-    el("span", { class: "task-group-count", text: groupCountText(g) }),
+    { class: "tgroup-head", dataset: { taskGroup: `${a.uid}::${g.key}` } },
+    el("span", { class: "tgroup-title", text: g.title }),
+    el("span", { class: "tgroup-count", text: groupCountText(g) }),
     g.key === "campaign" ? campaignRunButton(a) : null,
   );
-  const body = el("div", { class: "task-group-body" });
+  const body = el("div", { class: "tgroup-body" });
   if (g.type === "campaign") fillCampaignGroup(a, body, g);
   else fillSnapGroup(a, body, g);
-  return el("div", { class: `task-group task-group-${g.key}` }, head, body);
+  return el("section", { class: "tgroup", "aria-label": `${g.title} ${groupCountText(g)}` }, head, body);
 }
 
 // 成长 / 小程序组：未领奖（未接取 / 已接取 / 待领奖）在上；已领奖沉底并收进折叠块。
 function fillSnapGroup(a, body, g) {
   const undone = g.tasks.filter((t) => String(t?.acceptStatus ?? "") !== "claimed");
   const done = g.tasks.filter((t) => String(t?.acceptStatus ?? "") === "claimed");
-  if (undone.length) body.append(taskRowsTable(undone.map((t) => taskRow(a, t))));
+  if (undone.length) body.append(taskRowList(undone.map((t) => taskRow(a, t))));
   if (done.length) body.append(taskDoneBlock(`${a.uid}::${g.key}`, done.map((t) => taskRow(a, t))));
 }
 
@@ -1335,23 +1308,8 @@ function fillCampaignGroup(a, body, g) {
     const undone = tasks.filter((t) => !campaignTaskClaimed(t));
     for (const t of tasks) if (campaignTaskClaimed(t)) claimed.push({ act, t });
     if (!undone.length) continue; // 整组已领的活动不在这里出头（行都在折叠块里）
-    body.append(
-      el(
-        "div",
-        { class: "tbl-wrap" },
-        el(
-          "table",
-          { class: "tbl tbl-tasks" },
-          ...taskCols(),
-          el(
-            "tbody",
-            {},
-            el("tr", { class: "task-act-row" }, el("td", { colspan: "6" }, campaignActHead(act))),
-            ...undone.map((t) => campaignTaskRow(a, act, t)),
-          ),
-        ),
-      ),
-    );
+    body.append(campaignActHead(act));
+    body.append(taskRowList(undone.map((t) => campaignTaskRow(a, act, t))));
   }
   if (claimed.length) {
     body.append(
@@ -1383,18 +1341,20 @@ function campaignStatusNote(a) {
 }
 
 // 活动子标题：`星巴克协作 · 可领 0 · 已领 0/3`（`·` 是独立分隔 span，视觉与文本都对齐契约）。
+// 重做（2026-11-13）后是清单里的一行纯文字（不再塞进表格行）：缩进落在组头与任务行之间，
+// 字号更小、字重更轻、颜色更浅 —— 与「活动任务」组头、任务行三层分明。
 function campaignActHead(act) {
   const tasks = Array.isArray(act?.tasks) ? act.tasks : [];
   const label = String(act?.label ?? act?.code ?? "活动").trim() || "活动";
-  const sep = () => el("span", { class: "task-act-head-sep", text: "·" });
+  const sep = () => el("span", { class: "tact-sep", text: "·" });
   return el(
     "div",
-    { class: "task-act-head" },
-    el("span", { class: "task-act-head-name", text: label }),
+    { class: "tact-head" },
+    el("span", { class: "tact-name", text: label }),
     sep(),
-    el("span", { class: "task-act-head-meta", text: `可领 ${campaignNum(act?.claimable)}` }),
+    el("span", { class: "tact-meta", text: `可领 ${campaignNum(act?.claimable)}` }),
     sep(),
-    el("span", { class: "task-act-head-meta", text: `已领 ${campaignClaimedCount(act)}/${tasks.length}` }),
+    el("span", { class: "tact-meta", text: `已领 ${campaignClaimedCount(act)}/${tasks.length}` }),
   );
 }
 
@@ -1457,11 +1417,11 @@ function campaignTaskRow(a, act, t, opts = {}) {
       : "缺少活动码 / 任务码，无法勾选";
 
   return el(
-    "tr",
-    { class: "task-row-campaign" },
+    "div",
+    { class: "trow trow-campaign", role: "listitem" },
     el(
-      "td",
-      { "data-label": "选", class: "pick-cell" },
+      "div",
+      { class: "trow-pick" },
       el(
         "label",
         { class: "check", title: pickTitle },
@@ -1476,17 +1436,17 @@ function campaignTaskRow(a, act, t, opts = {}) {
       ),
     ),
     el(
-      "td",
-      { "data-label": "任务" },
-      el("span", { class: "cell-main", text: label }),
-      code ? el("span", { class: "cell-sub", text: code }) : null,
+      "div",
+      { class: "trow-main" },
+      el("span", { class: "trow-title", text: label }),
+      code ? el("span", { class: "trow-code", text: code }) : null,
       el("div", { class: "cell-badges" }, marks),
       ...notes.map((n) => el("div", { class: "row-note", text: n })),
     ),
-    el("td", { "data-label": "状态" }, status),
-    el("td", { "data-label": "进度" }, el("span", { class: "mono", text: target > 0 ? `${cur}/${target}` : `${cur}` })),
-    el("td", { "data-label": "奖励", class: "num" }, el("span", { class: "mono", text: reward > 0 ? `+${fmtNum(reward)} 积分` : "—" })),
-    el("td", { "data-label": "操作" }, actions),
+    el("div", { class: "trow-status" }, status),
+    el("div", { class: "trow-prog" }, progressCell({ current: cur, target })),
+    el("div", { class: "trow-reward" }, el("span", { class: "mono", text: reward > 0 ? `+${fmtNum(reward)} 积分` : "—" })),
+    el("div", { class: "trow-act" }, actions),
   );
 }
 
@@ -3700,10 +3660,91 @@ function updateSelectionUI() {
 
 // ---- 实时进度区 --------------------------------------------------------------------------
 
-function stepRow(s) {
+// ---- 运行时长反馈（用户 2026-11-13：「开始批量任务会卡住没反应」） --------------------------
+// 活动腿按上游节奏跑（点亮后轮询 6×3s、桌面类任务最多 60s），期间步骤/日志很稀疏 ——
+// 面板据此每秒展示真实计时：job 级一行「已运行 1:23 · 最近事件 12:03:45」，running 的
+// 步骤行「进行中 · 已 32s」。只显示已运行时长与最后一次事件的时刻，**绝不伪造进度百分比**。
+// 时间来源优先契约字段 job.startedAt / step.at（engine runner 都有）；缺失时用前端首次
+// 看到 running 的时刻起算（state.jobSeenAt / state.stepSeenAt），绝不显示空白。
+
+function fmtElapsed(ms) {
+  const s = Math.max(0, Math.floor(Number(ms) / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}:${String(s % 60).padStart(2, "0")}`;
+  return `${Math.floor(m / 60)}:${String(m % 60).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+}
+
+function jobStartMs(job) {
+  const d = toDate(job?.startedAt ?? job?.createdAt);
+  if (d) return d.getTime();
+  const id = String(job?.id ?? "");
+  if (!state.jobSeenAt.has(id)) state.jobSeenAt.set(id, Date.now());
+  return state.jobSeenAt.get(id);
+}
+
+function stepStartMs(job, idx, s) {
+  const d = toDate(s?.at);
+  if (d) return d.getTime();
+  const key = `${job?.id ?? ""}#${idx}`;
+  if (!state.stepSeenAt.has(key)) state.stepSeenAt.set(key, Date.now());
+  return state.stepSeenAt.get(key);
+}
+
+// 最后一次事件的时刻：steps[] 里最近的 at（步骤按时间追加，取最大值）；没有步骤 → job 开始时刻。
+function lastEventMs(job) {
+  let best = 0;
+  for (const s of Array.isArray(job?.steps) ? job.steps : []) {
+    const d = toDate(s?.at);
+    if (d && d.getTime() > best) best = d.getTime();
+  }
+  return best || jobStartMs(job);
+}
+
+function jobElapsedText(job) {
+  return `已运行 ${fmtElapsed(Date.now() - jobStartMs(job))} · 最近事件 ${fmtTime(lastEventMs(job))}`;
+}
+
+// 每秒只改既有文本节点的 textContent（不重绘、不动结构）：3s 轮询 / SSE 重绘之间
+// 时长也在走，且不会打断用户交互。
+function tickElapsed() {
+  const job = state.data?.job;
+  if (!job || job.state === "done" || job.state === "error") return;
+  const je = $("#jobBody [data-job-elapsed]");
+  if (je) je.textContent = jobElapsedText(job);
+  const steps = Array.isArray(job.steps) ? job.steps : [];
+  for (const node of $$("#jobBody [data-step-elapsed]")) {
+    const idx = Number(node.dataset.stepElapsed);
+    const s = steps[idx];
+    if (s && s.state === "running") node.textContent = `· 已 ${fmtElapsed(Date.now() - stepStartMs(job, idx, s))}`;
+  }
+}
+
+// 有 running job 就开 1s 计时器，没有就停（幂等，renderJob 每次收尾都调用）。
+function syncElapsedTimer() {
+  const job = state.data?.job;
+  const active = !!job && job.state !== "done" && job.state !== "error";
+  if (active && !state.elapsedTimer) {
+    state.elapsedTimer = setInterval(tickElapsed, 1000);
+    tickElapsed();
+  } else if (!active && state.elapsedTimer) {
+    clearInterval(state.elapsedTimer);
+    state.elapsedTimer = 0;
+    pruneElapsedSeen();
+  }
+}
+
+// 收尾清掉兜底计时缓存（job/step 自带时间戳时它本来就是空的；防止长跑实例缓慢积累）。
+function pruneElapsedSeen() {
+  state.jobSeenAt.clear();
+  state.stepSeenAt.clear();
+}
+
+function stepRow(s, idx, job) {
   const gain = [];
   if (Number(s.credit) > 0) gain.push(`+${fmtNum(s.credit)} 积分`);
   if (Number(s.energy) > 0) gain.push(`+${fmtNum(s.energy)} 能量`);
+  const running = s.state === "running";
   return el(
     "tr",
     {},
@@ -3712,7 +3753,18 @@ function stepRow(s) {
       s.uid ? el("span", { class: "cell-sub", text: String(s.uid) }) : null,
     ),
     el("td", { "data-label": "腿", text: legName(s.leg) }),
-    el("td", { "data-label": "状态" }, stepBadge(s.state)),
+    el("td", { "data-label": "状态" },
+      stepBadge(s.state),
+      // running 的步骤实时显示已运行时长（每秒由 tickElapsed 更新文本，不重绘）
+      running
+        ? el("span", {
+            class: "step-elapsed",
+            dataset: { stepElapsed: String(idx) },
+            text: `· 已 ${fmtElapsed(Date.now() - stepStartMs(job, idx, s))}`,
+            title: "该步骤进入「进行中」以来的真实时长（活动腿按上游节奏跑，日志稀疏不代表卡死）",
+          })
+        : null,
+    ),
     el("td", { "data-label": "详情", class: "detail-cell", text: String(s.detail ?? "") || "—" }),
     el("td", { "data-label": "收益", class: "num", text: gain.length ? gain.join(" · ") : "—" }),
     el("td", { "data-label": "时间", class: "num", text: fmtTime(s.at) }),
@@ -3744,6 +3796,7 @@ function renderJob() {
         "勾选账号与任务腿后点「批量做任务」启动一轮：接取 → 点亮 → 领奖；排程到点也会自动运行。",
       ),
     );
+    syncElapsedTimer(); // 没有 job：停掉秒级计时器
     return;
   }
 
@@ -3760,12 +3813,26 @@ function renderJob() {
   }
 
   const totals = job.totals ?? {};
+  // job 级时长行：运行中 → 每秒走动的「已运行 1:23 · 最近事件 12:03:45」（tickElapsed 只改文本）；
+  // 已结束 → 静态「用时 X」（startedAt/endedAt 都解析得出才显示，绝不编数）。
+  const startD = toDate(job.startedAt);
+  const endD = toDate(job.endedAt);
   const meta = el(
     "div",
     { class: "job-meta" },
     finished && !state.data?.job ? badge("最近一轮（已结束）", "badge-quiet") : null,
     badge(JOB_STATE_NAMES[job.state] ?? String(job.state ?? "—"), job.state === "error" ? "badge-warn" : "badge-strong"),
     job.stopped ? badge("已被要求停止", "badge-warn") : null,
+    !finished
+      ? el("span", {
+          class: "job-elapsed",
+          dataset: { jobElapsed: "1" },
+          text: jobElapsedText(job),
+          title: "本轮开始以来的真实时长与最后一次步骤/事件的时刻（活动腿按上游节奏跑，日志稀疏不代表卡死）",
+        })
+      : startD && endD
+        ? el("span", { class: "mono muted", text: `用时 ${fmtElapsed(endD.getTime() - startD.getTime())}` })
+        : null,
     el("span", { class: "mono muted", text: String(job.id ?? "") }),
     el("span", { class: "muted", text: `触发：${TRIGGER_NAMES[job.trigger] ?? job.trigger ?? "—"}` }),
     el("span", { class: "muted", text: `开始 ${fmtDateTime(job.startedAt)}` }),
@@ -3800,7 +3867,7 @@ function renderJob() {
               el("th", { text: "时间", class: "num" }),
             ),
           ),
-          el("tbody", {}, steps.map(stepRow)),
+          el("tbody", {}, steps.map((s, i) => stepRow(s, i, job))),
         ),
       )
     : el("p", { class: "muted", text: "还没有步骤产出。" });
@@ -3816,6 +3883,7 @@ function renderJob() {
     logPane,
   );
   renderJobLogs();
+  syncElapsedTimer(); // 运行中 → 秒级计时器接管时长文本；已结束 → 停表
 }
 
 // ---- 批量操作 ------------------------------------------------------------------------------
@@ -5124,6 +5192,8 @@ function handleSSE(evt) {
       stopPolling();
       if (state.jobTimer) clearInterval(state.jobTimer);
       state.jobTimer = 0;
+      if (state.elapsedTimer) clearInterval(state.elapsedTimer); // 秒级时长计时器一并停
+      state.elapsedTimer = 0;
       state.feed = "idle";
       renderTop();
       toast(`守护进程已退出：${evt.reason || ""}`, "warn", 10000);

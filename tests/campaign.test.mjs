@@ -7,6 +7,9 @@
 //   - need_view 真值先 viewed；need_view 缺失/假值不 view（hub row.get 的实际语义）；
 //   - 进度以 completed_at / progress>=target 为准；达标才领奖；
 //   - 领奖只 POST 成功**不算**成功，必须回读到 claimed_at；
+//   - 逐轮进度日志（2026-11-13 用户反馈「批量做任务像卡住了」）：判据轮询/
+//     领奖回读的每一轮恰一行等待行（行数 = 轮数，带当前进度与「第 i/n 次」），
+//     快/慢/桌面/领奖四种文案可区分，绝不刷屏；
 //   - app kind 只提示、不伪造（零事件上报）；
 //   - 幂等：已领（claimed_at 已在）不再领；
 //   - restricted（403/11140）透传且停手；
@@ -25,6 +28,8 @@ import assert from "node:assert/strict";
 import {
   CAMPAIGN_CASES,
   CAMPAIGN_CLAIM_POLL_TRIES,
+  CAMPAIGN_POLL_TRIES,
+  CAMPAIGN_SLOW_POLL_TRIES,
   CAMPAIGN_SPECS,
   MP_EXPERT_CATEGORY,
   campaignChatEvent,
@@ -51,6 +56,10 @@ const RECEIPT_ISO = "2026-11-13T00:00:00Z";
 //   noNeedView: true                             —— 上游不带 need_view 字段
 //   restricted: true                             —— 一律 403/11140
 //   growthFails: true                            —— 成长任务清单 500（解耦用例）
+//   landOnCheck: {taskCode: n}                   —— 判据事件上报后第 n 次清单检查才
+//                                                  落库 completed_at（逐轮进度日志用例）
+//   receiptOnRead: {taskCode: n}                 —— 领奖 POST 后第 n 次回读才见
+//                                                  claimed_at（领奖等待行用例）
 function campaignStub(opts = {}, clock = fakeClock(NOW)) {
   const calls = [];
   const reports = []; // {kind:"mp"|"desktop"|"other", events, headers, host}
@@ -59,6 +68,14 @@ function campaignStub(opts = {}, clock = fakeClock(NOW)) {
   const completed = new Set();
   const claimed = new Set();
   const respond = (status, body) => ({ status, text: async () => JSON.stringify(body) });
+  // 延迟落库/回执（缺省立即落库，既有用例口径不变）：pendingLands/receiptReads
+  // 记已检查次数，每次成功的清单读取推进一格，到点才把判据挂进 progress。
+  const pendingLands = new Map(); // task -> 已检查次数
+  const receiptReads = new Map(); // task -> 已回读次数
+  const completeTask = (code) => {
+    if (opts.landOnCheck?.[code]) pendingLands.set(code, 0);
+    else completed.add(code);
+  };
 
   const payloadFor = (campaign) =>
     campaign === "campaign_starbucks_2026"
@@ -102,6 +119,24 @@ function campaignStub(opts = {}, clock = fakeClock(NOW)) {
         ...(opts.needViewFalse ? { need_view: false } : {}),
         ...(opts.noNeedView ? { need_view: undefined } : {}),
       }));
+      // 延迟落库推进：本次读取就是一次「检查/回读」，到点才让判据可见
+      for (const [code, n] of pendingLands) {
+        if (n + 1 >= opts.landOnCheck[code]) {
+          pendingLands.delete(code);
+          completed.add(code);
+        } else {
+          pendingLands.set(code, n + 1);
+        }
+      }
+      for (const [code, n] of receiptReads) {
+        if (n + 1 >= opts.receiptOnRead[code]) {
+          receiptReads.delete(code);
+          completed.add(code);
+          claimed.add(code);
+        } else {
+          receiptReads.set(code, n + 1);
+        }
+      }
       const progress = tasks
         .filter((t) => completed.has(t.task_code) || claimed.has(t.task_code))
         .map((t) => ({
@@ -124,8 +159,12 @@ function campaignStub(opts = {}, clock = fakeClock(NOW)) {
       const task = decodeURIComponent(claimMatch[1]);
       claims.push({ task, campaign: u.searchParams.get("activity_code") });
       if (!opts.claimWithoutReceipt) {
-        completed.add(task);
-        claimed.add(task); // hub fake：领奖后回读可见 claimed_at
+        if (opts.receiptOnRead?.[task]) {
+          receiptReads.set(task, 0); // 回执延迟：从下一次回读开始计数
+        } else {
+          completed.add(task);
+          claimed.add(task); // hub fake：领奖后回读可见 claimed_at
+        }
       }
       return respond(200, { code: 0 });
     }
@@ -137,15 +176,15 @@ function campaignStub(opts = {}, clock = fakeClock(NOW)) {
         reports.push({ kind: "mp", events, headers, host: u.host });
         for (const e of events) {
           const page = JSON.stringify({ pageURL: e.pageURL, pageName: e.pageName });
-          if (e.eventCode === "chat_request_send") completed.add(page.includes("starbucks") ? "ai_chat" : "skill_use");
-          if (e.eventCode === "expert_actual_use") completed.add(page.includes("starbucks") ? "expert" : "expert_chat");
+          if (e.eventCode === "chat_request_send") completeTask(page.includes("starbucks") ? "ai_chat" : "skill_use");
+          if (e.eventCode === "expert_actual_use") completeTask(page.includes("starbucks") ? "expert" : "expert_chat");
         }
         return respond(200, { code: 0, data: {} });
       }
       if (String(headers["User-Agent"] ?? "").includes("WorkBuddy/5.8.3")) {
         reports.push({ kind: "desktop", events, headers, host: u.host });
         for (const e of events) {
-          if (e.eventCode === "playbook_prompt_send" && e.id === "cnb-content-calendar") completed.add("desktop_same");
+          if (e.eventCode === "playbook_prompt_send" && e.id === "cnb-content-calendar") completeTask("desktop_same");
         }
         return respond(200, { code: 0, data: {} });
       }
@@ -431,6 +470,70 @@ test("campaign：领奖必须回读 claimed_at —— 只 POST 成功不算", as
   // claim POST 之后的回读确实发生了（每张领奖 5 次回读预算）
   const readCalls = stub.calls.filter((c) => c.path === "/portal/activity/tasks" && c.method === "GET");
   assert.ok(readCalls.length > 6);
+});
+
+// ---- 逐轮进度日志（2026-11-13 用户反馈「批量做任务像卡住了」：点亮/回读等待
+//      最长 60s+，等待期间每一轮都要有一行「生命迹象」） ---------------------------
+
+test("campaign：判据轮询逐轮打点 —— 等待行数 = 检查次数，带进度与轮次", async () => {
+  // 第 2 次检查才落库：第 1 轮等（0/3），第 2 轮看到 3/3 即停
+  const stub = campaignStub({ landOnCheck: { ai_chat: 2 } });
+  const res = await run(stub, { codes: ["campaign_starbucks_2026:ai_chat"] });
+  assert.equal(res.ok, true, res.logs.join("\n"));
+  assert.equal(res.earned, 100);
+  const waits = res.logs.filter((l) => l.includes("等待上游落库"));
+  assert.equal(waits.length, 2, "恰两条等待行 —— 一轮一条（行数=检查次数），不是轮询内刷屏");
+  assert.ok(waits[0].startsWith("   ⏳ 与 AI 对话3次: "), waits[0]);
+  assert.ok(waits[0].endsWith("等待上游落库（0/3，第 1/6 次检查）"), waits[0]);
+  assert.ok(waits[1].endsWith("等待上游落库（3/3，第 2/6 次检查）"), waits[1]);
+  assert.ok(res.logs.some((l) => l.includes("✅ 与 AI 对话3次: completed 3/3")), res.logs.join("\n"));
+});
+
+test("campaign：桌面类长等逐轮打点 —— 「最多 60s」+ 轮次（10×6s 预算）", async () => {
+  const stub = campaignStub({ landOnCheck: { desktop_same: 3 } });
+  const res = await run(stub, { codes: ["campaign_reporter_2026:desktop_same"] });
+  assert.equal(res.ok, true, res.logs.join("\n"));
+  assert.equal(res.earned, 100);
+  const waits = res.logs.filter((l) => l.includes("桌面端动作需等待"));
+  assert.equal(waits.length, 3, "第 3 次检查才落库 → 恰三条等待行");
+  assert.ok(waits[0].endsWith("桌面端动作需等待，最多 60s（0/1，第 1/10 次检查）"), waits[0]);
+  assert.ok(waits[2].endsWith("桌面端动作需等待，最多 60s（1/1，第 3/10 次检查）"), waits[2]);
+});
+
+test("campaign：慢轮询逐轮打点且不刷屏 —— 预算耗尽恰 6+6 条，文案区分两段", async () => {
+  // 永不落库：快轮询 6 轮 + 慢轮询 6 轮，各恰 6 条等待行后如实顺延（不算失败）
+  const stub = campaignStub({ landOnCheck: { expert: 999 } });
+  const res = await run(stub, { codes: ["campaign_starbucks_2026:expert"] });
+  assert.equal(res.ok, true, "判据延迟未落库只顺延，不算失败");
+  assert.equal(res.earned, 0);
+  const fast = res.logs.filter((l) => l.includes("等待上游落库"));
+  const slow = res.logs.filter((l) => l.includes("判据延迟，慢轮询加等"));
+  assert.equal(fast.length, CAMPAIGN_POLL_TRIES, "快轮询恰 6 条（CAMPAIGN_POLL=6）");
+  assert.equal(slow.length, CAMPAIGN_SLOW_POLL_TRIES, "慢轮询恰 6 条（CAMPAIGN_SLOW_POLL=6）");
+  assert.ok(fast[0].endsWith("等待上游落库（0/1，第 1/6 次检查）"), fast[0]);
+  assert.ok(fast[5].endsWith("等待上游落库（0/1，第 6/6 次检查）"), fast[5]);
+  assert.ok(slow[0].endsWith("判据延迟，慢轮询加等（0/1，第 1/6 次检查）"), slow[0]);
+  assert.ok(res.logs.some((l) => l.includes("判据延迟未落库（0/1），下轮自动补领")));
+  // 整个 run 里「第 1/」开轮次的行恰两条（快/慢各一）—— 没有第三种等待变体混入
+  const waitish = res.logs.filter((l) => l.includes("第 1/"));
+  assert.equal(waitish.length, 2, waitish.join("\n"));
+});
+
+test("campaign：领奖回读逐轮打点 —— 等待行数 = 回读轮数 + 一条成功行", async () => {
+  // 第 2 次回读才见 claimed_at：两轮等待行 + 成功行（成功行在等待行之后）
+  const stub = campaignStub({ receiptOnRead: { ai_chat: 2 } });
+  stub.completed.add("ai_chat"); // 已达成 → 直接进领奖，不发射判据
+  const res = await run(stub, { codes: ["campaign_starbucks_2026:ai_chat"] });
+  assert.equal(res.ok, true, res.logs.join("\n"));
+  assert.equal(res.earned, 100);
+  const waits = res.logs.filter((l) => l.includes("已提交，等待回执"));
+  assert.equal(waits.length, 2, "恰两条等待行");
+  assert.ok(waits[0].endsWith("领奖[campaign_starbucks_2026/ai_chat]: 已提交，等待回执（第 1/5 次）"), waits[0]);
+  assert.ok(waits[1].endsWith("领奖[campaign_starbucks_2026/ai_chat]: 已提交，等待回执（第 2/5 次）"), waits[1]);
+  const successIdx = res.logs.findIndex((l) => l.includes("🎁 领奖[campaign_starbucks_2026/ai_chat]: +100 积分"));
+  assert.ok(successIdx >= 0, "恰一条成功行");
+  assert.ok(successIdx > res.logs.indexOf(waits[1]), "成功行在最后一条等待行之后（回执到 → 停）");
+  assert.equal(res.logs.filter((l) => l.includes("+100 积分")).length, 1);
 });
 
 test("campaign：幂等 —— 已领（claimed_at 已在）不再领、不再上报", async () => {

@@ -878,7 +878,6 @@ details[open] > .acct-tasks-summary { color: var(--ink-2); border-bottom: 1px so
   font-size: 11.5px;
   color: var(--ink-3);
 }
-.acct-tasks .tbl-wrap { padding: 2px 20px 12px; }
 
 /* 国际版账号诊断：一行次要文字，绝不列出具体账号 */
 .acct-intl {
@@ -1025,12 +1024,6 @@ details[open] > .acct-tasks-summary { color: var(--ink-2); border-bottom: 1px so
 .task-sel-summary { font-size: 11.5px; color: var(--accent-strong); white-space: nowrap; }
 .task-sel-summary[hidden] { display: none; }
 
-.tbl th.pick-col, .tbl td.pick-cell {
-  width: 30px;
-  padding-right: 0;
-}
-.tbl td.pick-cell .check { cursor: pointer; }
-
 /* ---- 批量操作条 -------------------------------------------------------------- */
 
 .batchbar {
@@ -1095,6 +1088,32 @@ details[open] > .acct-tasks-summary { color: var(--ink-2); border-bottom: 1px so
   color: var(--ink-3);
 }
 .job-meta .mono { font-size: 11px; }
+
+/* 运行时长反馈（用户 2026-11-13「开始批量任务会卡住没反应」）：
+   .job-elapsed 是 job 级每秒走动的胶囊「已运行 1:23 · 最近事件 12:03:45」；
+   .step-elapsed 跟在 running 步骤的「进行中」徽章后「· 已 32s」。
+   都是等宽 tabular-nums（数字跳动不抖行宽）、最轻的中性色 —— 是「活的」但不抢焦点。 */
+.job-elapsed {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface-2);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+.step-elapsed {
+  margin-left: 6px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
 
 .job-totals {
   display: grid;
@@ -1738,17 +1757,16 @@ dialog::backdrop { background: rgba(8, 10, 14, .5); }
   min-width: 0;
 }
 
-/* 分组标题右侧的「跑一轮活动任务」按钮（原账号行活动条与这里共用，现只剩这里）：沿用 .mini-btn
-   配色/圆角，字号与组头（13px）协调略放大，内边距收紧。 */
+/* 分组标题右侧的「跑一轮活动任务」按钮（唯一入口）：沿用 .mini-btn 配色/圆角，
+   字号与新组头（12.5px）协调，内边距收紧。 */
 .campaign-btn { font-size: 11.5px; padding: 3px 10px; }
-/* 活动分组状态说明行（最近一次结果 / 查询失败）：原来在账号行活动条里，现随活动分组就近展示。 */
+/* 活动分组状态说明行（最近一次结果 / 查询失败）：重做（2026-11-13）后不再是
+   强调色块 + 左色条，就是清单顶部一两行安静的说明文字（警示仍用 warn 色，绝不静默）。 */
 .campaign-notes {
   display: flex;
   flex-direction: column;
-  gap: 3px;
-  padding: 7px 20px;
-  border-left: 4px solid var(--accent);
-  background: var(--accent-soft);
+  gap: 2px;
+  padding: 7px 20px 1px;
 }
 /* 说明行：限两行 + 省略号，全文在 title 里，不把行顶高 */
 .campaign-note {
@@ -1767,81 +1785,128 @@ dialog::backdrop { background: rgba(8, 10, 14, .5); }
 .campaign-run { color: var(--ink-2); }
 .campaign-run.warn-text { color: var(--warn); }
 
-/* 任务明细三个来源分组（CONTRACT §11.6）：成长任务 → 小程序任务 → 活动任务。
-   每组一个纯标题头（**恒展开、不可折叠** —— 无 <details>/折叠箭头）+ 组体；组内未完成在上、
-   已领奖沉底进「已完成 N 项」折叠块。三个分组各一张 .tbl-tasks 表，靠 colgroup 定宽让列跨组对齐。
-   标题头必须与「任务行」「活动子标题」明显分层：更重字号 + 区块底色 + 左侧 4px 强调色条 + 上边框
-   （沿用全表单一靛蓝强调色的设计语言，三个组头同款，靠标题文字区分）。 */
-.task-group { border-bottom: 1px solid var(--line); }
-.task-group:last-child { border-bottom: none; }
-.task-group-head {
+/* ---- 任务明细清单（2026-11-13 重做，CONTRACT §11.6） --------------------------------
+   一条干净的清单，不再是「三个色块组头 + 每组一张带列头的小表」：
+   · 层次全靠排版与留白 —— 不用底色块、不用左侧色条、不套边框；
+   · 三层分明（每层至少在字号/字重/颜色/缩进四个维度里占两个）：
+       组头   .tgroup-head  12.5px/700/ink + .06em 字距 + 等宽计数 + hairline 下划线（不可点、恒展开）
+       活动头 .tact-head    11.5px/600/ink-2，缩进 34px（组头与任务行之间），等宽 meta
+       任务行 .trow          12.5px/500 标题 + 10.5px 等宽 code，行分隔 hairline，hover 轻底
+   · 所有 .trow 共用同一份 grid 模板（六格定宽 + 弹性主列），列跨行、跨组自然对齐；
+   · 数字全部等宽 tabular-nums，奖励右对齐；
+   · 组内未完成在上、已领奖沉底进「已完成 N 项」（.tdone，默认收起，标题整体压暗一档）。 */
+
+.tgroup + .tgroup { margin-top: 14px; }
+.task-sel-wrap { padding-bottom: 8px; }
+
+.tgroup-head {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   flex-wrap: wrap;
-  padding: 9px 20px 9px 13px;
-  border-top: 2px solid var(--line-strong);
-  border-left: 4px solid var(--accent);
-  background: var(--accent-soft);
+  padding: 9px 20px 7px;
+  border-bottom: 1px solid var(--line);
 }
-.task-group-head .task-group-title {
-  font-size: 13px;
-  font-weight: 750;
-  letter-spacing: .01em;
+.tgroup-title {
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: .06em;
   color: var(--ink);
 }
-.task-group-head .task-group-count {
+.tgroup-count {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-3);
+}
+.tgroup-head > .campaign-btn { margin-left: auto; }
+
+/* 活动子标题：清单里的一行纯文字（缩进在组头 20px 与任务标题 56px 之间） */
+.tact-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 20px 2px 34px;
+}
+.tact-name { font-size: 11.5px; font-weight: 600; color: var(--ink-2); }
+.tact-sep { font-size: 10px; color: var(--ink-3); }
+.tact-meta {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-3);
+}
+
+/* 任务行：六格网格（勾选 | 主 | 状态 | 进度 | 奖励 | 操作）。
+   定宽列跨行对齐；主列 minmax(0,1fr) 吃剩余宽度，长标题 overflow-wrap 换行不溢出。 */
+.trow {
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr) 100px 118px 96px 150px;
+  grid-template-areas: "pick main status prog reward act";
+  gap: 4px 10px;
+  align-items: center;
+  padding: 7px 20px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12.5px;
+}
+.trow:hover { background: var(--surface-2); }
+.trow-pick { grid-area: pick; display: flex; align-items: center; min-width: 0; }
+.trow-pick .check { cursor: pointer; }
+.trow-main { grid-area: main; min-width: 0; }
+.trow-title {
+  display: block;
+  color: var(--ink);
+  font-weight: 500;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.trow-code {
+  display: block;
+  margin-top: 1px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink-3);
+  word-break: break-all;
+}
+.trow-status { grid-area: status; min-width: 0; }
+.trow-prog { grid-area: prog; min-width: 0; }
+.trow-prog .prog-cell { min-width: 0; }
+.trow-reward {
+  grid-area: reward;
+  text-align: right;
   font-family: var(--font-mono);
   font-size: 11px;
+  font-variant-numeric: tabular-nums;
   color: var(--ink-2);
+  overflow-wrap: anywhere;
 }
-.task-group-head > .campaign-btn { margin-left: auto; }
-.task-group-body { display: flex; flex-direction: column; }
+.trow-act { grid-area: act; min-width: 0; }
+.trow-act .row-actions { justify-content: flex-end; }
 
-/* 「已完成 N 项」折叠块（默认收起）：比分组标题更轻，整体压暗。 */
-.task-done { border-top: 1px dashed var(--line); }
-.task-done > .task-done-summary {
+/* 「已完成 N 项」折叠块（默认收起）：比分组标题更轻，无底色；块内行整体压暗一档 */
+.tdone > .tdone-summary {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 20px;
+  padding: 7px 20px;
   font-size: 11px;
   color: var(--ink-3);
   cursor: pointer;
   user-select: none;
   list-style: none;
 }
-.task-done > .task-done-summary::-webkit-details-marker { display: none; }
-.task-done > .task-done-summary::marker { content: ""; }
-.task-done > .task-done-summary::before {
+.tdone > .tdone-summary::-webkit-details-marker { display: none; }
+.tdone > .tdone-summary::marker { content: ""; }
+.tdone > .tdone-summary::before {
   content: "\25B8"; /* ▸ */
   flex: none;
   font-size: 10px;
   transition: transform .15s ease;
 }
-.task-done[open] > .task-done-summary::before { transform: rotate(90deg); }
-.task-done > .task-done-summary:hover { color: var(--ink-2); }
-
-/* 活动分组里的活动子标题：`星巴克协作 · 可领 0 · 已领 0/3`（占整行，作为后续任务行的分级标题）。
-   必须与「活动任务」组头、普通任务行都不同 —— 次级层次：字号更小、更靠右缩进、左侧细线、底色更弱。 */
-.task-act-row > td {
-  padding: 6px 8px 3px 26px;
-  background: var(--surface-2);
-  border-left: 2px solid var(--line-strong);
-}
-.task-act-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
-.task-act-head-name { font-weight: 600; color: var(--ink-2); font-size: 11px; }
-.task-act-head-sep { color: var(--ink-3); }
-.task-act-head-meta { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-3); }
-
-/* 三个分组的表列定宽：跨组对齐（活动分组与「已完成」折叠块也是 .tbl-tasks）。
-   窄屏表格降级为卡片（@media 640px）时节宽与 colgroup 一并失效。 */
-.tbl-tasks { table-layout: fixed; }
-.tbl-tasks col.col-pick { width: 30px; }
-.tbl-tasks col.col-status { width: 96px; }
-.tbl-tasks col.col-prog { width: 126px; }
-.tbl-tasks col.col-reward { width: 76px; }
-.tbl-tasks col.col-act { width: 152px; }
+.tdone[open] > .tdone-summary::before { transform: rotate(90deg); }
+.tdone > .tdone-summary:hover { color: var(--ink-2); }
+.tdone .trow-title { color: var(--ink-2); font-weight: 450; }
 
 /* 连登日历：7 列小格子（周一…周日），只画最近 28 天（4–5 行、约 75px 高）。
    每格 12px，score=0 用中性色，>0 用强调色 + 透明度分 3 档
@@ -1969,11 +2034,32 @@ details[open] > .heat-summary::before { transform: rotate(45deg); margin-top: 0;
 
   .banners { padding: 0 16px 10px; }
   .acct-intl { padding: 8px 16px 0; }
-  .acct-tasks .tbl-wrap { padding: 2px 16px 10px; }
   .task-sel-bar { padding-left: 16px; padding-right: 16px; }
-  /* 任务分组的标题头 / 「已完成」折叠条与任务表左内边距对齐（16px） */
-  .task-group-head { padding-left: 13px; padding-right: 16px; }
-  .task-done > .task-done-summary { padding-left: 16px; padding-right: 16px; }
+  .snap-stale { padding-left: 16px; padding-right: 16px; }
+  .campaign-notes { padding-left: 16px; padding-right: 16px; }
+
+  /* 任务清单窄屏（≤820px）：六格网格压成三行紧凑条目 ——
+     ① 勾选 + 标题 + 状态徽章；② 进度 + 奖励（右对齐）；③ 操作。
+     勾选格纵跨三行；无横向溢出（主列 minmax(0,1fr)，长标题/code 换行）。 */
+  .trow {
+    grid-template-columns: 24px minmax(0, 1fr) auto;
+    grid-template-areas:
+      "pick main status"
+      "pick prog reward"
+      "pick act act";
+    gap: 3px 10px;
+    padding: 8px 16px;
+  }
+  .trow-pick { align-self: start; padding-top: 3px; }
+  .trow-status { justify-self: end; align-self: start; }
+  .trow-prog { align-self: center; }
+  .trow-reward { justify-self: end; align-self: center; }
+  .trow-act { padding-top: 2px; }
+  .trow-act .row-actions { justify-content: flex-start; }
+  /* 组头 / 活动子标题 / 「已完成」折叠条与清单左内边距对齐（16px） */
+  .tgroup-head { padding: 9px 16px 7px; }
+  .tact-head { padding: 8px 16px 2px 28px; }
+  .tdone > .tdone-summary { padding-left: 16px; padding-right: 16px; }
   /* 窄屏：连登信息在昵称右边放不下时就整块落到下一行（账号列只有一列宽） */
   .acct-id { flex-wrap: wrap; }
   .heat-panel { padding: 9px 16px; }
@@ -2057,20 +2143,21 @@ details[open] > .heat-summary::before { transform: rotate(45deg); margin-top: 0;
   .detail-cell, .prog-cell { max-width: none; }
   .prog-cell { flex: 1 1 auto; }
 
-  /* 任务 / 步骤 / 历史：窄屏不摊成六行高卡片，压成三行紧凑条目 */
-  .tbl-steps tr, .tbl-history tr, .tbl-tasks tr {
+  /* 步骤 / 历史：窄屏不摊成六行高卡片，压成三行紧凑条目
+     （任务清单 .trow 已是 div 网格，≤820px 自带紧凑布局，不参与 .tbl 卡片化） */
+  .tbl-steps tr, .tbl-history tr {
     display: grid;
     gap: 3px 10px;
     margin-bottom: 6px;
     padding: 9px 12px;
   }
-  .tbl-steps td, .tbl-history td, .tbl-tasks td {
+  .tbl-steps td, .tbl-history td {
     display: block;
     padding: 0;
     border: 0;
     text-align: left;
   }
-  .tbl-steps td::before, .tbl-history td::before, .tbl-tasks td::before { display: none; }
+  .tbl-steps td::before, .tbl-history td::before { display: none; }
 
   .tbl-steps tr { grid-template-columns: minmax(0, 1fr) auto auto; }
   .tbl-steps td[data-label="账号"] { grid-column: 1; grid-row: 1; }
@@ -2088,30 +2175,6 @@ details[open] > .heat-summary::before { transform: rotate(45deg); margin-top: 0;
   .tbl-history td[data-label="腿"] { grid-column: 2; grid-row: 3; justify-self: center; font-size: 10.5px; color: var(--ink-3); }
   .tbl-history td[data-label="收益"] { grid-column: 3; grid-row: 3; justify-self: end; font-size: 11px; }
   .tbl-history td[data-label="触发"] { display: none; }
-
-  .tbl-tasks tr { grid-template-columns: auto minmax(0, 1fr) auto; }
-  .tbl-tasks td[data-label="选"] { grid-column: 1; grid-row: 1; align-self: start; padding-top: 2px; }
-  .tbl-tasks td[data-label="任务"] { grid-column: 2 / -1; grid-row: 1; }
-  .tbl-tasks td[data-label="状态"] { grid-column: 1; grid-row: 2; }
-  .tbl-tasks td[data-label="进度"] { grid-column: 2; grid-row: 2; }
-  .tbl-tasks td[data-label="奖励"] { grid-column: 3; grid-row: 2; justify-self: end; font-size: 11px; }
-  .tbl-tasks td[data-label="操作"] { grid-column: 1 / -1; grid-row: 3; }
-  .tbl-tasks .prog-cell { min-width: 0; }
-  /* 卡片化后 colgroup 无意义，隐藏避免怪布局；活动子标题行整行铺开 */
-  .tbl-tasks colgroup { display: none; }
-  .tbl-tasks .task-act-row { display: block; }
-  .tbl-tasks .task-act-row > td { display: block; padding: 4px 12px; }
-  .tbl-tasks .task-act-row > td::before { content: none; }
-
-  /* 账号卡片里的任务表：去掉双层边框，和卡片对齐 */
-  .acct-tasks .tbl tr {
-    margin-bottom: 0;
-    border: 0;
-    border-bottom: 1px solid var(--line);
-    border-radius: 0;
-    background: transparent;
-  }
-  .acct-tasks .tbl tr:last-child { border-bottom: none; }
 
   .toasts { left: 12px; right: 12px; bottom: 12px; justify-items: stretch; }
   .toast { max-width: none; }
