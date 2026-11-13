@@ -1241,6 +1241,75 @@ export async function startDaemon(opts = {}) {
     }
   }
 
+  // ---- 活动缓存收尾刷新（CONTRACT §11.5：job 结束写回 state/campaign.json）--
+  // job 真跑过 campaign 腿的账号，收尾时静默 fetchCampaignState 写回
+  // state/campaign.json —— 让看板活动明细在 job 完成后自动更新（不再要求用户
+  // 手动点「刷新快照」）。调用方（finalizeJob）按 step.leg === "campaign" 过滤，
+  // 没跑 campaign 腿的账号不进这里（没跑就查一次上游是浪费）。节奏与
+  // refreshSnapshots 同款：每账号前 ≥1s 限速红线 + 账号间隔 1500ms，上游调用
+  // 经 engineOpts() 的全局节流器排队（绝不绕过铁律 4）；有 job 在跑就让路。
+  // 失败只记日志（restricted 也只是失败文案，绝不在收尾路径冻结账号），绝不抛、
+  // 绝不影响 job 结论 —— 调用点 fire-and-forget（.catch(() => {})）。
+  async function refreshCampaignAfterJob(uids) {
+    const fn = engine?.campaign?.fetchCampaignState
+    if (typeof fn !== "function") return
+    for (const uid of uids) {
+      if (runner?.current()) return // 有 job 在跑就让路，别跟它抢限速窗口（同 refreshSnapshots）
+      const acct = accountByUid(uid)
+      if (!acct) continue
+      try {
+        await sleepFn(1000) // 限速红线：与上一轮上游调用（可能是刚结束的 job）之间 ≥1s
+        const state = await fn(acct, engineOpts(acct))
+        if (state?.ok) {
+          // 只写缓存投影（与 fetchCampaignForUid 成功路径同一落点）：/api/state
+          // 的 accounts[].campaign 与 GET /api/campaign 的 TTL（state.updatedISO）
+          // 从下一次读取起自动看到新值。
+          campaignCache[uid] = state
+          saveCampaign()
+        } else {
+          log(`[campaign] ${uid} 刷新失败：${scrub(String(state?.error || state?.msg || "活动任务读取失败"))}`)
+        }
+      } catch (e) {
+        log(`[campaign] ${uid} 刷新失败：${shortErr(e)}`)
+      }
+      await sleepFn(1500) // 账号间隔
+    }
+  }
+
+  // ---- 连登缓存收尾刷新（§11.5 对称缺口：job 结束写回 state/streak.json）----
+  // 前端「跑一轮」改走 job 后，连登天数/补签卡/抽奖数不再有 POST /api/streak/run
+  // 的返回值可即时回填 —— job 真跑过 streak 腿的账号，收尾时静默
+  // fetchStreakState 写回 state/streak.json（与 GET /api/streak 成功路径同一
+  // 落点；/api/state 投影与 TTL 依据 updatedISO 自动看到新值）。触发条件、节奏、
+  // 失败口径与 refreshCampaignAfterJob 完全同款：调用方（finalizeJob）按
+  // step.leg === "streak" 且非 skip 过滤（腿没跑/冻结跳过都不刷），两条刷新在
+  // finalizeJob 里串行执行（绝不并发打上游），每账号前 ≥1s 限速红线 + 账号
+  // 间隔 1500ms，上游调用经 engineOpts() 的全局节流器排队；有 job 在跑就让路；
+  // 失败只记日志，绝不抛、绝不影响 job 结论。
+  async function refreshStreakAfterJob(uids) {
+    const fn = engine?.streak?.fetchStreakState
+    if (typeof fn !== "function") return
+    for (const uid of uids) {
+      if (runner?.current()) return // 有 job 在跑就让路，别跟它抢限速窗口（同 refreshSnapshots）
+      const acct = accountByUid(uid)
+      if (!acct) continue
+      try {
+        await sleepFn(1000) // 限速红线：与上一轮上游调用（可能是刚结束的 job）之间 ≥1s
+        const state = await fn(acct, engineOpts(acct))
+        if (state?.ok) {
+          // 只写缓存投影（与 fetchStreakForUid 成功路径同一落点）
+          streakCache[uid] = state
+          saveStreak()
+        } else {
+          log(`[streak] ${uid} 刷新失败：${scrub(String(state?.error || state?.msg || "连登状态查询失败"))}`)
+        }
+      } catch (e) {
+        log(`[streak] ${uid} 刷新失败：${shortErr(e)}`)
+      }
+      await sleepFn(1500) // 账号间隔
+    }
+  }
+
   // ---- 历史（每次尝试一行） ----------------------------------------------
 
   // 历史 trigger 口径（看板「触发」列）：触发方式住在 job.spec.trigger
@@ -1338,6 +1407,37 @@ export async function startDaemon(opts = {}) {
     const steps = Array.isArray(job.steps) ? job.steps : []
     const uids = [...new Set(steps.map((s) => s.uid).filter(Boolean))]
     if (uids.length) refreshSnapshots(uids, 12000).catch(() => {})
+    // 活动缓存收尾刷新（CONTRACT §11.5）：只刷真跑过 campaign 腿的账号 ——
+    // 腿没跑（无 campaign step）或整账号冻结跳过的（step.state === "skip"，
+    // 上游一个活动请求都没发过）都不刷，没跑就查一次上游是浪费。收尾是
+    // fire-and-forget：失败只记日志，绝不影响 job 结论。
+    const campaignUids = [
+      ...new Set(
+        steps
+          .filter((s) => s.leg === "campaign" && s.state !== "skip")
+          .map((s) => s.uid)
+          .filter(Boolean),
+      ),
+    ]
+    // 连登缓存收尾刷新（§11.5 对称缺口）：同款条件 —— 前端「跑一轮」改走 job
+    // 后，连登天数/补签卡/抽奖数不再有同步路由的返回值可回填，靠这里写回
+    // state/streak.json 让看板自动更新。
+    const streakUids = [
+      ...new Set(
+        steps
+          .filter((s) => s.leg === "streak" && s.state !== "skip")
+          .map((s) => s.uid)
+          .filter(Boolean),
+      ),
+    ]
+    // 两条收尾刷新串行执行（campaign → streak）：全局节流器本就把上游调用排成
+    // 队，这里再把两个刷新巡回也串起来 —— 绝不并发打上游；中途有新 job 启动时
+    // 各自让路。fire-and-forget：失败只记日志，绝不影响 job 结论。
+    const refreshCachesAfterJob = async () => {
+      if (campaignUids.length) await refreshCampaignAfterJob(campaignUids)
+      if (streakUids.length) await refreshStreakAfterJob(streakUids)
+    }
+    if (campaignUids.length || streakUids.length) refreshCachesAfterJob().catch(() => {})
   }
 
   function watchJobTick() {

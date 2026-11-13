@@ -676,7 +676,18 @@ export async function runCampaignTasks(acct, opts = {}) {
     }
   }
 
-  if (earned > 0) emit(`🎪 活动任务本轮入账 ${earned} 积分`);
+  // 收尾一行（CONTRACT §11.5 步骤粒度）：runner 的 step.detail 取 logs 最后一条
+  // → SSE 步骤/历史文案 —— 只报总数看不出来自哪个活动，点名有领奖的活动与项数
+  //（actions.claimed 是任务 code，按 spec.tasks 的 task 归属到活动）。
+  if (earned > 0) {
+    const parts = wanted
+      .map((spec) => {
+        const n = actions.claimed.filter((c) => spec.tasks.some((t) => t.task === c)).length;
+        return n ? `${spec.label}×${n}` : "";
+      })
+      .filter(Boolean);
+    emit(`🎪 活动任务本轮入账 ${earned} 积分${parts.length ? `（${parts.join("、")}）` : ""}`);
+  }
   const result = {
     ok: !failed && !restricted,
     earned,

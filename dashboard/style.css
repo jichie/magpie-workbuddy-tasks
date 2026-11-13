@@ -1807,8 +1807,43 @@ dialog::backdrop { background: rgba(8, 10, 14, .5); }
 .campaign-list[open] > .campaign-list-summary::before { transform: rotate(45deg); margin-top: 0; }
 .campaign-list-summary:hover { color: var(--ink); }
 .campaign-list-label { font-weight: 600; color: var(--ink-2); }
-.campaign-list-body { padding-top: 4px; display: flex; flex-direction: column; gap: 2px; }
-.campaign-act { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; margin-top: 2px; }
+.campaign-list-body { padding-top: 4px; display: flex; flex-direction: column; gap: 3px; }
+/* 单个活动分组（CONTRACT §11.5）：标题 = 活动名 + 可领 / 已领；已完成的活动默认折叠、整体压暗。
+   每个活动一个独立 <details>，两个活动绝不混成一坨。 */
+.campaign-act-group { min-width: 0; }
+.campaign-act-group > .campaign-act {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 2px;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+}
+.campaign-act-group > .campaign-act::-webkit-details-marker { display: none; }
+.campaign-act-group > .campaign-act::marker { content: ""; }
+.campaign-act-group > .campaign-act::before {
+  content: "";
+  width: 4px;
+  height: 4px;
+  flex: none;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform .15s ease;
+  margin-top: -2px;
+}
+.campaign-act-group[open] > .campaign-act::before { transform: rotate(45deg); margin-top: 0; }
+.campaign-act-group > .campaign-act:hover { color: var(--ink); }
+.campaign-act-body { display: flex; flex-direction: column; gap: 2px; padding: 2px 0 3px 4px; }
+.campaign-act-done > .campaign-act { color: var(--ink-3); }
+.campaign-act-done-tag {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--ok);
+  white-space: nowrap;
+}
 .campaign-act-label { font-weight: 600; color: var(--ink-2); font-size: 10.5px; }
 .campaign-act-meta { font-family: var(--font-mono); font-size: 10px; color: var(--ink-3); }
 .campaign-task {

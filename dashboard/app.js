@@ -139,8 +139,12 @@ const state = {
   heatOpen: new Set(), // 展开连登日历的 uid（默认折叠；轮询重绘不丢状态）
   campaignBusy: new Set(), // 活动任务查询/运行正在请求中的 uid（防重复并发）
   campaignErrors: new Map(), // uid -> string：活动任务查询失败原因（显示在活动任务条里，不弹错）
-  campaignRuns: new Map(), // uid -> {ok, text}：最近一次「活动任务」结果（跨重绘保留，不静默）
+  campaignRuns: new Map(), // uid -> {ok, text}：最近一次「活动任务」结果（来自 job 的 campaign 腿步骤；跨重绘保留，不静默）
   campaignOpen: new Set(), // 展开「活动任务明细」小列表的 uid（默认折叠；轮询重绘不丢状态）
+  campaignActFold: new Map(), // `${uid}::${code}` -> bool：单个活动分组是否展开（用户手动定过；未定过按「未完成默认展开」）
+  campaignJobIds: new Map(), // uid -> jobId：本看板为某账号「跑一轮活动任务」起的 job（驱动按钮禁用 + 收尾补查活动缓存）
+  streakJobId: "", // 本看板起的「连登管家」job id（收尾时把该轮 streak 腿步骤回填到各行最近一次结果）
+  lastSeenJobId: "", // 最近一次在 /api/state 里看到的运行中 job id（SSE 掉线时轮询兜底判断收尾）
   unfreezing: new Set(), // 「恢复」正在请求中的 uid（期间禁用该行按钮）
   busy: false, // 批量操作进行中
   lastFinished: null, // 最近一个结束的 job（SSE 收尾广播）
@@ -2803,64 +2807,33 @@ export function streakResultText(r, who) {
   return `${name}：连登管家${head}${tail}${msgPart}`;
 }
 
-// 用运行结果里的 detail 更新行内数字（同一轮上游读到的值 → 比等下一次查询更即时）。
-// 只在已经查过（本地有状态）时合并：不凭一条运行结果凭空造出连登状态。
-function mergeStreakDetail(uid, detail) {
-  if (!detail || typeof detail !== "object") return;
-  const cur = streakCache.get(uid) ?? accountByUid(uid)?.streak;
-  if (!cur || typeof cur !== "object") return;
-  const next = { ...cur };
-  for (const k of ["days", "makeupCards", "lotteryChances"]) {
-    const v = Number(detail[k]);
-    if (Number.isFinite(v)) next[k] = v;
-  }
-  applyStreak(uid, next);
-}
-
-function rememberStreakRun(uid, row, who) {
-  const key = String(uid ?? "").trim();
-  // 没有 row（后端没给这个账号的结果）不算成功：如实标红，不静默
-  const ok = !!row && String(row.outcome ?? "") !== "failed";
-  const text = row ? streakResultText(row, who) : `${who}：连登管家没有返回结果`;
-  if (!key) return { ok: false, text: text || `${who}：连登管家没有返回结果` };
-  state.streakRuns.set(key, { ok, text });
-  return { ok, text };
-}
+// （0.3.5 §11.5）连登管家改走 job 后，各行「最近一次连登管家结果」由 job 的 streak 腿步骤渲染
+//（rememberStreakStep / settleTrackedJob），不再有 /api/streak/run 的 results[] 可合并 —— 原
+// mergeStreakDetail / rememberStreakRun 随之删除。streakResultText 保留为契约形状的纯函数出口。
 
 // 0.3.4：账号行里的「连登管家」按钮已删（用户口径：连登管家在批量条上已经有一个了）。
 // 单账号要跑就连登写清 uid 走批量接口 POST /api/streak/run {uids:[uid]}；界面入口统一在批量条。
 
-// 批量「连登管家」（批量操作条）：作用于勾选账号；未勾选 = 全部可参与账号（同 /api/checkin 口径）
+// 批量「连登管家」（批量操作条）：作用于勾选账号；未勾选 = 全部可参与账号（同 /api/run 口径）。
+// 0.3.5（CONTRACT §11.5）：改走 job（POST /api/run {legs:["streak"]}），实时步骤 / 日志由既有 SSE 推给
+// 「实时进度」区，结果进「历史」，与「批量做任务」完全同款；不再从看板调 POST /api/streak/run（该路由保留给 MCP / 外部）。
 async function runStreakSelected() {
   await withBusy(async () => {
     const uids = [...state.selected];
-    setBatchStatus("连登管家运行中…（补签 → 礼包/补偿 → 档位兑换 → 抽奖；账号之间守护进程会间隔至少 1.5 秒）");
+    const body = { legs: ["streak"] };
+    if (uids.length) body.uids = uids;
+    setBatchStatus(`正在启动连登管家：${uids.length ? `${uids.length} 个账号` : "全部可参与账号"}（补签 → 礼包/补偿 → 档位兑换 → 抽奖）…`);
     try {
-      const body = uids.length ? { uids } : {};
-      const r = await api("api/streak/run", { method: "POST", body });
-      const list = Array.isArray(r?.results) ? r.results : [];
-      if (!list.length) {
-        setBatchStatus("连登管家完成：没有可运行的账号。");
-        return;
-      }
-      let earned = 0;
-      let failed = 0;
-      const lines = list.map((row) => {
-        const ruid = String(row?.uid ?? "");
-        const who = accountByUid(ruid)?.nickname || ruid || "—";
-        const { ok, text } = rememberStreakRun(ruid, row, who);
-        if (!ok) failed++;
-        earned += streakNum(row?.earned);
-        if (row?.detail) mergeStreakDetail(ruid, row.detail);
-        return text;
-      });
-      const head = `连登管家完成：${list.length} 个账号 · 共 +${fmtNum(earned)} 积分${failed ? ` · ${failed} 个失败` : ""}`;
-      setBatchStatus(`${head}\n${lines.join("\n")}`);
-      toast(head, failed ? "warn" : "info", failed ? 9000 : 6500);
+      const r = await api("api/run", { method: "POST", body });
+      const jobId = r?.job?.id ? String(r.job.id) : "";
+      state.streakJobId = jobId; // 收尾时按该轮的 streak 腿步骤回填各行最近一次结果
+      setBatchStatus(`已启动 ${jobId || "连登管家"}：进度见「实时进度」区（SSE 推送）。`);
+      state.lastFinished = null;
       await loadState();
+      connectSSE();
     } catch (e) {
       setBatchStatus("");
-      humanErr(e, "连登管家失败");
+      humanErr(e, "启动连登管家失败");
     }
   });
 }
@@ -3021,9 +2994,47 @@ function campaignActivities(st) {
     : [];
 }
 
+// 任务是否已领（claimedAt 非空）。
+function campaignTaskClaimed(t) {
+  return String(t?.claimedAt ?? "").trim() !== "";
+}
+
+// 活动已领数：claimed 是数字就用它；null / "" / 缺失（没给）退回按任务的 claimedAt 计数
+// —— 不把「没给」当 0。
+function campaignClaimedCount(act) {
+  const tasks = Array.isArray(act?.tasks) ? act.tasks : [];
+  const hasCount = act?.claimed != null && act.claimed !== "" && Number.isFinite(Number(act.claimed));
+  return hasCount ? campaignNum(act.claimed) : tasks.filter(campaignTaskClaimed).length;
+}
+
+// 活动是否「已完成」（CONTRACT §11.5 口径）：可领 0 且全部任务 claimedAt 非空。
+// 没有任务的活动（tasks 为空）按「全部已领」成立，也归入已完成 —— 没什么可做的就该折叠下去。
+function campaignActDone(act) {
+  if (campaignNum(act?.claimable) !== 0) return false;
+  const tasks = Array.isArray(act?.tasks) ? act.tasks : [];
+  return tasks.every(campaignTaskClaimed);
+}
+
+// 活动排序：未完成在前、已完成在后（稳定：同组保持后端给的原始顺序）。
+function campaignSortedActivities(acts) {
+  return acts
+    .map((act, i) => ({ act, i }))
+    .sort((a, b) => (campaignActDone(a.act) ? 1 : 0) - (campaignActDone(b.act) ? 1 : 0) || a.i - b.i)
+    .map((x) => x.act);
+}
+
+// 活动内任务排序：未领在前、已领在后（稳定）。
+function campaignSortedTasks(tasks) {
+  return tasks
+    .map((t, i) => ({ t, i }))
+    .sort((a, b) => (campaignTaskClaimed(a.t) ? 1 : 0) - (campaignTaskClaimed(b.t) ? 1 : 0) || a.i - b.i)
+    .map((x) => x.t);
+}
+
 // 一行汇总文案：`活动任务：星巴克协作 2/3 · 记者节福利 0/3 · 可领 1`。
 // 每个活动显示「已领 / 总数」（claimed 优先，缺字段时按任务 claimedAt 计数）；末尾附可领合计。
 // 没有任何活动 = 「活动任务：未查询」（诚实口径 —— 绝不显示成 0/0 假装查过）。
+// 摘要保持后端给的原始活动顺序（明细区才做未完成/已完成排序，两处口径互不影响）。
 // 纯函数（导出仅供 Node 下校验）。
 export function campaignSummaryText(st) {
   const acts = campaignActivities(st);
@@ -3031,19 +3042,15 @@ export function campaignSummaryText(st) {
   const parts = acts.map((act) => {
     const label = String(act?.label ?? act?.code ?? "活动").trim() || "活动";
     const tasks = Array.isArray(act?.tasks) ? act.tasks : [];
-    // claimed 是数字就用它；null / "" / 缺失（没给）退回按任务的 claimedAt 计数 —— 不把「没给」当 0
-    const hasCount = act?.claimed != null && act.claimed !== "" && Number.isFinite(Number(act.claimed));
-    const claimed = hasCount
-      ? campaignNum(act.claimed)
-      : tasks.filter((t) => String(t?.claimedAt ?? "").trim()).length;
-    return `${label} ${claimed}/${tasks.length}`;
+    return `${label} ${campaignClaimedCount(act)}/${tasks.length}`;
   });
   const claimable = acts.reduce((n, act) => n + campaignNum(act?.claimable), 0);
   return `活动任务：${parts.join(" · ")} · 可领 ${claimable}`;
 }
 
-// 活动任务明细小列表（默认折叠）：活动 → 任务名 + 进度 / 奖励 + 已领标记。
-// 展开状态按 uid 记在 state.campaignOpen —— 3 秒轮询重建 DOM 不会把它折回去。
+// 活动任务明细小列表（默认折叠）：活动分组 → 任务名 + 进度 / 奖励 + 已领标记。
+// 排序（CONTRACT §11.5）：活动之间「未完成在前、已完成在后并默认折叠」；活动内部「未领在前、已领在后」。
+// 折叠状态：账号级明细记 state.campaignOpen，单个活动记 state.campaignActFold —— 3 秒轮询重建 DOM 不会把它折回去。
 function campaignListBlock(a, st) {
   const uid = String(a.uid ?? "");
   const acts = campaignActivities(st);
@@ -3060,21 +3067,44 @@ function campaignListBlock(a, st) {
     el("span", { class: "campaign-list-label", text: `活动任务明细 · ${acts.length} 个活动 / ${taskCount} 项` }),
   );
   const body = el("div", { class: "campaign-list-body" });
-  for (const act of acts) {
-    const tasks = Array.isArray(act?.tasks) ? act.tasks : [];
-    const actLabel = String(act?.label ?? act?.code ?? "活动").trim() || "活动";
-    body.append(
-      el("div", { class: "campaign-act" },
-        el("span", { class: "campaign-act-label", text: actLabel }),
-        el("span", { class: "campaign-act-meta", text: `可领 ${campaignNum(act?.claimable)}` }),
-      ),
-    );
-    if (!tasks.length) {
-      body.append(el("div", { class: "campaign-task campaign-task-empty", text: "该活动暂无任务" }));
-      continue;
-    }
-    for (const t of tasks) {
-      const claimed = String(t?.claimedAt ?? "").trim() !== "";
+  for (const act of campaignSortedActivities(acts)) body.append(campaignActGroup(uid, act));
+  details.append(summary, body);
+  details.addEventListener("toggle", () => {
+    if (details.open) state.campaignOpen.add(uid);
+    else state.campaignOpen.delete(uid);
+  });
+  return details;
+}
+
+// 单个活动分组（可折叠）：标题 = 活动名 + 「可领 N」+「已领 x/y」（已完成再挂一枚「已完成」）。
+// 分组标题与任务行分属两个块，两个活动绝不混成一坨；任务按「未领在前、已领在后」排。
+// 已完成的活动默认折叠；用户手动展开/收起的意图记进 state.campaignActFold，轮询重绘不丢。
+function campaignActGroup(uid, act) {
+  const code = String(act?.code ?? act?.label ?? "");
+  const key = `${uid}::${code}`;
+  const done = campaignActDone(act);
+  const tasks = Array.isArray(act?.tasks) ? act.tasks : [];
+  const group = el("details", {
+    class: done ? "campaign-act-group campaign-act-done" : "campaign-act-group",
+    dataset: { campaignAct: key },
+  });
+  const open = state.campaignActFold.has(key) ? !!state.campaignActFold.get(key) : !done;
+  if (open) group.open = true;
+  const label = String(act?.label ?? act?.code ?? "活动").trim() || "活动";
+  const summary = el(
+    "summary",
+    { class: "campaign-act" },
+    el("span", { class: "campaign-act-label", text: label }),
+    el("span", { class: "campaign-act-meta", text: `可领 ${campaignNum(act?.claimable)}` }),
+    el("span", { class: "campaign-act-meta", text: `已领 ${campaignClaimedCount(act)}/${tasks.length}` }),
+    done ? el("span", { class: "campaign-act-done-tag", text: "已完成" }) : null,
+  );
+  const body = el("div", { class: "campaign-act-body" });
+  if (!tasks.length) {
+    body.append(el("div", { class: "campaign-task campaign-task-empty", text: "该活动暂无任务" }));
+  } else {
+    for (const t of campaignSortedTasks(tasks)) {
+      const claimed = campaignTaskClaimed(t);
       const reward = campaignNum(t?.credit);
       body.append(
         el("div", { class: "campaign-task" },
@@ -3090,12 +3120,11 @@ function campaignListBlock(a, st) {
       );
     }
   }
-  details.append(summary, body);
-  details.addEventListener("toggle", () => {
-    if (details.open) state.campaignOpen.add(uid);
-    else state.campaignOpen.delete(uid);
+  group.append(summary, body);
+  group.addEventListener("toggle", () => {
+    state.campaignActFold.set(key, group.open);
   });
-  return details;
+  return group;
 }
 
 // 账号单元格里的活动任务条（0.3.5）：与连登条同级别、同风格，紧跟在连登条下面。
@@ -3106,7 +3135,7 @@ function campaignCellBlock(a) {
   const st = campaignOf(a);
   const err = state.campaignErrors.get(uid);
   const run = state.campaignRuns.get(uid);
-  const busy = state.campaignBusy.has(uid);
+  const busy = state.campaignBusy.has(uid) || campaignJobRunning(uid);
   const kids = [];
 
   // 第 1 行：汇总文案（未查询 / 各活动 已领/总数 · 可领 N）
@@ -3119,7 +3148,7 @@ function campaignCellBlock(a) {
         : "活动任务：还没查过（点账号行「刷新快照」会顺带补查一次）",
     }),
   );
-  // 第 2 行：运行按钮（单账号 → POST /api/campaign/run {uids:[uid]}）
+  // 第 2 行：运行按钮（单账号 → POST /api/run {uids:[uid], legs:["campaign"]}，起 job 走既有 SSE）
   kids.push(
     el("div", { class: "campaign-actions" },
       el("button", {
@@ -3128,7 +3157,9 @@ function campaignCellBlock(a) {
         dataset: { campaignRun: uid },
         text: busy ? "运行中…" : "跑一轮活动任务",
         disabled: busy,
-        title: "POST /api/campaign/run {uids:[uid]}：只对这一个账号跑一轮运营活动任务（真实写动作）。活动任务与成长任务解耦，独立跑、独立记账。",
+        title:
+          'POST /api/run {uids:[uid], legs:["campaign"]}：起一轮 job，只对这一个账号跑运营活动任务' +
+          "（真实写动作），实时步骤 / 日志见「实时进度」区（SSE 推送）。活动任务与成长任务解耦，独立跑、独立记账。",
         onclick: () => runCampaignOne(uid),
       }),
     ),
@@ -3252,39 +3283,134 @@ export function campaignResultText(r, who) {
   return `${name}：活动任务${head}${tail}${msgPart}`;
 }
 
-function rememberCampaignRun(uid, row, who) {
+// 从 job 的步骤里取某账号某腿的最后一条（该腿的 campaign 步骤：状态 + detail）。
+function jobStepFor(job, uid, leg) {
+  const steps = Array.isArray(job?.steps) ? job.steps : [];
+  let found = null;
+  for (const s of steps) {
+    if (String(s?.uid ?? "") === String(uid) && String(s?.leg ?? "") === leg) found = s;
+  }
+  return found;
+}
+
+// job 步骤状态 → 人话（与 stepBadge 同一套取值；未知一律「结果未知」，绝不冒充成功）。
+function stepOutcomeHead(stateName) {
+  if (stateName === "fail") return "失败";
+  if (stateName === "skip") return "跳过";
+  if (stateName === "restricted") return "风控冷却";
+  if (stateName === "ok") return "完成";
+  return "结果未知";
+}
+
+// 该账号这一轮活动任务是否还在跑：由 job 状态驱动（/api/state 的 job / SSE 的 job 事件），
+// job 结束后 state.data.job 为空 → 自动恢复。
+// ① 本看板起的那一轮（state.campaignJobIds 记录在案）；② 兜底：当前 job 只跑 campaign 腿且点名了该账号
+//   （页面刷新后本地记录丢了也认得出，避免运行期间按钮又变可点）。
+function campaignJobRunning(uid) {
+  const j = state.data?.job;
+  if (!j) return false;
+  const key = String(uid);
+  const tracked = state.campaignJobIds.get(key);
+  if (tracked && tracked === String(j.id ?? "")) return true;
+  const legs = Array.isArray(j.spec?.legs) ? j.spec.legs : Array.isArray(j.legs) ? j.legs : [];
+  if (!legs.length || legs.some((l) => l !== "campaign")) return false;
+  const uids = Array.isArray(j.spec?.uids) ? j.spec.uids.map(String) : null;
+  if (uids && uids.includes(key)) return true;
+  return Array.isArray(j.steps) && j.steps.some((s) => String(s?.uid ?? "") === key && String(s?.leg ?? "") === "campaign");
+}
+
+// 用 job 步骤回填「该账号最近一次活动任务结果」那一行（批量条那套手法：结果来自 job.steps，不再是 results[]）。
+function rememberCampaignStep(uid, job, who) {
   const key = String(uid ?? "").trim();
-  // 没有 row（后端没给这个账号的结果）不算成功：如实标红，不静默
-  const ok = !!row && String(row.outcome ?? "") !== "failed";
-  const text = row ? campaignResultText(row, who) : `${who}：活动任务没有返回结果`;
-  if (key) state.campaignRuns.set(key, { ok, text });
+  const step = jobStepFor(job, uid, "campaign");
+  if (!key || !step) return null;
+  const stateName = String(step.state ?? "");
+  const detail = String(step.detail ?? "").trim();
+  const ok = stateName !== "fail" && stateName !== "restricted";
+  const text = `${who}：活动任务${stepOutcomeHead(stateName)}${detail ? `：${detail}` : ""}`;
+  state.campaignRuns.set(key, { ok, text });
   return { ok, text };
 }
 
-// 单账号「跑一轮活动任务」：POST /api/campaign/run {uids:[uid]}。
-// 结果进行内说明行 + toast（成功 / 失败都显示，绝不静默）；失败也要显示原因。
+// 「连登管家」job 收尾：把该轮 streak 腿步骤回填到各账号的最近一次结果行（保住既有那行，不因改走 job 而空掉）。
+function rememberStreakStep(uid, job, who) {
+  const key = String(uid ?? "").trim();
+  const step = jobStepFor(job, uid, "streak");
+  if (!key || !step) return null;
+  const stateName = String(step.state ?? "");
+  const detail = String(step.detail ?? "").trim();
+  const ok = stateName !== "fail" && stateName !== "restricted";
+  state.streakRuns.set(key, { ok, text: `${who}：连登管家${stepOutcomeHead(stateName)}${detail ? `：${detail}` : ""}` });
+  return { ok };
+}
+
+// job 收尾统一处理（SSE 收尾广播 / 轮询兜底都走这里）：
+//   ① 活动任务：清掉本地 job 记录 → 从步骤回填结果行 → 主动补查一次活动缓存（后端 finishJob 也会刷，这里双保险；409 busy 静默跳过）；
+//   ② 连登管家：清掉 job 记录 → 从步骤回填各行结果行。
+function settleTrackedJob(job) {
+  if (!job || !job.id) return;
+  const jobId = String(job.id);
+  for (const [uid, id] of [...state.campaignJobIds]) {
+    if (id !== jobId) continue;
+    state.campaignJobIds.delete(uid);
+    const who = accountByUid(uid)?.nickname || uid;
+    rememberCampaignStep(uid, job, who);
+    // 主动查一次明细（refresh=1）：成功就覆盖本地缓存并重绘；busy 静默跳过，其它失败照旧落条内说明行
+    queryCampaign(uid, { silent: true });
+    updateCampaignArea(uid);
+  }
+  if (state.streakJobId && state.streakJobId === jobId) {
+    state.streakJobId = "";
+    const steps = Array.isArray(job.steps) ? job.steps : [];
+    for (const s of steps) {
+      if (String(s?.leg ?? "") !== "streak") continue;
+      const uid = String(s?.uid ?? "");
+      if (!uid) continue;
+      rememberStreakStep(uid, job, accountByUid(uid)?.nickname || uid);
+    }
+  }
+}
+
+// job 收尾兜底（SSE 掉线只剩 3 秒轮询时）：/api/state 的 job 从「有」变「无」= 上一轮结束了。
+function reconcileJobs() {
+  const id = state.data?.job?.id ? String(state.data.job.id) : "";
+  const prev = state.lastSeenJobId;
+  if (prev && prev !== id) {
+    const finished = state.lastFinished && String(state.lastFinished.id ?? "") === prev ? state.lastFinished : null;
+    settleTrackedJob(finished ?? { id: prev, steps: [] });
+  }
+  state.lastSeenJobId = id;
+}
+
+// 单账号「跑一轮活动任务」：POST /api/run {uids:[uid], legs:["campaign"]}（与「批量做任务」同款，走 job）。
+// 实时步骤 / 日志由既有 SSE 推给「实时进度」区；按钮由 job 状态驱动禁用 / 恢复；结果从 job 的
+// campaign 腿步骤回填进行内说明行；job 结束后由 settleTrackedJob 补查一次活动明细。
 async function runCampaignOne(uid) {
   const who = accountByUid(uid)?.nickname || uid;
-  if (state.campaignBusy.has(uid)) return;
-  state.campaignBusy.add(uid);
+  if (state.campaignBusy.has(uid) || campaignJobRunning(uid)) return;
+  state.campaignBusy.add(uid); // 起 job 的这次请求期间先显示「运行中…」，拿到 job id 后交给 job 状态驱动
   updateCampaignArea(uid);
   try {
-    const r = await api("api/campaign/run", { method: "POST", body: { uids: [uid] } });
-    const list = Array.isArray(r?.results) ? r.results : [];
-    const row = list.find((x) => String(x?.uid ?? "") === uid) ?? list[0] ?? null;
-    const { ok, text } = rememberCampaignRun(uid, row, who);
-    toast(text, ok ? "info" : "warn", ok ? 6500 : 9000);
+    const r = await api("api/run", { method: "POST", body: { uids: [uid], legs: ["campaign"] } });
+    const jobId = r?.job?.id ? String(r.job.id) : "";
+    if (jobId) state.campaignJobIds.set(String(uid), jobId);
+    state.lastFinished = null;
     await loadState();
+    connectSSE();
   } catch (e) {
-    // 失败也要显示原因（别静默）：连不上的网络错误也如实说
-    const msg = e instanceof ApiError
-      ? humanizeApiErr(e.message || `HTTP ${e.status}`, e.data?.hint)
-      : e && e.network
-        ? "连不上守护进程"
-        : humanizeApiErr(String((e && e.message) || e));
-    const text = `${who}：活动任务失败 —— ${msg}`;
-    state.campaignRuns.set(uid, { ok: false, text });
-    toast(text, "warn", 9000);
+    // 已有 job 在跑（409）沿用与「批量做任务」一致的提示口径（humanErr 统一处理）。
+    if (e instanceof ApiError && e.status === 409) {
+      humanErr(e, "启动活动任务失败");
+    } else {
+      const msg = e instanceof ApiError
+        ? humanizeApiErr(e.message || `HTTP ${e.status}`, e.data?.hint)
+        : e && e.network
+          ? "连不上守护进程"
+          : humanizeApiErr(String((e && e.message) || e));
+      const text = `${who}：活动任务失败 —— ${msg}`;
+      state.campaignRuns.set(uid, { ok: false, text });
+      toast(text, "warn", 9000);
+    }
   } finally {
     state.campaignBusy.delete(uid);
     updateCampaignArea(uid);
@@ -4737,6 +4863,8 @@ function handleSSE(evt) {
     if (j.state === "done" || j.state === "error") {
       state.lastFinished = j;
       if (state.data) state.data.job = null;
+      state.lastSeenJobId = "";
+      settleTrackedJob(j); // 活动任务收尾补查 / 连登管家结果回填
       renderJob();
       renderTop();
       syncJobTimer();
@@ -4746,6 +4874,7 @@ function handleSSE(evt) {
       state.lastFinished = null;
       if (state.data) state.data.job = j;
       else state.data = { job: j };
+      state.lastSeenJobId = String(j.id ?? "");
       renderJob();
       renderTop();
       updateSelectionUI();
@@ -4834,6 +4963,7 @@ async function loadState({ quiet = false } = {}) {
       }
     }
     if (state.conn !== "stopped") state.conn = "online";
+    reconcileJobs(); // job 从「有」变「无」= 上一轮结束（SSE 掉线时靠这里兜底收尾）
     renderAll();
     autoFetchCredits();
   } catch (e) {
