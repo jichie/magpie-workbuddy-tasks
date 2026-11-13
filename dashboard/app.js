@@ -140,7 +140,6 @@ const state = {
   campaignBusy: new Set(), // 活动任务查询/运行正在请求中的 uid（防重复并发）
   campaignErrors: new Map(), // uid -> string：活动任务查询失败原因（显示在活动任务条里，不弹错）
   campaignRuns: new Map(), // uid -> {ok, text}：最近一次「活动任务」结果（来自 job 的 campaign 腿步骤；跨重绘保留，不静默）
-  taskGroupFold: new Map(), // `${uid}::${group}` -> bool：任务明细分组（成长/小程序/活动）是否展开（默认展开；轮询重绘不丢）
   taskDoneFold: new Map(), // `${uid}::${group}` -> bool：「已完成 N 项」折叠块是否展开（默认收起；用户手动展开过则记住）
   campaignJobIds: new Map(), // uid -> jobId：本看板为某账号「跑一轮活动任务」起的 job（驱动按钮禁用 + 收尾补查活动缓存）
   streakJobId: "", // 本看板起的「连登管家」job id（收尾时把该轮 streak 腿步骤回填到各行最近一次结果）
@@ -1174,7 +1173,7 @@ const REFRESH_NOTE = "点账号行右侧「刷新快照」读取（只读，不�
 
 // 一张任务明细、三个来源分组（CONTRACT §11.6）：成长任务 → 小程序任务 → 活动任务。
 // 分组按来源拆分（成长 = 快照里非 MP code；小程序 = isMPTask()；活动 = accounts[].campaign 投影），
-// 各分组标题带计数且可折叠（默认展开，折叠状态记 state.taskGroupFold，3 秒轮询重绘不丢）。
+// 各分组标题带计数、**恒展开、不可折叠**（纯标题头，无 <details>/折叠箭头/点击行为）。
 // 组内「未完成在上、已领奖沉底」：已领奖的任务收进一个默认收起的「已完成 N 项」<details>，
 // 用户手动展开过就记住（state.taskDoneFold）。空分组不渲染标题（否则会满屏空壳）。
 function taskTable(a) {
@@ -1215,10 +1214,6 @@ function emptyTaskText(snap) {
   if (!snap) return `快照为空，${REFRESH_NOTE}`;
   if (snapExpired(snap)) return `快照已过期（${fmtDateTime(snap.updatedISO)} 更新），${REFRESH_NOTE}`;
   return `快照为空（${fmtDateTime(snap.updatedISO)} 更新）：该账号当前没有任务，或上游返回为空。`;
-}
-
-function taskGroupOpen(key) {
-  return state.taskGroupFold.has(key) ? !!state.taskGroupFold.get(key) : true; // 默认展开
 }
 
 // 分组标题计数：`成长任务 · 12 项 · 待领 2`（活动组：总任务数 / 可领合计）。
@@ -1277,6 +1272,7 @@ function taskRowsTable(rows) {
 }
 
 // 「已完成 N 项」折叠块：默认收起；用户手动展开过就记住（state.taskDoneFold）。
+// 块内每行都是已领奖的行，一律不给勾选框（见 stripPickCell）。
 function taskDoneBlock(key, rows) {
   const dk = `${key}::done`;
   const details = el("details", { class: "task-done", dataset: { taskDone: key } });
@@ -1288,31 +1284,34 @@ function taskDoneBlock(key, rows) {
       el("span", { text: `已完成 ${rows.length} 项` }),
     ),
   );
-  if (rows.length) details.append(taskRowsTable(rows));
+  if (rows.length) details.append(taskRowsTable(rows.map(stripPickCell)));
   details.addEventListener("toggle", () => state.taskDoneFold.set(dk, details.open));
   return details;
 }
 
-// 一个分组：<details> 包着标题（可折叠）+ 组体（未完成在前，已领奖收进「已完成」折叠块）。
+// 已领奖的行去掉勾选框：清空行首勾选单元格的内容（空 <td> 保留 —— 桌面端列宽与窄屏卡片
+// 的占位都不乱，只是这一格不再有 checkbox / 「选」提示）。
+function stripPickCell(tr) {
+  const td = tr && tr.firstElementChild;
+  if (td && td.classList && td.classList.contains("pick-cell")) td.replaceChildren();
+  return tr;
+}
+
+// 一个分组：纯标题头（**恒展开、不可折叠** —— 无 <details>/折叠箭头/点击行为）+ 组体
+// （未完成在前，已领奖收进「已完成」折叠块）。标题头的视觉与任务行、活动子标题明显分层，
+// 见 style.css 的 .task-group-head。
 function taskGroupBlock(a, g) {
-  const key = `${a.uid}::${g.key}`;
-  const details = el("details", { class: `task-group task-group-${g.key}`, dataset: { taskGroup: key } });
-  if (taskGroupOpen(key)) details.open = true;
-  details.append(
-    el(
-      "summary",
-      { class: "task-group-summary" },
-      el("span", { class: "task-group-title", text: g.title }),
-      el("span", { class: "task-group-count", text: groupCountText(g) }),
-      g.key === "campaign" ? campaignRunButton(a) : null,
-    ),
+  const head = el(
+    "div",
+    { class: `task-group-head task-group-head-${g.key}`, dataset: { taskGroup: `${a.uid}::${g.key}` } },
+    el("span", { class: "task-group-title", text: g.title }),
+    el("span", { class: "task-group-count", text: groupCountText(g) }),
+    g.key === "campaign" ? campaignRunButton(a) : null,
   );
   const body = el("div", { class: "task-group-body" });
   if (g.type === "campaign") fillCampaignGroup(a, body, g);
   else fillSnapGroup(a, body, g);
-  details.append(body);
-  details.addEventListener("toggle", () => state.taskGroupFold.set(key, details.open));
-  return details;
+  return el("div", { class: `task-group task-group-${g.key}` }, head, body);
 }
 
 // 成长 / 小程序组：未领奖（未接取 / 已接取 / 待领奖）在上；已领奖沉底并收进折叠块。
@@ -1325,7 +1324,11 @@ function fillSnapGroup(a, body, g) {
 
 // 活动组：活动作为子标题（`星巴克协作 · 可领 0 · 已领 0/3`），其未领任务行紧随其后；
 // 全部活动的已领任务统一沉底进一个「已完成 N 项」折叠块（活动名随行显示，上下文不丢）。
+// 组体最上方补一行状态说明（最近一次结果 / 查询失败）——活动摘要条从账号行移除后，
+// 这些「绝不静默」的诊断信息就近落在活动分组里。
 function fillCampaignGroup(a, body, g) {
+  const note = campaignStatusNote(a);
+  if (note) body.append(note);
   const claimed = [];
   for (const act of campaignSortedActivities(g.acts)) {
     const tasks = campaignSortedTasks(Array.isArray(act?.tasks) ? act.tasks : []);
@@ -1358,6 +1361,25 @@ function fillCampaignGroup(a, body, g) {
       ),
     );
   }
+}
+
+// 活动分组的状态说明行（原账号行活动条的那几行说明搬到这里）：最近一次结果 / 读取失败 /
+// 查询失败，三者按序叠加；全都没有 → null（不占位置）。沿用 .campaign-note 一族的样式。
+function campaignStatusNote(a) {
+  const uid = String(a.uid ?? "");
+  const st = campaignOf(a);
+  const err = state.campaignErrors.get(uid);
+  const run = state.campaignRuns.get(uid);
+  const kids = [];
+  if (run) kids.push(el("span", { class: run.ok ? "campaign-note campaign-run" : "campaign-note campaign-run warn-text", text: run.text, title: run.text }));
+  if (st?.ok === false && st.error) {
+    kids.push(el("span", { class: "campaign-note campaign-err warn-text", text: `活动任务读取失败：${String(st.error)}` }));
+  }
+  if (err) {
+    const t = `活动任务查询失败：${err}`;
+    kids.push(el("span", { class: "campaign-note campaign-err warn-text", text: t, title: t }));
+  }
+  return kids.length ? el("div", { class: "campaign-notes" }, ...kids) : null;
 }
 
 // 活动子标题：`星巴克协作 · 可领 0 · 已领 0/3`（`·` 是独立分隔 span，视觉与文本都对齐契约）。
@@ -1669,7 +1691,32 @@ function metric(value, label) {
   );
 }
 
-function snapMetrics(snap) {
+// 任务明细三组（成长/小程序/活动）的合并计数（用户 2026-11-13 追加口径）：
+//   total     = 成长 + 小程序 + 活动 三项之和（活动任务来自 accounts[].campaign 投影）；
+//   canAccept = 成长/小程序里 canAccept 的项数（活动任务没有「接取」概念，不计入）；
+//   pending   = 成长/小程序里 completed 的项数 + 活动任务里 completedAt 非空且 claimedAt 空 的项数；
+//   snapModern = 快照带判断字段才展示「可接取」那一项（老后端没有 canAccept 时不硬编造）。
+// 快照为空时只按活动算（campaign 存在也能出数字）。
+function detailTotals(a) {
+  const tasks = Array.isArray(a?.snapshot?.tasks) ? a.snapshot.tasks : [];
+  const flags = tasks.map(taskFlags);
+  let campTotal = 0;
+  let campPending = 0;
+  for (const act of campaignActivities(campaignOf(a))) {
+    const ts = Array.isArray(act?.tasks) ? act.tasks : [];
+    campTotal += ts.length;
+    campPending += ts.filter(campaignTaskClaimable).length;
+  }
+  return {
+    total: tasks.length + campTotal,
+    canAccept: flags.filter((f) => f.canAccept).length,
+    pending: tasks.filter((t) => String(t?.acceptStatus ?? "") === "completed").length + campPending,
+    snapModern: flags.some((f) => f.modern),
+  };
+}
+
+function snapMetrics(a) {
+  const snap = a?.snapshot;
   const c = snapCounts(snap);
   if (!c) {
     return el("span", {
@@ -1677,11 +1724,12 @@ function snapMetrics(snap) {
       text: "无快照：点「刷新快照」读取（只读，不接取、不上报）",
     });
   }
+  const t = detailTotals(a);
   const cells = [
-    metric(c.total, "任务总量"),
+    metric(t.total, "任务总量"), // 三组之和（成长 + 小程序 + 活动）
     metric(c.notAccepted, "未接取"),
     metric(c.accepted, "已接取"),
-    metric(c.pending, "待领奖"),
+    metric(t.pending, "待领奖"), // 成长/小程序 completed + 活动可领
     metric(c.claimed, "已领奖"),
   ];
   const flags = (snap.tasks ?? []).map(taskFlags);
@@ -1690,23 +1738,23 @@ function snapMetrics(snap) {
     cells.push(
       metric(n((f) => f.desktopOnly), "桌面端"),
       metric(n((f) => f.unforgeable), "无法自动化"),
-      metric(n((f) => f.canAccept), "可接取"),
+      metric(t.canAccept, "可接取"), // 成长/小程序 canAccept（活动无「接取」概念）
     );
   }
   return el("span", { class: "acct-metrics" }, ...cells);
 }
 
-// 折叠标题只留一行紧凑文字（完整汇总在 title）：任务明细 · 19 项 · 可接取 5 · 待领奖 0。
-// 数字与 snapMetrics/taskSummary 同源；老后端没有 canAccept 字段时不硬编造这一项。
-function snapBrief(snap) {
+// 折叠标题只留一行紧凑文字（完整汇总在 title）：任务明细 · N 项 · 可接取 x · 待领奖 y。
+// N / 待领奖按三组之和（成长 + 小程序 + 活动），可接取只算成长/小程序（活动任务没有「接取」
+// 概念）。仅当快照带判断字段时才展示「可接取」这一项（老后端不硬编造）。
+function snapBrief(a) {
+  const snap = a?.snapshot;
   const c = snapCounts(snap);
   if (!c) return "任务明细 · 无快照";
-  const parts = ["任务明细", `${c.total} 项`];
-  const flags = (snap.tasks ?? []).map(taskFlags);
-  if (flags.some((f) => f.modern)) {
-    parts.push(`可接取 ${flags.filter((f) => f.canAccept).length}`);
-  }
-  parts.push(`待领奖 ${c.pending}`);
+  const t = detailTotals(a);
+  const parts = ["任务明细", `${t.total} 项`];
+  if (t.snapModern) parts.push(`可接取 ${t.canAccept}`);
+  parts.push(`待领奖 ${t.pending}`);
   return parts.join(" · ");
 }
 
@@ -1865,13 +1913,13 @@ function accountRow(a) {
       },
       el("span", {
         class: expired ? "acct-tasks-label warn-text" : "acct-tasks-label",
-        text: snapBrief(a.snapshot),
+        text: snapBrief(a),
       }),
       el("span", { class: "acct-tasks-meta", text: snapMetaText }),
     ),
     // 连登日历搬进「任务明细」详情里（任务表上方，0.3.4）：它是「这个账号最近发生了什么」
     // 的明细，和任务表同属展开区；账号行只留昵称右侧那两行数字 + 档位。
-    el("div", { class: "acct-tasks-body" }, snapMetrics(a.snapshot), heatPanel(a), taskTable(a)),
+    el("div", { class: "acct-tasks-body" }, snapMetrics(a), heatPanel(a), taskTable(a)),
   );
   if (state.expanded.has(uid)) tasks.open = true;
   tasks.addEventListener("toggle", () => {
@@ -1885,20 +1933,20 @@ function accountRow(a) {
       class: frozen ? "acct acct-frozen" : "acct",
       role: "group",
       "aria-label": `账号 ${name}${frozen ? `（已冻结 ${frozenCode(frozen)}）` : ""}`,
+      dataset: { acct: uid }, // 锚点：updateCampaignArea() 用它找到整行 replaceWith 局部重绘
     },
     el(
       "div",
       { class: "acct-grid" },
       el("div", { class: "acct-cell acct-pick" }, el("label", { class: "check" }, check)),
-      // 账号单元格横向：左边昵称，右边紧跟连登两行 + 活动任务条（0.3.5）。
-      // .acct-id-stack 把「连登条 + 活动任务条」竖排（活动任务条在连登条下面）；
-      // 它只是包一层，不改连登条自身内容，也不动账号行其它列。
-      // 原来横跨整行的 .acct-streak（含按钮与日历）已取消。
+      // 账号单元格：左边昵称，右边紧跟连登两行。活动任务摘要条已移除（用户 2026-11-13：
+      // 「活动任务和跑一轮可以去掉了」）——活动任务的入口只剩任务明细「活动任务」分组标题
+      // 右侧那个「跑一轮活动任务」按钮。
       el(
         "div",
         { class: "acct-cell acct-id" },
         el("span", { class: "acct-name", text: name, title: nameTitle }),
-        el("div", { class: "acct-id-stack" }, streakCellBlock(a), campaignCellBlock(a)),
+        el("div", { class: "acct-id-stack" }, streakCellBlock(a)),
       ),
       statusCell,
       progressCell,
@@ -3317,30 +3365,12 @@ function campaignSortedTasks(tasks) {
     .map((x) => x.t);
 }
 
-// 一行汇总文案：`活动任务：星巴克协作 2/3 · 记者节福利 0/3 · 可领 1`。
-// 每个活动显示「已领 / 总数」（claimed 优先，缺字段时按任务 claimedAt 计数）；末尾附可领合计。
-// 没有任何活动 = 「活动任务：未查询」（诚实口径 —— 绝不显示成 0/0 假装查过）。
-// 摘要保持后端给的原始活动顺序（明细区才做未完成/已完成排序，两处口径互不影响）。
-// 纯函数（导出仅供 Node 下校验）。
-export function campaignSummaryText(st) {
-  const acts = campaignActivities(st);
-  if (!acts.length) return "活动任务：未查询";
-  const parts = acts.map((act) => {
-    const label = String(act?.label ?? act?.code ?? "活动").trim() || "活动";
-    const tasks = Array.isArray(act?.tasks) ? act.tasks : [];
-    return `${label} ${campaignClaimedCount(act)}/${tasks.length}`;
-  });
-  const claimable = acts.reduce((n, act) => n + campaignNum(act?.claimable), 0);
-  return `活动任务：${parts.join(" · ")} · 可领 ${claimable}`;
-}
+// 一行汇总文案 `活动任务：星巴克协作 2/3 · 可领 1` 与账号行活动摘要条已随「账号行的活动任务块」
+// 一起移除（用户 2026-11-13）：活动任务现在只在任务明细的「活动任务」分组里，分组标题右侧的
+// 「跑一轮活动任务」按钮是唯一入口（见 fillCampaignGroup / campaignStatusNote）。
 
-// 活动任务明细列表已按 CONTRACT §11.6 合并进「任务明细」的三个分组（见 taskTable /
-// fillCampaignGroup）；账号行下面的可折叠活动明细列表（.campaign-list）整块移除，
-// 账号行只保留一行「活动任务：… · 可领 N」摘要 + 「跑一轮活动任务」按钮。
-
-// 「跑一轮活动任务」按钮（CONTRACT §11.6 第 6 条）：账号行的活动条与「活动任务」分组标题右侧
-// 共用同一个按钮构造器 —— 两处触发同一路径 POST /api/run {uids:[uid], legs:["campaign"]}（起 job）。
-// 放在 <summary> 里时 preventDefault/stopPropagation，点按钮不连带折叠分组。
+// 「跑一轮活动任务」按钮（CONTRACT §11.6 第 6 条）：只出现在「活动任务」分组标题右侧。
+// 触发同一路径 POST /api/run {uids:[uid], legs:["campaign"]}（起 job，实时进度走既有 SSE）。
 function campaignRunButton(a) {
   const uid = String(a.uid ?? "");
   const busy = state.campaignBusy.has(uid) || campaignJobRunning(uid);
@@ -3354,7 +3384,7 @@ function campaignRunButton(a) {
       'POST /api/run {uids:[uid], legs:["campaign"]}：起一轮 job，只对这一个账号跑运营活动任务' +
       "（真实写动作），实时步骤 / 日志见「实时进度」区（SSE 推送）。活动任务与成长任务解耦，独立跑、独立记账。",
     onclick: (ev) => {
-      // summary 内的按钮：不让点击连带折叠/展开分组
+      // 分组标题头里也可能被点击：不连带其它默认行为
       if (ev && typeof ev.preventDefault === "function") ev.preventDefault();
       if (ev && typeof ev.stopPropagation === "function") ev.stopPropagation();
       runCampaignOne(uid);
@@ -3362,57 +3392,14 @@ function campaignRunButton(a) {
   });
 }
 
-// 账号单元格里的活动任务条（0.3.5）：与连登条同级别、同风格，紧跟在连登条下面。
-// 锚点 [data-campaign-cell="uid"] 供 updateCampaignArea() replaceWith 局部重绘（一账号一个）。
-// 额外说明行（最近一次结果 / 查询失败）只在有内容时追加，正常情况就是干净的一行 + 按钮。
-function campaignCellBlock(a) {
-  const uid = String(a.uid ?? "");
-  const st = campaignOf(a);
-  const err = state.campaignErrors.get(uid);
-  const run = state.campaignRuns.get(uid);
-  const kids = [];
-
-  // 第 1 行：汇总文案（未查询 / 各活动 已领/总数 · 可领 N）
-  kids.push(
-    el("span", {
-      class: st && campaignActivities(st).length ? "campaign-line" : "campaign-line campaign-empty",
-      text: st ? campaignSummaryText(st) : "活动任务：未查询",
-      title: st
-        ? "活动任务（CONTRACT §11.1）：每个活动显示「已领 / 总数」，可领 = 当前可领奖项数"
-        : "活动任务：还没查过（点账号行「刷新快照」会顺带补查一次）",
-    }),
-  );
-  // 第 2 行：运行按钮（单账号 → POST /api/run {uids:[uid], legs:["campaign"]}，起 job 走既有 SSE）
-  kids.push(el("div", { class: "campaign-actions" }, campaignRunButton(a)));
-  // 最近一次活动任务结果（含失败原因）：轮询重绘后仍看得见，绝不静默
-  if (run) {
-    kids.push(
-      el("span", {
-        class: run.ok ? "campaign-note campaign-run" : "campaign-note campaign-run warn-text",
-        text: run.text,
-        title: run.text,
-      }),
-    );
-  }
-  // 全部子请求都失败时 campaign 里带 ok:false + error（部分失败仍是 ok:true）——如实说出来
-  if (st?.ok === false && st.error) {
-    kids.push(el("span", { class: "campaign-note campaign-err warn-text", text: `活动任务读取失败：${String(st.error)}` }));
-  }
-  // 查询失败（含「刷新快照」顺带补查时失败）：失败原因落在这里，不弹错也不吞掉
-  if (err) {
-    const t = `活动任务查询失败：${err}`;
-    kids.push(el("span", { class: "campaign-note campaign-err warn-text", text: t, title: t }));
-  }
-  // 说明：活动任务明细已并入「任务明细」的活动分组（CONTRACT §11.6）——这里不再有明细列表。
-  return el("div", { class: "acct-campaign", dataset: { campaignCell: uid } }, ...kids);
-}
-
-// 只重绘活动任务条（同 updateStreakArea 的理由：不打散任务勾选 / 折叠 / 输入焦点）。
+// 活动数据更新时就地重绘该账号的账号行：活动明细现在只在任务明细「活动任务」分组里，重绘整
+// 账号行最省事。勾选 / 任务明细展开 / 「已完成」折叠 / 连登日历展开等状态都记在 state 里，
+// 重绘即还原，不打散用户正在做的事（[data-acct="uid"] 锚点在 accountRow 上）。
 function updateCampaignArea(uid) {
   const acct = accountByUid(uid);
   if (!acct) return;
-  const box = $(`[data-campaign-cell="${uid}"]`);
-  if (box) box.replaceWith(campaignCellBlock(acct));
+  const row = $(`[data-acct="${uid}"]`);
+  if (row) row.replaceWith(accountRow(acct));
 }
 
 function applyCampaign(uid, campaign) {
