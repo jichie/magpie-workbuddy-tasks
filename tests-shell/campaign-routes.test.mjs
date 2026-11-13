@@ -1,17 +1,22 @@
-// tests-shell/campaign-routes.test.mjs —— 运营活动任务两条 HTTP 路由
-//（GET /api/campaign、POST /api/campaign/run，CONTRACT §11.1）+ state/campaign.json
-// 缓存 + /api/state 只读投影的守护进程回归（真实 daemon + 真实引擎 + 假时钟/假上游，
-// 零真实网络）。缓存与节流口径镜像 /api/streak（streak-routes.test.mjs 同款手法）。
+// tests-shell/campaign-routes.test.mjs —— 运营活动任务三条 HTTP 路由
+//（GET /api/campaign、POST /api/campaign/run §11.1、POST /api/campaign/claim
+// §11.6）+ state/campaign.json 缓存 + /api/state 只读投影的守护进程回归
+//（真实 daemon + 真实引擎 + 假时钟/假上游，零真实网络）。缓存与节流口径镜像
+// /api/streak（streak-routes.test.mjs 同款手法）。
 //
 // 钉死：
-//   1. 两条路由登记进 API_ROUTE_AUTH（全路由免密钥）；
+//   1. 三条路由登记进 API_ROUTE_AUTH（全路由免密钥）；
 //   2. GET /api/campaign：首次拉上游 → 200 {uid, cached:false, campaign} 并原子落盘；
 //      TTL 内直接回缓存（零上游）；refresh=1 强制拉取；job 在跑时 refresh=1 →
 //      409 busy、无 refresh → 回缓存（哪怕已过期）；
 //   3. POST /api/campaign/run：缺省目标 = 未冻结 + tasksEnabled；
 //      results[{uid, outcome, earned, message, detail{activities, claimed, unavailable}}]；
 //      领奖真实发生（claimed_at 回读）；显式点名冻结账号 → failed +「恢复」提示；
-//   4. /api/state 投影：accounts[].campaign 只读缓存（绝不为它打上游）。
+//   4. POST /api/campaign/claim（§11.6 第 3 条）：{uid, activityCode, taskCode}
+//      缺一 → 400；200 形状与 /api/task/claim 对齐（{ok, credit, energy, via,
+//      reason}）；账号找不到 = /api/task/claim 同口径（500 +「找不到账号」）；
+//      冻结账号如实失败（§10.5 文案、零上游）；
+//   5. /api/state 投影：accounts[].campaign 只读缓存（绝不为它打上游）。
 
 import { test, describe, after } from "node:test";
 import assert from "node:assert/strict";
@@ -205,10 +210,11 @@ after(async () => {
 });
 
 describe("路由登记与 GET 缓存口径", () => {
-  test("两条路由全部登记进 API_ROUTE_AUTH（免密钥登记表）", () => {
+  test("三条路由全部登记进 API_ROUTE_AUTH（免密钥登记表）", () => {
     for (const [method, path] of [
       ["GET", "/api/campaign"],
       ["POST", "/api/campaign/run"],
+      ["POST", "/api/campaign/claim"],
     ]) {
       const row = API_ROUTE_AUTH.find((r) => r.path === path);
       assert.ok(row, `${path} 已登记`);
@@ -419,5 +425,108 @@ describe("POST /api/campaign/run 与 /api/state 投影", () => {
     assert.equal(stub.calls.length, n, "/api/state 没有打上游");
     // 排程 hours 里 campaign 默认空、且键存在
     assert.deepEqual(st.settings.hours.campaign, []);
+  });
+});
+
+describe("POST /api/campaign/claim（单条活动任务领奖，§11.6 第 3 条）", () => {
+  // 新开一轮：重写冻结台账（UID_FROZEN 再次冻结）+ 全新假上游，并把星巴克
+  // ai_chat 预置成「已达成（completed_at 在）、未领」——成功路径的真实素材。
+  test("200 成功：回读 claimed_at 才算，credit 按 reward_credit 记账，形状与 /api/task/claim 对齐", async () => {
+    writeFileSync(
+      frozenFile,
+      JSON.stringify({
+        [UID_FROZEN]: { at: new Date(NOW).toISOString(), code: 11140, message: "request illegal" },
+      }),
+    );
+    await h.stop();
+    h = await boot();
+    stub.completed.add("ai_chat");
+    const n0 = stub.calls.length;
+    const r = await fetch(`${base()}/api/campaign/claim`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ uid: UID_OK, activityCode: "campaign_starbucks_2026", taskCode: "ai_chat" }),
+    });
+    assert.equal(r.status, 200);
+    const j = await r.json();
+    assert.deepEqual(j, { ok: true, credit: 100, energy: 0, via: "", reason: "" }, "形状与 /api/task/claim 对齐（活动领奖无 chat/web 双路，via 恒空串）");
+    // 上游真实发生：恰 1 次 claim POST + 初始清单读取与领奖回读（claimed_at）
+    assert.equal(stub.calls.filter((c) => c.path.endsWith("/claim")).length, 1);
+    assert.ok(stub.calls.filter((c) => c.path === "/portal/activity/tasks" && c.method === "GET").length >= 2, "初始读取 + 回读");
+    assert.ok(stub.calls.length > n0);
+    assert.ok(stub.calls.every((c) => c.host === "www.codebuddy.cn"));
+  });
+
+  test("400：uid/activityCode/taskCode 缺一不可，400 不打上游", async () => {
+    const n0 = stub.calls.length;
+    for (const body of [
+      {},
+      { uid: UID_OK },
+      { activityCode: "campaign_starbucks_2026", taskCode: "ai_chat" },
+      { uid: UID_OK, activityCode: "campaign_starbucks_2026" },
+      { uid: UID_OK, taskCode: "ai_chat" },
+    ]) {
+      const r = await fetch(`${base()}/api/campaign/claim`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      assert.equal(r.status, 400);
+      assert.deepEqual(await r.json(), { error: "需要 uid、activityCode 与 taskCode" });
+    }
+    assert.equal(stub.calls.length, n0, "参数校验失败零上游");
+  });
+
+  test("账号找不到 → 与 /api/task/claim 逐字同口径：500 +「找不到账号」（manualOp 转换），零上游", async () => {
+    const n0 = stub.calls.length;
+    const r = await fetch(`${base()}/api/campaign/claim`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ uid: "u-nosuch", activityCode: "campaign_starbucks_2026", taskCode: "ai_chat" }),
+    });
+    assert.equal(r.status, 500, "/api/task/claim 对未知账号就是 500（不是 404），新路由同口径");
+    const j = await r.json();
+    assert.match(j.error, /找不到账号 u-nosuch/);
+    assert.match(j.error, /plugin-auth\.json/);
+    assert.equal(stub.calls.length, n0);
+  });
+
+  test("显式点名冻结账号 → 200 {ok:false} + §10.5 冻结文案（与 /api/task/claim 逐字同款），零上游", async () => {
+    const n0 = stub.calls.length;
+    const r = await fetch(`${base()}/api/campaign/claim`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ uid: UID_FROZEN, activityCode: "campaign_starbucks_2026", taskCode: "ai_chat" }),
+    });
+    assert.equal(r.status, 200);
+    const j = await r.json();
+    assert.equal(j.ok, false);
+    assert.equal(j.credit, 0);
+    assert.equal(j.energy, 0);
+    assert.equal(j.via, "");
+    assert.match(j.reason, /账号已冻结（11140）：request illegal/);
+    assert.match(j.reason, /确认无风险后在账号行点「恢复」/);
+    assert.equal(stub.calls.length, n0, "冻结账号一个上游都不发");
+  });
+
+  test("任务未达成 → 200 {ok:false}，reason 给人话（不硬闯领奖）", async () => {
+    const n0 = stub.calls.length;
+    // expert 未达成（进度 0/1）——只读一次清单就拒绝，不发 claim POST
+    const r = await fetch(`${base()}/api/campaign/claim`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ uid: UID_OK, activityCode: "campaign_starbucks_2026", taskCode: "expert" }),
+    });
+    assert.equal(r.status, 200);
+    const j = await r.json();
+    assert.equal(j.ok, false);
+    assert.equal(j.credit, 0);
+    assert.match(j.reason, /任务未达成/);
+    assert.equal(
+      stub.calls.filter((c) => c.path === "/portal/activity/tasks/expert/claim").length,
+      0,
+      "未达成绝不 POST 领奖（成功用例里 ai_chat 的 claim POST 不计入）",
+    );
+    assert.ok(stub.calls.length > n0, "但清单读取发生了（拿进度与 reward_credit）");
   });
 });

@@ -140,8 +140,8 @@ const state = {
   campaignBusy: new Set(), // 活动任务查询/运行正在请求中的 uid（防重复并发）
   campaignErrors: new Map(), // uid -> string：活动任务查询失败原因（显示在活动任务条里，不弹错）
   campaignRuns: new Map(), // uid -> {ok, text}：最近一次「活动任务」结果（来自 job 的 campaign 腿步骤；跨重绘保留，不静默）
-  campaignOpen: new Set(), // 展开「活动任务明细」小列表的 uid（默认折叠；轮询重绘不丢状态）
-  campaignActFold: new Map(), // `${uid}::${code}` -> bool：单个活动分组是否展开（用户手动定过；未定过按「未完成默认展开」）
+  taskGroupFold: new Map(), // `${uid}::${group}` -> bool：任务明细分组（成长/小程序/活动）是否展开（默认展开；轮询重绘不丢）
+  taskDoneFold: new Map(), // `${uid}::${group}` -> bool：「已完成 N 项」折叠块是否展开（默认收起；用户手动展开过则记住）
   campaignJobIds: new Map(), // uid -> jobId：本看板为某账号「跑一轮活动任务」起的 job（驱动按钮禁用 + 收尾补查活动缓存）
   streakJobId: "", // 本看板起的「连登管家」job id（收尾时把该轮 streak 腿步骤回填到各行最近一次结果）
   lastSeenJobId: "", // 最近一次在 /api/state 里看到的运行中 job id（SSE 掉线时轮询兜底判断收尾）
@@ -820,10 +820,28 @@ function isPicked(uid, code) {
   return !!set && set.has(String(code ?? ""));
 }
 
-// 快照里仍可勾选的任务：有 code 且未锁定（locked 只来自后端字段，老后端 = false）
+// 快照里仍可勾选的任务：有 code 且未锁定（locked 只来自后端字段，老后端 = false）；
+// 再加上活动任务的可勾选码（CONTRACT §11.6：活动任务行与成长/小程序任务共用同一套勾选 state）。
 function selectableCodes(a) {
   const tasks = Array.isArray(a?.snapshot?.tasks) ? a.snapshot.tasks : [];
-  return tasks.filter((t) => !taskFlags(t).locked).map((t) => String(t?.code ?? "")).filter(Boolean);
+  const snap = tasks.filter((t) => !taskFlags(t).locked).map((t) => String(t?.code ?? "")).filter(Boolean);
+  return [...snap, ...campaignPickCodes(a)];
+}
+
+// 活动任务行的勾选码 = `<activityCode>:<taskCode>`（CONTRACT §11.6）。
+// 已领（claimedAt 非空）的活动任务没有可跑的动作，不给码、也不可勾选；缺 activityCode / taskCode 的项同样跳过。
+// 活动状态来自 accounts[].campaign 投影（§11.1），没查过 / 后端未落地时为 []，不抛错。
+function campaignPickCodes(a) {
+  const out = [];
+  for (const act of campaignActivities(campaignOf(a))) {
+    const ac = String(act?.code ?? "").trim();
+    if (!ac) continue;
+    for (const t of Array.isArray(act?.tasks) ? act.tasks : []) {
+      const tc = String(t?.taskCode ?? "").trim();
+      if (tc && !campaignTaskClaimed(t)) out.push(`${ac}:${tc}`);
+    }
+  }
+  return out;
 }
 
 // 该账号勾选的任务码（供 /api/run 的 body.codes 用）；没有勾选 → null。
@@ -1154,65 +1172,333 @@ function taskRow(a, t) {
 // 只读刷新的说明：刷新快照只读取上游，不会接取任务也不会上报进度。
 const REFRESH_NOTE = "点账号行右侧「刷新快照」读取（只读，不会接取或上报；守护进程内置限速：两次上游调用至少间隔 1 秒）。";
 
+// 一张任务明细、三个来源分组（CONTRACT §11.6）：成长任务 → 小程序任务 → 活动任务。
+// 分组按来源拆分（成长 = 快照里非 MP code；小程序 = isMPTask()；活动 = accounts[].campaign 投影），
+// 各分组标题带计数且可折叠（默认展开，折叠状态记 state.taskGroupFold，3 秒轮询重绘不丢）。
+// 组内「未完成在上、已领奖沉底」：已领奖的任务收进一个默认收起的「已完成 N 项」<details>，
+// 用户手动展开过就记住（state.taskDoneFold）。空分组不渲染标题（否则会满屏空壳）。
 function taskTable(a) {
   const snap = a.snapshot;
-  if (!snap) {
-    return el(
-      "p",
-      { class: "muted", style: { padding: "10px 14px" } },
-      `快照为空，${REFRESH_NOTE}`,
-    );
+  const tasks = Array.isArray(snap?.tasks) ? snap.tasks : [];
+  // 活动任务来自 accounts[].campaign 投影（§11.1）：没查过 / 后端未落地 = []（不显示该分组）
+  const campaignActs = campaignActivities(campaignOf(a));
+
+  const groups = [];
+  const growth = tasks.filter((t) => !isMPTask(t));
+  const mp = tasks.filter((t) => isMPTask(t));
+  if (growth.length) groups.push({ key: "growth", title: "成长任务", type: "snap", tasks: growth });
+  if (mp.length) groups.push({ key: "mp", title: "小程序任务", type: "snap", tasks: mp });
+  // 活动分组只在真有活动任务行时出现（活动存在但一个任务都没有 = 空壳，不显示空标题）
+  const campaignTaskTotal = campaignActs.reduce((n, act) => n + (Array.isArray(act?.tasks) ? act.tasks.length : 0), 0);
+  if (campaignTaskTotal) groups.push({ key: "campaign", title: "活动任务", type: "campaign", acts: campaignActs });
+
+  const wrap = el("div", { class: "task-sel-wrap" });
+  // 任务级勾选提示条始终最上方（跨三个分组）：说明「不勾选 = 全部」，并显示已选计数
+  wrap.append(taskSelBar(a.uid));
+
+  if (!groups.length) {
+    wrap.append(el("p", { class: "muted", style: { padding: "10px 14px" } }, emptyTaskText(snap)));
+    return wrap;
   }
-  const tasks = Array.isArray(snap.tasks) ? snap.tasks : [];
-  const expired = snapExpired(snap);
-  if (!tasks.length) {
-    return el(
-      "p",
-      { class: "muted", style: { padding: "10px 14px" } },
-      expired
-        ? `快照已过期（${fmtDateTime(snap.updatedISO)} 更新），${REFRESH_NOTE}`
-        : `快照为空（${fmtDateTime(snap.updatedISO)} 更新）：该账号当前没有成长任务，或上游返回为空。`,
-    );
-  }
-  const head = el(
-    "thead",
-    {},
-    el(
-      "tr",
-      {},
-      el(
-        "th",
-        { class: "pick-col" },
-        el(
-          "label",
-          { class: "check", title: "全选 / 取消全选该账号的任务" },
-          el("input", {
-            type: "checkbox",
-            dataset: { taskAll: a.uid },
-            "aria-label": "全选该账号任务",
-            onchange: (ev) => setPickedAll(a.uid, ev.target.checked),
-          }),
-        ),
-      ),
-      el("th", { text: "任务" }),
-      el("th", { text: "状态" }),
-      el("th", { text: "进度" }),
-      el("th", { text: "奖励", class: "num" }),
-      el("th", { text: "操作" }),
-    ),
-  );
-  const body = el("tbody", {}, tasks.map((t) => taskRow(a, t)));
-  const table = el("div", { class: "tbl-wrap" }, el("table", { class: "tbl tbl-tasks" }, head, body));
-  // 任务级勾选提示条始终在表格上方：说明「不勾选 = 全部」，并显示已选计数
-  const kids = [taskSelBar(a.uid)];
   // 后端标记过期：数据仍展示（比空白有用），但明确说明陈旧并给只读刷新入口
-  if (expired) {
-    kids.push(
+  if (snap && snapExpired(snap)) {
+    wrap.append(
       el("p", { class: "snap-stale", text: `快照已过期（${fmtDateTime(snap.updatedISO)} 更新），${REFRESH_NOTE}` }),
     );
   }
-  kids.push(table);
-  return el("div", { class: "task-sel-wrap" }, ...kids);
+  for (const g of groups) wrap.append(taskGroupBlock(a, g));
+  return wrap;
+}
+
+// 无任何任务时的说明文案（快照为空 / 过期 / 真的没任务），与旧口径一致。
+function emptyTaskText(snap) {
+  if (!snap) return `快照为空，${REFRESH_NOTE}`;
+  if (snapExpired(snap)) return `快照已过期（${fmtDateTime(snap.updatedISO)} 更新），${REFRESH_NOTE}`;
+  return `快照为空（${fmtDateTime(snap.updatedISO)} 更新）：该账号当前没有任务，或上游返回为空。`;
+}
+
+function taskGroupOpen(key) {
+  return state.taskGroupFold.has(key) ? !!state.taskGroupFold.get(key) : true; // 默认展开
+}
+
+// 分组标题计数：`成长任务 · 12 项 · 待领 2`（活动组：总任务数 / 可领合计）。
+function groupCountText(g) {
+  if (g.type === "campaign") {
+    let total = 0;
+    let pending = 0;
+    for (const act of g.acts) {
+      const ts = Array.isArray(act?.tasks) ? act.tasks : [];
+      total += ts.length;
+      pending += campaignNum(act?.claimable);
+    }
+    return `· ${total} 项 · 待领 ${pending}`;
+  }
+  const pending = g.tasks.filter((t) => String(t?.acceptStatus ?? "") === "completed").length;
+  return `· ${g.tasks.length} 项 · 待领 ${pending}`;
+}
+
+// 列头 + 定宽列（三个分组各一张表，colgroup 让它们的列宽一致、跨组对齐）。
+function taskCols() {
+  return [
+    el(
+      "colgroup",
+      {},
+      el("col", { class: "col-pick" }),
+      el("col", { class: "col-task" }),
+      el("col", { class: "col-status" }),
+      el("col", { class: "col-prog" }),
+      el("col", { class: "col-reward" }),
+      el("col", { class: "col-act" }),
+    ),
+    el(
+      "thead",
+      {},
+      el(
+        "tr",
+        {},
+        el("th", { class: "pick-col" }),
+        el("th", { text: "任务" }),
+        el("th", { text: "状态" }),
+        el("th", { text: "进度" }),
+        el("th", { text: "奖励", class: "num" }),
+        el("th", { text: "操作" }),
+      ),
+    ),
+  ];
+}
+
+// 一组的表体（任务行）。rows 已是 <tr> 数组。
+function taskRowsTable(rows) {
+  return el(
+    "div",
+    { class: "tbl-wrap" },
+    el("table", { class: "tbl tbl-tasks" }, ...taskCols(), el("tbody", {}, ...rows)),
+  );
+}
+
+// 「已完成 N 项」折叠块：默认收起；用户手动展开过就记住（state.taskDoneFold）。
+function taskDoneBlock(key, rows) {
+  const dk = `${key}::done`;
+  const details = el("details", { class: "task-done", dataset: { taskDone: key } });
+  if (state.taskDoneFold.get(dk) === true) details.open = true;
+  details.append(
+    el(
+      "summary",
+      { class: "task-done-summary", title: "已领奖的任务（默认收起；展开后 3 秒轮询重绘不丢）" },
+      el("span", { text: `已完成 ${rows.length} 项` }),
+    ),
+  );
+  if (rows.length) details.append(taskRowsTable(rows));
+  details.addEventListener("toggle", () => state.taskDoneFold.set(dk, details.open));
+  return details;
+}
+
+// 一个分组：<details> 包着标题（可折叠）+ 组体（未完成在前，已领奖收进「已完成」折叠块）。
+function taskGroupBlock(a, g) {
+  const key = `${a.uid}::${g.key}`;
+  const details = el("details", { class: `task-group task-group-${g.key}`, dataset: { taskGroup: key } });
+  if (taskGroupOpen(key)) details.open = true;
+  details.append(
+    el(
+      "summary",
+      { class: "task-group-summary" },
+      el("span", { class: "task-group-title", text: g.title }),
+      el("span", { class: "task-group-count", text: groupCountText(g) }),
+      g.key === "campaign" ? campaignRunButton(a) : null,
+    ),
+  );
+  const body = el("div", { class: "task-group-body" });
+  if (g.type === "campaign") fillCampaignGroup(a, body, g);
+  else fillSnapGroup(a, body, g);
+  details.append(body);
+  details.addEventListener("toggle", () => state.taskGroupFold.set(key, details.open));
+  return details;
+}
+
+// 成长 / 小程序组：未领奖（未接取 / 已接取 / 待领奖）在上；已领奖沉底并收进折叠块。
+function fillSnapGroup(a, body, g) {
+  const undone = g.tasks.filter((t) => String(t?.acceptStatus ?? "") !== "claimed");
+  const done = g.tasks.filter((t) => String(t?.acceptStatus ?? "") === "claimed");
+  if (undone.length) body.append(taskRowsTable(undone.map((t) => taskRow(a, t))));
+  if (done.length) body.append(taskDoneBlock(`${a.uid}::${g.key}`, done.map((t) => taskRow(a, t))));
+}
+
+// 活动组：活动作为子标题（`星巴克协作 · 可领 0 · 已领 0/3`），其未领任务行紧随其后；
+// 全部活动的已领任务统一沉底进一个「已完成 N 项」折叠块（活动名随行显示，上下文不丢）。
+function fillCampaignGroup(a, body, g) {
+  const claimed = [];
+  for (const act of campaignSortedActivities(g.acts)) {
+    const tasks = campaignSortedTasks(Array.isArray(act?.tasks) ? act.tasks : []);
+    const undone = tasks.filter((t) => !campaignTaskClaimed(t));
+    for (const t of tasks) if (campaignTaskClaimed(t)) claimed.push({ act, t });
+    if (!undone.length) continue; // 整组已领的活动不在这里出头（行都在折叠块里）
+    body.append(
+      el(
+        "div",
+        { class: "tbl-wrap" },
+        el(
+          "table",
+          { class: "tbl tbl-tasks" },
+          ...taskCols(),
+          el(
+            "tbody",
+            {},
+            el("tr", { class: "task-act-row" }, el("td", { colspan: "6" }, campaignActHead(act))),
+            ...undone.map((t) => campaignTaskRow(a, act, t)),
+          ),
+        ),
+      ),
+    );
+  }
+  if (claimed.length) {
+    body.append(
+      taskDoneBlock(
+        `${a.uid}::campaign`,
+        claimed.map(({ act, t }) => campaignTaskRow(a, act, t, { showAct: true })),
+      ),
+    );
+  }
+}
+
+// 活动子标题：`星巴克协作 · 可领 0 · 已领 0/3`（`·` 是独立分隔 span，视觉与文本都对齐契约）。
+function campaignActHead(act) {
+  const tasks = Array.isArray(act?.tasks) ? act.tasks : [];
+  const label = String(act?.label ?? act?.code ?? "活动").trim() || "活动";
+  const sep = () => el("span", { class: "task-act-head-sep", text: "·" });
+  return el(
+    "div",
+    { class: "task-act-head" },
+    el("span", { class: "task-act-head-name", text: label }),
+    sep(),
+    el("span", { class: "task-act-head-meta", text: `可领 ${campaignNum(act?.claimable)}` }),
+    sep(),
+    el("span", { class: "task-act-head-meta", text: `已领 ${campaignClaimedCount(act)}/${tasks.length}` }),
+  );
+}
+
+// 活动任务行（CONTRACT §11.6）：勾选码 = `<activityCode>:<taskCode>`；可领给「领取」按钮
+// （新路由 POST /api/campaign/claim {uid, activityCode, taskCode}）；未完成不给按钮、行内指到
+// 分组标题的「跑一轮活动任务」；kind==="app" 的行说明「需手机端 App 完成，脚本不伪造」。
+function campaignTaskRow(a, act, t, opts = {}) {
+  const uid = String(a.uid ?? "");
+  const activityCode = String(act?.code ?? "").trim();
+  const taskCode = String(t?.taskCode ?? "").trim();
+  const code = activityCode && taskCode ? `${activityCode}:${taskCode}` : "";
+  const claimed = campaignTaskClaimed(t);
+  const claimable = campaignTaskClaimable(t);
+  const isApp = String(t?.kind ?? "") === "app";
+  const label = String(t?.label ?? taskCode ?? "任务");
+
+  const actions = el("div", { class: "row-actions" });
+  if (claimable && activityCode && taskCode) {
+    actions.append(
+      el("button", {
+        type: "button",
+        class: "mini-btn",
+        text: "领取",
+        title: "POST /api/campaign/claim：领这一项活动任务的奖励（引擎会回读 claimed_at 才算成功）",
+        onclick: (ev) => claimCampaignOne(uid, activityCode, taskCode, ev.target),
+      }),
+    );
+  } else if (isApp && !claimed) {
+    actions.append(el("span", { class: "muted", text: "需手机端完成" }));
+  } else if (!claimed) {
+    actions.append(el("span", { class: "muted", text: "待跑一轮活动任务" }));
+  }
+
+  // 徽章：来源「活动」；kind==="app" 再挂「需手机端」。
+  const marks = [badge("活动", "badge-quiet")];
+  marks[0].title = "运营活动任务（独立契约，不在成长任务快照里）";
+  if (isApp) {
+    const b = badge("需手机端", "badge-warn");
+    b.title = "kind=app：需手机端 App 完成，脚本不伪造（§11.1 诚实口径）";
+    marks.push(b);
+  }
+  if (opts.showAct) marks.push(el("span", { class: "pin-id", text: String(act?.label ?? act?.code ?? "活动") }));
+
+  const notes = [];
+  if (isApp) notes.push("需手机端 App 完成，脚本不伪造");
+  if (!claimed && !claimable && !isApp) notes.push("点分组标题的「跑一轮活动任务」执行");
+
+  const status = claimed
+    ? badge(ACCEPT_NAMES.claimed, "badge-quiet")
+    : claimable
+      ? badge(ACCEPT_NAMES.completed, "badge-warn")
+      : badge("未完成", "badge-quiet");
+  const target = campaignNum(t?.target);
+  const cur = campaignNum(t?.progress);
+  const reward = campaignNum(t?.credit);
+  const pickTitle = claimed
+    ? "已领奖，无需再跑"
+    : code
+      ? "勾选后批量操作只作用于选中任务；不勾选 = 全部"
+      : "缺少活动码 / 任务码，无法勾选";
+
+  return el(
+    "tr",
+    { class: "task-row-campaign" },
+    el(
+      "td",
+      { "data-label": "选", class: "pick-cell" },
+      el(
+        "label",
+        { class: "check", title: pickTitle },
+        el("input", {
+          type: "checkbox",
+          dataset: { taskPick: uid, code },
+          checked: !claimed && !!code && isPicked(uid, code),
+          disabled: !code || claimed,
+          "aria-label": `选择活动任务 ${label}`,
+          onchange: (ev) => setPicked(uid, code, ev.target.checked),
+        }),
+      ),
+    ),
+    el(
+      "td",
+      { "data-label": "任务" },
+      el("span", { class: "cell-main", text: label }),
+      code ? el("span", { class: "cell-sub", text: code }) : null,
+      el("div", { class: "cell-badges" }, marks),
+      ...notes.map((n) => el("div", { class: "row-note", text: n })),
+    ),
+    el("td", { "data-label": "状态" }, status),
+    el("td", { "data-label": "进度" }, el("span", { class: "mono", text: target > 0 ? `${cur}/${target}` : `${cur}` })),
+    el("td", { "data-label": "奖励", class: "num" }, el("span", { class: "mono", text: reward > 0 ? `+${fmtNum(reward)} 积分` : "—" })),
+    el("td", { "data-label": "操作" }, actions),
+  );
+}
+
+// 活动任务是否「可领」（CONTRACT §11.6）：`completedAt` 非空且 `claimedAt` 空。
+function campaignTaskClaimable(t) {
+  return String(t?.completedAt ?? "").trim() !== "" && !campaignTaskClaimed(t);
+}
+
+// 单行「领取」活动任务：POST /api/campaign/claim {uid, activityCode, taskCode}（CONTRACT §11.6）。
+// 结果行文案与单任务领奖（claimOne）同款：成功 → 「已领奖 +N 积分…」，失败 → 「未领到：<原因>」。
+// 后端未落地（404）时按 humanErr 如实报错，不白屏、不抛。
+async function claimCampaignOne(uid, activityCode, taskCode, btn) {
+  btn.disabled = true;
+  btn.textContent = "领取中…";
+  try {
+    const r = await api("api/campaign/claim", { method: "POST", body: { uid, activityCode, taskCode } });
+    const viaNote = r?.via === "web" ? " · 已走网页通道" : "";
+    const okBadge = r?.ok
+      ? badge(
+          `已领奖 +${fmtNum(r.credit)} 积分${Number(r.energy) > 0 ? ` +${fmtNum(r.energy)} 能量` : ""}${viaNote}`,
+          "badge-strong",
+        )
+      : badge(`未领到：${r?.reason || "上游未说明原因"}`, "badge-warn");
+    btn.replaceWith(okBadge);
+    toast(
+      r?.ok ? `活动任务领取成功：+${fmtNum(r.credit)} 积分${viaNote}` : `活动任务领取未成功：${r?.reason || "见任务行提示"}`,
+      r?.ok ? "info" : "warn",
+    );
+    if (r?.ok) await queryCampaign(uid); // 成功后就地补查活动缓存，让分组计数/进度跟手更新
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = "领取";
+    humanErr(e, "领取活动任务失败");
+  }
 }
 
 // 账号行的轻量汇总：状态分布 + 后端判断字段的计数（共 N 项 · 桌面端 N · 无法自动化 N ·
@@ -3048,83 +3334,32 @@ export function campaignSummaryText(st) {
   return `活动任务：${parts.join(" · ")} · 可领 ${claimable}`;
 }
 
-// 活动任务明细小列表（默认折叠）：活动分组 → 任务名 + 进度 / 奖励 + 已领标记。
-// 排序（CONTRACT §11.5）：活动之间「未完成在前、已完成在后并默认折叠」；活动内部「未领在前、已领在后」。
-// 折叠状态：账号级明细记 state.campaignOpen，单个活动记 state.campaignActFold —— 3 秒轮询重建 DOM 不会把它折回去。
-function campaignListBlock(a, st) {
-  const uid = String(a.uid ?? "");
-  const acts = campaignActivities(st);
-  if (!acts.length) return null;
-  const details = el("details", { class: "campaign-list", dataset: { campaignList: uid } });
-  if (state.campaignOpen.has(uid)) details.open = true;
-  const taskCount = acts.reduce((n, act) => n + (Array.isArray(act?.tasks) ? act.tasks.length : 0), 0);
-  const summary = el(
-    "summary",
-    {
-      class: "campaign-list-summary",
-      title: "活动任务明细：每个活动下的任务名 / 进度 / 奖励 / 是否已领（活动任务是独立契约，不在任务快照里）",
-    },
-    el("span", { class: "campaign-list-label", text: `活动任务明细 · ${acts.length} 个活动 / ${taskCount} 项` }),
-  );
-  const body = el("div", { class: "campaign-list-body" });
-  for (const act of campaignSortedActivities(acts)) body.append(campaignActGroup(uid, act));
-  details.append(summary, body);
-  details.addEventListener("toggle", () => {
-    if (details.open) state.campaignOpen.add(uid);
-    else state.campaignOpen.delete(uid);
-  });
-  return details;
-}
+// 活动任务明细列表已按 CONTRACT §11.6 合并进「任务明细」的三个分组（见 taskTable /
+// fillCampaignGroup）；账号行下面的可折叠活动明细列表（.campaign-list）整块移除，
+// 账号行只保留一行「活动任务：… · 可领 N」摘要 + 「跑一轮活动任务」按钮。
 
-// 单个活动分组（可折叠）：标题 = 活动名 + 「可领 N」+「已领 x/y」（已完成再挂一枚「已完成」）。
-// 分组标题与任务行分属两个块，两个活动绝不混成一坨；任务按「未领在前、已领在后」排。
-// 已完成的活动默认折叠；用户手动展开/收起的意图记进 state.campaignActFold，轮询重绘不丢。
-function campaignActGroup(uid, act) {
-  const code = String(act?.code ?? act?.label ?? "");
-  const key = `${uid}::${code}`;
-  const done = campaignActDone(act);
-  const tasks = Array.isArray(act?.tasks) ? act.tasks : [];
-  const group = el("details", {
-    class: done ? "campaign-act-group campaign-act-done" : "campaign-act-group",
-    dataset: { campaignAct: key },
+// 「跑一轮活动任务」按钮（CONTRACT §11.6 第 6 条）：账号行的活动条与「活动任务」分组标题右侧
+// 共用同一个按钮构造器 —— 两处触发同一路径 POST /api/run {uids:[uid], legs:["campaign"]}（起 job）。
+// 放在 <summary> 里时 preventDefault/stopPropagation，点按钮不连带折叠分组。
+function campaignRunButton(a) {
+  const uid = String(a.uid ?? "");
+  const busy = state.campaignBusy.has(uid) || campaignJobRunning(uid);
+  return el("button", {
+    type: "button",
+    class: "mini-btn campaign-btn",
+    dataset: { campaignRun: uid },
+    text: busy ? "运行中…" : "跑一轮活动任务",
+    disabled: busy,
+    title:
+      'POST /api/run {uids:[uid], legs:["campaign"]}：起一轮 job，只对这一个账号跑运营活动任务' +
+      "（真实写动作），实时步骤 / 日志见「实时进度」区（SSE 推送）。活动任务与成长任务解耦，独立跑、独立记账。",
+    onclick: (ev) => {
+      // summary 内的按钮：不让点击连带折叠/展开分组
+      if (ev && typeof ev.preventDefault === "function") ev.preventDefault();
+      if (ev && typeof ev.stopPropagation === "function") ev.stopPropagation();
+      runCampaignOne(uid);
+    },
   });
-  const open = state.campaignActFold.has(key) ? !!state.campaignActFold.get(key) : !done;
-  if (open) group.open = true;
-  const label = String(act?.label ?? act?.code ?? "活动").trim() || "活动";
-  const summary = el(
-    "summary",
-    { class: "campaign-act" },
-    el("span", { class: "campaign-act-label", text: label }),
-    el("span", { class: "campaign-act-meta", text: `可领 ${campaignNum(act?.claimable)}` }),
-    el("span", { class: "campaign-act-meta", text: `已领 ${campaignClaimedCount(act)}/${tasks.length}` }),
-    done ? el("span", { class: "campaign-act-done-tag", text: "已完成" }) : null,
-  );
-  const body = el("div", { class: "campaign-act-body" });
-  if (!tasks.length) {
-    body.append(el("div", { class: "campaign-task campaign-task-empty", text: "该活动暂无任务" }));
-  } else {
-    for (const t of campaignSortedTasks(tasks)) {
-      const claimed = campaignTaskClaimed(t);
-      const reward = campaignNum(t?.credit);
-      body.append(
-        el("div", { class: "campaign-task" },
-          el("span", {
-            class: "campaign-task-name",
-            text: String(t?.label ?? t?.taskCode ?? "任务"),
-            title: `任务码：${String(t?.taskCode ?? "")}`,
-          }),
-          el("span", { class: "campaign-task-prog", text: `${campaignNum(t?.progress)}/${campaignNum(t?.target)}` }),
-          reward > 0 ? el("span", { class: "campaign-task-reward", text: `+${fmtNum(reward)}` }) : null,
-          claimed ? el("span", { class: "campaign-task-claimed", text: "已领" }) : null,
-        ),
-      );
-    }
-  }
-  group.append(summary, body);
-  group.addEventListener("toggle", () => {
-    state.campaignActFold.set(key, group.open);
-  });
-  return group;
 }
 
 // 账号单元格里的活动任务条（0.3.5）：与连登条同级别、同风格，紧跟在连登条下面。
@@ -3135,7 +3370,6 @@ function campaignCellBlock(a) {
   const st = campaignOf(a);
   const err = state.campaignErrors.get(uid);
   const run = state.campaignRuns.get(uid);
-  const busy = state.campaignBusy.has(uid) || campaignJobRunning(uid);
   const kids = [];
 
   // 第 1 行：汇总文案（未查询 / 各活动 已领/总数 · 可领 N）
@@ -3149,21 +3383,7 @@ function campaignCellBlock(a) {
     }),
   );
   // 第 2 行：运行按钮（单账号 → POST /api/run {uids:[uid], legs:["campaign"]}，起 job 走既有 SSE）
-  kids.push(
-    el("div", { class: "campaign-actions" },
-      el("button", {
-        type: "button",
-        class: "mini-btn campaign-btn",
-        dataset: { campaignRun: uid },
-        text: busy ? "运行中…" : "跑一轮活动任务",
-        disabled: busy,
-        title:
-          'POST /api/run {uids:[uid], legs:["campaign"]}：起一轮 job，只对这一个账号跑运营活动任务' +
-          "（真实写动作），实时步骤 / 日志见「实时进度」区（SSE 推送）。活动任务与成长任务解耦，独立跑、独立记账。",
-        onclick: () => runCampaignOne(uid),
-      }),
-    ),
-  );
+  kids.push(el("div", { class: "campaign-actions" }, campaignRunButton(a)));
   // 最近一次活动任务结果（含失败原因）：轮询重绘后仍看得见，绝不静默
   if (run) {
     kids.push(
@@ -3183,9 +3403,7 @@ function campaignCellBlock(a) {
     const t = `活动任务查询失败：${err}`;
     kids.push(el("span", { class: "campaign-note campaign-err warn-text", text: t, title: t }));
   }
-  // 可折叠的明细小列表（默认折叠）
-  const list = campaignListBlock(a, st);
-  if (list) kids.push(list);
+  // 说明：活动任务明细已并入「任务明细」的活动分组（CONTRACT §11.6）——这里不再有明细列表。
   return el("div", { class: "acct-campaign", dataset: { campaignCell: uid } }, ...kids);
 }
 

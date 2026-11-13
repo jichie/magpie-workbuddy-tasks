@@ -122,3 +122,71 @@ test("runner：taskCodes 清单上限 500（与 daemon 的 API 边界同款）",
   assert.equal(job.spec.taskCodes["uid-A"].length, 500);
   void clock;
 });
+
+// ---- codes 的两套命名空间（CONTRACT §11.6）--------------------------------------
+// 勾选清单是混着的：成长/小程序的裸 code，以及活动任务的 `<activityCode>:<taskCode>`
+// （含冒号）。runner 必须**按腿过滤**，且筛完为空时**整腿跳过** —— 绝不能把空数组
+// 传给引擎（引擎把「空/未传」当「全部」，那会让「只勾了活动任务」变成「把所有成长
+// 任务跑一遍」的反向放大）。
+
+test("runner：codes 按腿过滤 —— 活动任务码（含冒号）只在 campaign 腿生效，不进 growth 接取批次", async () => {
+  const clock = fakeClock(DAY);
+  const backend = backendFor(clock, { wbx_design_canvas_task_create: "create_canvas", chat_request_send: "chat_5" });
+  const runner = new JobRunner({
+    accounts: [makeAcct({ uid: "uid-A", nickname: "A" })],
+    now: clock.now,
+    sleep: clock.sleep,
+    fetch: backend.fetchImpl,
+  });
+  const job = runner.start({
+    legs: ["growth", "campaign"],
+    taskCodes: { "uid-A": ["chat_5", "campaign_starbucks_2026:ai_chat"] },
+  });
+  const done = await runner.wait(job.id);
+
+  // growth：裸 code 照常处理（chat_5 已是 accepted，所以走点亮/领奖而不是接取），
+  //         活动码（含冒号）绝不能出现在 growth 侧的任何请求体里
+  assert.ok(backend.state.claims.includes("chat_5"), "裸 code 应当被正常处理（走到领奖）");
+  const growthCalls = backend.calls.filter((c) => String(c.path).startsWith("/v2/activity/growth/"));
+  assert.ok(growthCalls.length >= 1, "growth 腿应当发过请求");
+  for (const c of growthCalls) {
+    assert.ok(
+      !JSON.stringify(c.body ?? "").includes(":"),
+      `活动码不得出现在 growth 侧请求体：${c.path} ${JSON.stringify(c.body)?.slice(0, 80)}`,
+    );
+  }
+
+  // campaign：只查勾中的活动（reporter 一次都不查）
+  const reads = backend.calls.filter((c) => c.path === "/portal/activity/tasks" && c.method === "GET");
+  assert.ok(reads.length >= 1, "campaign 腿应当读过活动清单");
+  for (const c of reads) {
+    assert.match(String(c.url), /campaign_starbucks_2026/, "只读勾中的活动");
+    assert.ok(!String(c.url).includes("campaign_reporter_2026"), "没勾的活动不得被读取");
+  }
+  void done;
+});
+
+test("runner：只勾活动任务时 growth 腿整腿跳过（绝不传空数组 = 全部）", async () => {
+  const clock = fakeClock(DAY);
+  const backend = backendFor(clock, {});
+  const runner = new JobRunner({
+    accounts: [makeAcct({ uid: "uid-A", nickname: "A" })],
+    now: clock.now,
+    sleep: clock.sleep,
+    fetch: backend.fetchImpl,
+  });
+  const job = runner.start({
+    legs: ["growth", "campaign"],
+    taskCodes: { "uid-A": ["campaign_starbucks_2026:ai_chat"] },
+  });
+  const done = await runner.wait(job.id);
+
+  const growthStep = done.steps.find((s) => s.leg === "growth");
+  assert.equal(growthStep?.state, "skip", "growth 腿该被整腿跳过");
+  assert.match(String(growthStep?.detail ?? ""), /不属于这条腿/);
+  assert.equal(
+    backend.calls.filter((c) => c.path === "/v2/activity/growth/tasks").length,
+    0,
+    "跳过时连成长任务清单都不该拉（这是「空数组=全部」的反向放大防护）",
+  );
+});

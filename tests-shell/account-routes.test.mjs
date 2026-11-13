@@ -112,6 +112,7 @@ describe("路由登记表（单一真相：routeNeedsKey 恒 false / API_ROUTE_A
       "POST /api/account/unfreeze",
       "POST /api/accounts",
       "POST /api/accounts/import",
+      "POST /api/campaign/claim",
       "POST /api/campaign/run",
       "POST /api/checkin",
       "POST /api/run",

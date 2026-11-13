@@ -5,6 +5,13 @@
 // /portal/activity/* 端点（base = billBase()，计费域同源）；判定/领奖状态按活动
 // 各自回读，与成长清单互不影响（成长腿空/失败时本腿照跑，反之亦然）。
 //
+// 0.3.5 追加（CONTRACT §11.6 任务明细重做的后端一半）：
+//   - claimCampaignTask(acct, {activity, task}, opts)：单条活动任务领奖出口
+//     （POST /api/campaign/claim 的引擎），语义同 §11.1 领奖（必须回读
+//     claimed_at 才算成功）；
+//   - runCampaignTasks 的 opts.codes 升级为**任务级**勾选
+//     （`<activityCode>:<taskCode>`；裸 activityCode 整活动兼容保留）。
+//
 // 与 hub 的移植差异（我们的架构要求，逐条对齐）：
 //   - hub 的 urllib 直连换我们的 engine/upstream.callJSON（自带 breathe + 全局
 //     spacer 排队 + 重试/退避 + 403/11140 restricted 透传 + chat 主机回退）——
@@ -323,6 +330,65 @@ function specFilter(codes) {
   return CAMPAIGN_SPECS.filter((s) => set.has(s.code));
 }
 
+// campaignSelection(codes, log) —— runCampaignTasks 的**任务级**勾选解析
+//（CONTRACT §11.6 第 4 条）。opts.codes 的条目语义：
+//   - 未传 / 非数组 / 空数组 → 全部活动全部任务（现状全跑；与成长/小程序腿
+//     「未传/空数组 = 全部」同款约定 —— daemon 的 /api/run 归一化还会把空清单
+//     落成 null，引擎侧再兜一道底。所以「空数组 vs 不传」同义，真正的分界在
+//     「非空但没有任何活动任务条目」→ 见下一条）
+//   - `<activityCode>:<taskCode>`（活动命中 CAMPAIGN_SPECS）→ 只跑该活动、
+//     活动内只跑勾中的任务；同一活动同时被裸 code 与 pair 勾中时取并集
+//     （整活动勾选优先）
+//   - 裸 `<activityCode>`（命中 CAMPAIGN_SPECS）→ 整个活动（§11.1 旧口径，
+//     向后兼容保留）
+//   - **其它条目一律忽略**：批量 codes 是成长/小程序/活动三套命名空间混在
+//     同一个池子里，本腿只认自己的条目 —— 成长任务 code、MP code、未知 code
+//     都不是「活动」，绝不拿去匹配 CAMPAIGN_SPECS、也不告警（它们归各自的腿）
+//   - 非空数组但一条活动任务条目都没命中 → empty:true：本腿无事可做，零上游
+//     跳过（与 runMiniProgramTasks「交集为空连清单都不拉」同款）—— 绝不回退成
+//     全跑（用户勾了具体任务，没勾活动 = 活动腿不该动）
+//   - 勾中活动但任务 code 不在 CAMPAIGN_SPECS（手滑/版本漂移）→ 警告一次并
+//     跳过（同成长腿「缺失 code 警告」口径）
+// 过滤在读清单**之前**完成：未选中的活动整块跳过，连每活动一次的 GET 都省
+//（上游调用次数 = 选中活动数，而非全部活动数）。
+function campaignSelection(codes, log = null) {
+  if (!Array.isArray(codes) || !codes.length) {
+    return { specs: CAMPAIGN_SPECS, taskSel: null, whole: null, empty: false };
+  }
+  const whole = new Set(); // 裸活动 code（整活动勾选）
+  const pairs = new Map(); // activityCode -> Set(taskCode)
+  for (const raw of codes) {
+    const s = String(raw ?? "").trim();
+    if (!s) continue;
+    const i = s.indexOf(":");
+    if (i === -1) {
+      if (CAMPAIGN_SPECS.some((sp) => sp.code === s)) whole.add(s);
+      continue;
+    }
+    const act = s.slice(0, i).trim();
+    const task = s.slice(i + 1).trim();
+    if (!task || !CAMPAIGN_SPECS.some((sp) => sp.code === act)) continue;
+    if (!pairs.has(act)) pairs.set(act, new Set());
+    pairs.get(act).add(task);
+  }
+  if (!whole.size && !pairs.size) return { specs: [], taskSel: null, whole, empty: true };
+  for (const [act, tasks] of pairs) {
+    const spec = CAMPAIGN_SPECS.find((sp) => sp.code === act);
+    for (const t of tasks) {
+      if (spec && !spec.tasks.some((ts) => ts.task === t) && log) {
+        log(`⚠️ 勾选的活动任务 [${act}/${t}] 不在活动任务清单，跳过`);
+      }
+    }
+  }
+  // pair 勾选的活动：至少一个勾中任务在清单里才纳入（否则只留上面那行警告，
+  // 该活动连清单读取都省 —— 也绝不在 state 里留下「未读取」的假错误行）。
+  const specs = CAMPAIGN_SPECS.filter(
+    (sp) => whole.has(sp.code) || sp.tasks.some((ts) => pairs.get(sp.code)?.has(ts.task)),
+  );
+  if (!specs.length) return { specs: [], taskSel: null, whole, empty: true };
+  return { specs, taskSel: pairs.size ? pairs : null, whole, empty: false };
+}
+
 // fetchCampaignState(acct, opts) -> 只读快照（CONTRACT §11.1）
 // -> {ok:true, activities:[{code,label,page,tasks:[{taskCode,label,kind,progress,
 //     target,credit,completedAt,claimedAt,needView}],claimable,claimed,error}],
@@ -399,6 +465,9 @@ async function campaignView(acct, campaign, task, opts = {}) {
 // 领奖（hub `_campaign_claim`）：只 POST 成功**不算**成功 —— 提交后最多回读
 // CAMPAIGN_CLAIM_POLL_TRIES 次（间隔 CAMPAIGN_CLAIM_GAP_MS），必须看到
 // claimed_at 才记成功；没回读到就「下轮重试」。
+// -> {ok, reason, restricted?}：reason 是给人话的失败说明（含 HTTP 状态/正文
+// 片段；ok:true 时为空串）。批量腿只消费 ok/restricted，reason 供单任务出口
+// claimCampaignTask 透传给路由。
 async function campaignClaim(acct, campaign, task, credit, opts = {}, log = null) {
   const ctx = ctxOf(opts);
   await ctx.breathe();
@@ -406,23 +475,73 @@ async function campaignClaim(acct, campaign, task, credit, opts = {}, log = null
     `/portal/activity/tasks/${encodeURIComponent(String(task))}/claim` +
     `?activity_code=${encodeURIComponent(String(campaign))}`;
   const res = await callJSON(acct, "chat", campaignBase(opts) + path, { method: "POST", body: "{}" }, opts);
-  if (res.restricted) return { ok: false, restricted: true };
+  if (res.restricted) return { ok: false, restricted: true, reason: res.msg || "账号已被风控限制" };
   if (!res.ok) {
-    if (log) log(`⚠️ 领奖[${campaign}/${task}]: HTTP ${res.status ?? 0} ${String(res.raw || res.msg || "").slice(0, 80)}`.trimEnd());
-    return { ok: false };
+    const snippet = String(res.raw || res.msg || "").slice(0, 80);
+    if (log) log(`⚠️ 领奖[${campaign}/${task}]: HTTP ${res.status ?? 0} ${snippet}`.trimEnd());
+    return {
+      ok: false,
+      reason: `领奖提交失败[${campaign}/${task}]: HTTP ${res.status ?? 0} ${snippet}`.trim(),
+    };
   }
   for (let i = 0; i < Math.max(1, CAMPAIGN_CLAIM_POLL_TRIES); i++) {
     if (i) await ctx.breathe(CAMPAIGN_CLAIM_GAP_MS);
     const read = await fetchCampaignRows(acct, campaign, opts, log);
-    if (read.restricted) return { ok: false, restricted: true };
+    if (read.restricted) return { ok: false, restricted: true, reason: read.error || "账号已被风控限制" };
     const row = (read.ok ? read.rows[task] : null) || {};
     if (row.claimedAt) {
       if (log) log(`🎁 领奖[${campaign}/${task}]: +${credit} 积分`);
-      return { ok: true };
+      return { ok: true, reason: "" };
     }
   }
   if (log) log(`⚠️ 领奖[${campaign}/${task}]: 已提交但未回读到 claimed_at，下轮重试`);
-  return { ok: false };
+  return {
+    ok: false,
+    reason:
+      `领奖[${campaign}/${task}]: 已提交但未回读到 claimed_at` +
+      `（重试 ${CAMPAIGN_CLAIM_POLL_TRIES} 次仍无上游回执，判据回执延迟）——稍后重跑「活动任务」会自动补领`,
+  };
+}
+
+// claimCampaignTask(acct, {activity, task}, opts) -> {ok, credit, energy, reason, restricted?}
+// 单条活动任务领奖出口（CONTRACT §11.6 第 3 条，给 POST /api/campaign/claim 用）。
+// 语义与 §11.1 的领奖**完全一致**：POST
+// /portal/activity/tasks/<task>/claim?activity_code=<activity> → **必须回读到
+// claimed_at 才算成功**（只 POST 成功不算），回读预算沿用
+// CAMPAIGN_CLAIM_POLL_TRIES / CAMPAIGN_CLAIM_GAP_MS。返回形状与其余 claim 出口
+// （tasks.claimTask / miniprogram.claimMPTask）一致：credit 来自活动清单的
+// reward_credit（本出口自带**一次**清单读取拿它记账并确认任务存在/已达成，
+// 回读阶段复用 campaignClaim 的轮询，不重复拉第二份清单）。
+// 绝不抛；restricted 透传；失败 reason 给人话（含 HTTP 状态/正文片段）。
+// 幂等：清单里已见 claimed_at → 直接 ok:true（不再 POST）。
+export async function claimCampaignTask(acct, target, opts = {}) {
+  const activity = String(target?.activity ?? "").trim();
+  const task = String(target?.task ?? "").trim();
+  const fail = (reason, extra = {}) => ({ ok: false, credit: 0, energy: 0, reason, ...extra });
+  if (!activity || !task) return fail("需要 activity 与 task（活动 code 与任务 code 缺一不可）");
+  if (acct?.provider !== "workbuddy") return fail("国际版不适用国内运营活动任务");
+  if (acct?.enterpriseId || acct?.isApiKey) return fail("企业版账号无成长体系，没有运营活动任务");
+  try {
+    const read = await fetchCampaignRows(acct, activity, opts);
+    if (read.restricted) return fail(read.error || "账号已被风控限制", { restricted: true });
+    if (!read.ok) return fail(read.error || "活动任务读取失败");
+    const row = read.rows[task];
+    if (!row) return fail(`活动 ${activity} 未下发任务 ${task}（未下发/已下线，或活动不存在）`);
+    const credit = row.credit || 0;
+    if (row.claimedAt) return { ok: true, credit, energy: 0, reason: "" };
+    const targetCount = row.target || 1;
+    if (!row.completedAt && (row.progress || 0) < targetCount) {
+      // 与批量腿同一道门（completed_at 或 progress>=target 才领）：不给未达成的
+      // 任务硬闯领奖（上游必 400），reason 里带上进度说清差多少。
+      return fail(`任务未达成（${row.progress || 0}/${targetCount}），暂不能领奖`);
+    }
+    const got = await campaignClaim(acct, activity, task, credit, opts);
+    if (got.restricted) return fail(got.reason || "账号已被风控限制", { restricted: true });
+    if (!got.ok) return fail(got.reason || "领奖未完成（未回读到 claimed_at）");
+    return { ok: true, credit, energy: 0, reason: "" };
+  } catch (e) {
+    return fail(`活动任务领奖失败：${String(e?.message ?? e).slice(0, 200)}`);
+  }
 }
 
 // 判据轮询（hub `_campaign_poll`）：每次 breathe(gap) 后重读活动，completed_at
@@ -485,8 +604,11 @@ async function campaignFire(acct, spec, task, opts = {}, log = null) {
 
 // runCampaignTasks(acct, opts) -> {ok, earned, restricted?, logs, actions, state,
 //                                  unavailable, lit, claimed}
-// opts: {codes?: string[]（活动勾选）, claim?, log(fn), sleep(fn), now(fn), fetch,
-//        gap?, spacer?, signal, bases?, env?}
+// opts: {codes?: string[]（任务级勾选，§11.6 第 4 条：`<activityCode>:<taskCode>`
+//        对 = 只跑命中活动/任务；裸 activityCode = 整活动（§11.1 旧口径兼容）；
+//        未传/空数组 = 全跑；非空但无活动条目 = 零上游跳过；其它命名空间的
+//        code 一律忽略 —— 详见 campaignSelection 注释）, claim?, log(fn), sleep(fn),
+//        now(fn), fetch, gap?, spacer?, signal, bases?, env?}
 // 判据是异步落库的：每次发射后有限轮询；没落库的判据留给下一轮，绝不原地补喷。
 // 与成长腿解耦：本腿只读 /portal/activity/*，成长清单的成败不影响这里。
 export async function runCampaignTasks(acct, opts = {}) {
@@ -511,7 +633,23 @@ export async function runCampaignTasks(acct, opts = {}) {
     return { ok: true, earned: 0, logs: ["企业版账号无成长体系，跳过"], actions, unavailable, state: null };
   }
 
-  const wanted = specFilter(opts.codes);
+  const sel = campaignSelection(opts.codes, emit);
+  if (sel.empty) {
+    // 勾选清单里一条活动任务都没有（全是成长/小程序 code 或未知 code）：
+    // 本腿无事可做，零上游（一次 /portal/activity/* 都不读）。
+    emit("🎪 勾选的任务里没有运营活动任务（活动任务勾选格式：<活动code>:<任务code>），本腿跳过");
+    return {
+      ok: true,
+      earned: 0,
+      logs,
+      actions,
+      unavailable,
+      state: { ok: true, activities: [], updatedISO: new Date(ctx.now()).toISOString() },
+      lit: 0,
+      claimed: 0,
+    };
+  }
+  const wanted = sel.specs;
   const lastRead = new Map(); // 活动最后一次读取（成功或失败），结束时据此拼 state
   const updatedISO = () => new Date(ctx.now()).toISOString();
   const stateFrom = () => {
@@ -525,6 +663,10 @@ export async function runCampaignTasks(acct, opts = {}) {
 
   for (const spec of wanted) {
     if (restricted) break;
+    // 任务级勾选：整活动勾选（裸 code）跑全部任务（tset=null）；pair 勾选只跑
+    // 选中的任务（在下面的任务循环里逐项过滤 —— 未勾中的任务不 view、不发射、
+    // 不领奖，上游状态原封不动，连「未下发/已下线」都不记它们）。
+    const tset = sel.taskSel && !(sel.whole && sel.whole.has(spec.code)) ? sel.taskSel.get(spec.code) : null;
     const read = await fetchCampaignRows(acct, spec.code, opts, emit);
     lastRead.set(spec.code, read);
     if (read.restricted) {
@@ -546,6 +688,7 @@ export async function runCampaignTasks(acct, opts = {}) {
     emit(`🎪 ${spec.label}（${spec.code}）`);
     for (const taskSpec of spec.tasks) {
       if (restricted) break;
+      if (tset && !tset.has(taskSpec.task)) continue;
       const code = taskSpec.task;
       const label = taskSpec.label;
       const row = rows[code];

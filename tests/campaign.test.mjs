@@ -10,6 +10,11 @@
 //   - app kind 只提示、不伪造（零事件上报）；
 //   - 幂等：已领（claimed_at 已在）不再领；
 //   - restricted（403/11140）透传且停手；
+//   - §11.6 后端一半：claimCampaignTask 单任务领奖（必须回读 claimed_at、
+//     credit 按 reward_credit 记账、restricted/不存在/未达成/已领各口径）；
+//   - §11.6 第 4 条：runCampaignTasks 的 opts.codes 任务级勾选
+//     （<activityCode>:<taskCode>，未勾活动零读取、空数组=全跑、
+//     非空但无活动条目=零上游跳过、其它命名空间 code 忽略）；
 //   - 与成长腿解耦：成长清单拉空/失败时 campaign 腿照跑（runner 级）；
 //   - 事件字段：reporter 专家/技能/桌面判据的 id 逐字；星巴克专家走市场挑选
 //     （MP_EXPERT_CATEGORY 分类）；MP 最小头族 + 页面上下文。
@@ -19,12 +24,14 @@ import assert from "node:assert/strict";
 
 import {
   CAMPAIGN_CASES,
+  CAMPAIGN_CLAIM_POLL_TRIES,
   CAMPAIGN_SPECS,
   MP_EXPERT_CATEGORY,
   campaignChatEvent,
   campaignDesktopEvents,
   campaignExpertEvents,
   campaignSkillEvents,
+  claimCampaignTask,
   fetchCampaignState,
   runCampaignTasks,
 } from "../engine/campaign.mjs";
@@ -477,6 +484,183 @@ test("campaign：opts.codes 勾选 —— 只跑选中的活动", async () => {
   assert.deepEqual(
     res.state.activities.map((a) => a.code),
     ["campaign_reporter_2026"],
+  );
+});
+
+// ---- §11.6 后端一半：单任务领奖出口 claimCampaignTask ---------------------------
+
+const claimOne = (stub, target, extra = {}) =>
+  claimCampaignTask(makeAcct(), target, {
+    now: stub.clock.now,
+    sleep: stub.clock.sleep,
+    fetch: stub.fetchImpl,
+    gap: GAP,
+    ...extra,
+  });
+
+test("campaign：claimCampaignTask 成功 —— 必须回读 claimed_at 才算，credit 按 reward_credit 记账", async () => {
+  const stub = campaignStub();
+  stub.completed.add("ai_chat"); // 已达成（completed_at 在）、未领
+  const res = await claimOne(stub, { activity: "campaign_starbucks_2026", task: "ai_chat" });
+  assert.equal(res.ok, true);
+  assert.equal(res.credit, 100, "credit 来自活动清单的 reward_credit（一次初始读取拿到）");
+  assert.equal(res.energy, 0);
+  assert.equal(res.reason, "");
+  // 上游序列：恰好 2 次清单 GET（初始 1 次拿 reward_credit/状态 + 回读第 1 次就
+  // 见到 claimed_at 即停）+ 恰 1 次 claim POST（路径与 activity_code 逐字）
+  const reads = stub.calls.filter((c) => c.path === "/portal/activity/tasks" && c.method === "GET");
+  const claimPosts = stub.calls.filter((c) => c.path.endsWith("/claim"));
+  assert.equal(reads.length, 2);
+  assert.equal(claimPosts.length, 1);
+  assert.ok(claimPosts[0].path.startsWith("/portal/activity/tasks/ai_chat/claim"));
+  assert.ok(claimPosts[0].query.includes("activity_code=campaign_starbucks_2026"));
+  assert.equal(stub.claims.length, 1);
+  // 领奖出口只领不点亮：零 viewed、零判据事件
+  assert.equal(stub.viewed.length, 0);
+  assert.equal(stub.reports.length, 0);
+});
+
+test("campaign：claimCampaignTask —— 只 POST 成功但无回执 → 失败，reason 说明未回读到 claimed_at", async () => {
+  const stub = campaignStub({ claimWithoutReceipt: true });
+  stub.completed.add("ai_chat");
+  const res = await claimOne(stub, { activity: "campaign_starbucks_2026", task: "ai_chat" });
+  assert.equal(res.ok, false);
+  assert.equal(res.credit, 0, "没回读到 claimed_at 绝不记账");
+  assert.equal(res.restricted, undefined);
+  assert.ok(res.reason.includes("未回读到 claimed_at"), res.reason);
+  // 回读预算沿用 CAMPAIGN_CLAIM_POLL/GAP：初始 1 次 + 5 次回读，全打同一活动
+  const reads = stub.calls.filter((c) => c.path === "/portal/activity/tasks" && c.method === "GET");
+  assert.equal(reads.length, 1 + CAMPAIGN_CLAIM_POLL_TRIES);
+  assert.ok(reads.every((c) => c.query.includes("campaign_starbucks_2026")));
+  assert.equal(stub.claims.length, 1);
+});
+
+test("campaign：claimCampaignTask —— restricted（403/11140）透传，绝不抛", async () => {
+  const stub = campaignStub({ restricted: true });
+  const res = await claimOne(stub, { activity: "campaign_starbucks_2026", task: "ai_chat" });
+  assert.equal(res.ok, false);
+  assert.equal(res.restricted, true);
+  assert.equal(res.credit, 0);
+  assert.equal(stub.claims.length, 0);
+});
+
+test("campaign：claimCampaignTask —— 活动/任务不存在 → 失败且零 POST", async () => {
+  // 未知任务：清单读取成功但 rows 里没有该 task
+  const a = campaignStub();
+  const ra = await claimOne(a, { activity: "campaign_starbucks_2026", task: "nope_task" });
+  assert.equal(ra.ok, false);
+  assert.ok(ra.reason.includes("nope_task"), ra.reason);
+  assert.equal(a.claims.length, 0, "任务不存在绝不 POST 领奖");
+  // 清单读取成功但一个任务都没下发（活动不存在/已结束同口径：rows 空）
+  const b = campaignStub({ noIssue: { campaign_starbucks_2026: true } });
+  const rb = await claimOne(b, { activity: "campaign_starbucks_2026", task: "ai_chat" });
+  assert.equal(rb.ok, false);
+  assert.ok(rb.reason.includes("未下发"), rb.reason);
+  assert.equal(b.claims.length, 0);
+});
+
+test("campaign：claimCampaignTask —— 未达成不硬闯、已领幂等成功、参数缺失不抛", async () => {
+  // 进度 0/3 → 与批量腿同一道门：拒绝领奖（不 POST），reason 带进度
+  const a = campaignStub();
+  const ra = await claimOne(a, { activity: "campaign_starbucks_2026", task: "ai_chat" });
+  assert.equal(ra.ok, false);
+  assert.ok(ra.reason.includes("任务未达成（0/3）"), ra.reason);
+  assert.equal(a.claims.length, 0);
+  // 清单里 claimed_at 已在 → 幂等成功（不再 POST），credit 照记
+  const b = campaignStub();
+  b.claimed.add("ai_chat");
+  const rb = await claimOne(b, { activity: "campaign_starbucks_2026", task: "ai_chat" });
+  assert.equal(rb.ok, true);
+  assert.equal(rb.credit, 100);
+  assert.equal(b.claims.length, 0, "已领奖不再重复 POST");
+  // 参数缺失 → 失败不抛（reason 说明缺什么）
+  const rc = await claimOne(campaignStub(), { activity: "", task: "ai_chat" });
+  assert.equal(rc.ok, false);
+  assert.ok(rc.reason.includes("activity"), rc.reason);
+});
+
+// ---- §11.6 第 4 条：runCampaignTasks 的 opts.codes 任务级勾选 -------------------
+
+test("campaign：runCampaignTasks {codes} 任务级勾选 —— 两个活动各选一项，未选的不动", async () => {
+  const stub = campaignStub();
+  const res = await run(stub, {
+    codes: ["campaign_starbucks_2026:ai_chat", "campaign_reporter_2026:desktop_same"],
+  });
+  assert.equal(res.ok, true, res.logs.join("\n"));
+  assert.equal(res.earned, 200, "ai_chat 100 + desktop_same 100；未勾的 expert/skill/app/expert_chat/skill_use 不动");
+  assert.deepEqual([...res.actions.claimed].sort(), ["ai_chat", "desktop_same"]);
+  // viewed/判据事件只在勾中的两个任务上发生
+  assert.deepEqual([...new Set(stub.viewed.map((v) => v.task))].sort(), ["ai_chat", "desktop_same"]);
+  const mpReports = stub.reports.filter((r) => r.kind === "mp");
+  const desktopEvents = stub.reports.filter((r) => r.kind === "desktop").flatMap((r) => r.events);
+  assert.equal(mpReports.length, 1, "恰一次 chat 判据上报（ai_chat）");
+  assert.equal(mpReports[0].events[0].pageName, "starbucks_activity");
+  assert.equal(desktopEvents.length, 1);
+  assert.equal(desktopEvents[0].id, "cnb-content-calendar");
+  assert.equal(stub.calls.some((c) => c.path.includes("/market/expert/list")), false, "expert 未勾 → 连专家市场都不挑");
+  assert.deepEqual(
+    res.state.activities.map((a) => a.code),
+    ["campaign_starbucks_2026", "campaign_reporter_2026"],
+    "state 只含被勾中的活动",
+  );
+});
+
+test("campaign：runCampaignTasks {codes} —— 未勾中的活动整块跳过（连读取都省）", async () => {
+  const stub = campaignStub();
+  const res = await run(stub, { codes: ["campaign_starbucks_2026:ai_chat"] });
+  assert.equal(res.ok, true);
+  assert.equal(res.earned, 100);
+  const starReads = stub.calls.filter(
+    (c) => c.path === "/portal/activity/tasks" && c.method === "GET" && c.query.includes("campaign_starbucks_2026"),
+  );
+  const repReads = stub.calls.filter(
+    (c) => c.path === "/portal/activity/tasks" && c.method === "GET" && c.query.includes("campaign_reporter_2026"),
+  );
+  assert.ok(starReads.length > 0);
+  assert.equal(repReads.length, 0, "未勾活动零读取（§11.6：连读取都可以省）");
+  assert.deepEqual(
+    res.state.activities.map((a) => a.code),
+    ["campaign_starbucks_2026"],
+  );
+});
+
+test("campaign：runCampaignTasks {codes} —— 空数组=全跑；非空但无活动条目=零上游跳过", async () => {
+  // 空数组 = 全跑（与成长/小程序腿「未传/空数组 = 全部」同款约定）
+  const a = campaignStub();
+  const ra = await run(a, { codes: [] });
+  assert.equal(ra.ok, true);
+  assert.equal(ra.earned, 400, "空数组与不传同义：5 项可领（app 不伪造）");
+
+  // 非空但全是其它命名空间 code（成长/MP/未知）→ 本腿无事可做，零上游
+  const b = campaignStub();
+  const rb = await run(b, { codes: ["Expert_someone_new", "Sequential_Tasks_1", "growth_whatever"] });
+  assert.equal(rb.ok, true);
+  assert.equal(rb.earned, 0);
+  assert.equal(b.calls.length, 0, "交集为空：一次 /portal/activity/* 都不读");
+  assert.deepEqual(rb.state.activities, []);
+  assert.ok(rb.logs.some((l) => l.includes("本腿跳过")), rb.logs.join("\n"));
+
+  // 成长/MP code 混在活动勾选里：只跑活动条目，其余忽略且不告警（两套命名空间）
+  const c = campaignStub();
+  const rc = await run(c, { codes: ["Sequential_Tasks_1", "campaign_starbucks_2026:expert"] });
+  assert.equal(rc.ok, true);
+  assert.equal(rc.earned, 100);
+  assert.equal(
+    c.calls.filter((x) => x.path === "/portal/activity/tasks" && x.method === "GET" && x.query.includes("campaign_reporter_2026")).length,
+    0,
+    "记者节未勾 → 零读取",
+  );
+  assert.ok(!rc.logs.some((l) => l.includes("Sequential_Tasks_1")), "其它命名空间 code 绝不当成活动匹配/告警");
+
+  // 勾中活动但任务 code 不在清单 → 警告一次，连读取都省（零上游）
+  const d = campaignStub();
+  const rd = await run(d, { codes: ["campaign_starbucks_2026:ai_chatt"] });
+  assert.equal(rd.ok, true);
+  assert.equal(rd.earned, 0);
+  assert.equal(d.calls.length, 0, "选中的任务都不在清单 → 连读取都省");
+  assert.ok(
+    rd.logs.some((l) => l.includes("[campaign_starbucks_2026/ai_chatt] 不在活动任务清单")),
+    rd.logs.join("\n"),
   );
 });
 

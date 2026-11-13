@@ -241,6 +241,7 @@ const API_ROUTE_AUTH = [
   { method: "POST", re: /^\/api\/checkin$/, path: "/api/checkin", note: "手动签到" },
   { method: "POST", re: /^\/api\/streak\/run$/, path: "/api/streak/run", note: "手动跑连登管家（补签/礼包/兑换/抽奖）" },
   { method: "POST", re: /^\/api\/campaign\/run$/, path: "/api/campaign/run", note: "手动跑运营活动任务（viewed/判据/领奖，§11.1）" },
+  { method: "POST", re: /^\/api\/campaign\/claim$/, path: "/api/campaign/claim", note: "单条活动任务领奖（必须回读 claimed_at 才算成功，§11.6）" },
   { method: "POST", re: /^\/api\/account\/unfreeze$/, path: "/api/account/unfreeze", note: "解冻 403/11140 冻结的账号" },
   { method: "POST", re: /^\/api\/settings$/, path: "/api/settings", note: "写设置" },
   { method: "POST", re: /^\/api\/account\/toggle$/, path: "/api/account/toggle", note: "参与任务开关" },
@@ -2191,6 +2192,50 @@ export async function startDaemon(opts = {}) {
     }
   }
 
+  // POST /api/campaign/claim：单条活动任务领奖（CONTRACT §11.6 第 3 条，看板
+  // 任务明细的「领取」按钮数据源）。body {uid, activityCode, taskCode}。
+  // 口径与 /api/task/claim（doClaim）逐字同款：引擎能力检查在最前；账号找不到
+  // 抛「找不到账号 …」（manualOp 转 500，与 /api/task/claim 同口径）；显式指定
+  // 的冻结账号如实失败（§10.5 冻结文案，零上游）。成功/失败形状与
+  // /api/task/claim 对齐：{ok, credit, energy, via, reason}（活动领奖没有
+  // chat/web 双路，via 恒空串）。引擎必须回读 claimed_at 才算成功（§11.1），
+  // credit 用活动清单的 reward_credit 记账。撞 restricted（403/11140）当场
+  // 冻结账号（同 doCampaignRun / doStreakRun 的 §10.5 口径）并回冻结提示。
+  async function doCampaignClaim(uid, activityCode, taskCode) {
+    const fn = engine?.campaign?.claimCampaignTask
+    if (typeof fn !== "function") throw new Error(engineErrorsText())
+    const acct = accountByUid(uid)
+    if (!acct) throw new Error(`找不到账号 ${uid}（重新扫描账号或检查 plugin-auth.json）`)
+    // 显式指定的冻结账号如实失败（CONTRACT §10.5）：不静默跳过、不碰上游
+    if (isFrozenUid(uid)) {
+      return {
+        ok: false,
+        credit: 0,
+        energy: 0,
+        via: "",
+        reason: `账号已冻结（11140）：${frozenMessageOf(uid)}；确认无风险后在账号行点「恢复」`,
+      }
+    }
+    const r = await fn(acct, { activity: activityCode, task: taskCode }, engineOpts(acct))
+    if (r?.restricted) {
+      freezeAccount(uid, { code: 11140, message: "活动任务领奖触发风控限制 (403/11140)" })
+      return {
+        ok: false,
+        credit: 0,
+        energy: 0,
+        via: "",
+        reason: "触发风控限制（403/11140），账号已冻结；确认无风险后在账号行点「恢复」",
+      }
+    }
+    return {
+      ok: !!r?.ok,
+      credit: r?.credit ?? 0,
+      energy: r?.energy ?? 0,
+      via: "",
+      reason: scrub(r?.reason ?? ""),
+    }
+  }
+
   // POST /api/account/unfreeze：解冻（CONTRACT §10.2/§10.5）。{uid} 或 {uids}；
   // missing = 本来就没冻结的 uid。
   function doUnfreeze(body) {
@@ -2731,7 +2776,8 @@ export async function startDaemon(opts = {}) {
     }
 
     // 运营活动任务（CONTRACT §11.1）：GET 状态（缓存/refresh/409 与 /api/streak
-    // 完全同口径）、POST 手动跑一轮。两条路由都在 API_ROUTE_AUTH 登记表里。
+    // 完全同口径）、POST 手动跑一轮；§11.6 另加 POST /api/campaign/claim（单条
+    // 活动任务领奖）。三条路由都在 API_ROUTE_AUTH 登记表里。
     if (p === "/api/campaign" && req.method === "GET") {
       const uid = String(u.searchParams.get("uid") ?? "").trim()
       if (!uid) {
@@ -2753,6 +2799,25 @@ export async function startDaemon(opts = {}) {
         return
       }
       const r = await manualOp(() => doCampaignRun(body.uids))
+      json(res, r.status, r.body)
+      return
+    }
+
+    // 单条活动任务领奖（CONTRACT §11.6 第 3 条）：{uid, activityCode, taskCode}
+    // 三条缺一 → 400；形状与 /api/task/claim 对齐（{ok, credit, energy, via, reason}）。
+    if (p === "/api/campaign/claim" && req.method === "POST") {
+      let body
+      try {
+        body = await readBody(req)
+      } catch (e) {
+        json(res, 400, { error: `请求体不是合法 JSON：${shortErr(e)}` })
+        return
+      }
+      if (!body.uid || !body.activityCode || !body.taskCode) {
+        json(res, 400, { error: "需要 uid、activityCode 与 taskCode" })
+        return
+      }
+      const r = await manualOp(() => doCampaignClaim(body.uid, body.activityCode, body.taskCode))
       json(res, r.status, r.body)
       return
     }

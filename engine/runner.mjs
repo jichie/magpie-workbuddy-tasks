@@ -387,7 +387,26 @@ export class JobRunner {
         // 刷新调用」与这一条腿分属两个节奏器（legOpts 每腿新建）—— 这里补一拍
         // gap，保证跨边界的两次上游调用也 ≥1s（宁可多等，绝不硬闯）。
         await this._sleep(Math.max(0, Number(this.opts.gap ?? DEFAULT_GAP_MS)));
+        // 任务级勾选（CONTRACT §3/§11.6）：codes 是**两套命名空间混在一个清单**里的 ——
+        // 成长/小程序的裸 code，以及活动任务的 `<activityCode>:<taskCode>`（**含冒号**）。
+        // 各腿只认自己那套，别把对面那套当「不存在的任务」去警告。
+        // 筛完为空 = 该账号选中的任务都不属于这条腿 → 整腿跳过；**绝不能传空数组**：
+        // 引擎把「空/未传」一律当「全部」，传下去会跑光所有任务（用户只勾了活动任务，
+        // 却把所有成长任务跑一遍 —— 这是不可接受的反向放大）。
+        const legCodes = (() => {
+          const all = job.spec.taskCodes?.[acct.uid];
+          if (!Array.isArray(all) || !all.length) return null; // 未勾选 = 全部
+          const isCampaignCode = (c) => String(c).includes(":");
+          if (leg === "campaign") return all.filter(isCampaignCode);
+          if (leg === "growth" || leg === "mp") return all.filter((c) => !isCampaignCode(c));
+          return null; // 其它腿（streak/buddy/travel/night）没有任务码
+        })();
+
         const step = this._step(job, acct, leg, "running");
+        if (Array.isArray(legCodes) && legCodes.length === 0) {
+          this._finishStep(job, step, "skip", "该账号选中的任务都不属于这条腿，跳过");
+          continue;
+        }
         let res = null;
         try {
           const legOpts = {
@@ -395,13 +414,9 @@ export class JobRunner {
             log: logFn,
             claim: job.spec.claim,
             signal: ctrl.signal,
-            // 任务级勾选（CONTRACT §3）：growth/mp 腿把该账号的选中清单作为
-            // opts.codes 传给引擎；未勾选（taskCodes=null）、该账号不在映射里
-            // 或清单为空 → undefined = 全部任务（旧行为）。buddy/travel/night
-            // 腿没有任务码，不传。
-            ...((leg === "growth" || leg === "mp") && job.spec.taskCodes
-              ? { codes: job.spec.taskCodes[acct.uid] }
-              : {}),
+            ...(legCodes ? { codes: legCodes } : {}),
+            // 任务级勾选：用上面按腿筛好的 legCodes（null = 全部；已在建 step 前
+            // 处理「筛完为空」的整腿跳过）。
             // 猫猫旅行只由 travel 腿触发：growth 腿显式 travel:false（runGrowthTasks
             // 第 3 步据此整段跳过）——只勾 growth 绝不跑旅行、growth+travel 也只跑
             // 一次，步骤 detail/收益由 travel 腿自己记。
