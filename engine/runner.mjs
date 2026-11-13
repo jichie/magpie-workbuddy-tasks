@@ -5,10 +5,11 @@
 //
 // 同一时刻只允许 1 个 job（current() 全局闸门；第二个 start() 抛 409）。
 // 账号与账号之间按 trigger 间隔（manual 1.5 s / schedule 2–5 s 抖动，见
-// schedule.accountGapMs）；腿的顺序固定 growth → mp → streak → buddy → travel →
-// night（mp 在 growth 后：小程序链式任务也是成长体系的一部分；streak 在 buddy
-// 前：连登管家是纯收益且幂等，先收；buddy 在 travel 前：开出的 Buddy 可被随后
-// 一轮旅行使用），spec.legs 是这个顺序的子集。
+// schedule.accountGapMs）；腿的顺序固定 growth → mp → campaign → streak → buddy
+// → travel → night（mp 在 growth 后：小程序链式任务也是成长体系的一部分；
+// campaign 在 mp 后 streak 前：运营活动任务独立于成长体系（CONTRACT §11.1）；
+// streak 在 buddy 前：连登管家是纯收益且幂等，先收；buddy 在 travel 前：开出
+// 的 Buddy 可被随后一轮旅行使用），spec.legs 是这个顺序的子集。
 // spec.taskCodes（{uid: string[]} | null，任务级勾选）只在 growth/mp 腿生效。
 // 旅行只由 travel 腿触发（growth 腿显式 travel:false）；growth+mp 同跑时 growth
 // 腿传 mpTasks:false（2b 关闭），避免小程序任务被两条腿各跑一遍。
@@ -20,6 +21,7 @@
 //（POST /api/account/unfreeze）能解除，绝不自动恢复。
 
 import { runBuddyOpen } from "./buddy.mjs";
+import { runCampaignTasks } from "./campaign.mjs"; // 运营活动任务腿（CONTRACT §11.1）
 import { DEFAULT_GAP_MS, REFRESH_LEAD_MS } from "./constants.mjs";
 import { reportDailyActivity } from "./daily.mjs"; // 每日活跃（点亮成长中心连登，CONTRACT §7）
 import { uuidHex } from "./fingerprint.mjs";
@@ -31,7 +33,9 @@ import { runGrowthTasks } from "./tasks.mjs";
 import { runCatTravel, runNightTask } from "./travel.mjs";
 import { clock, refreshAccount } from "./upstream.mjs";
 
-const LEG_ORDER = ["growth", "mp", "streak", "buddy", "travel", "night"];
+// 腿顺序（CONTRACT §11.1）：campaign 独立于成长体系（独立的 /portal/activity/*
+// 契约），排在 mp 之后、streak 之前；runner 与 daemon 的 LEGS 同序。
+const LEG_ORDER = ["growth", "mp", "campaign", "streak", "buddy", "travel", "night"];
 
 // 任务级勾选（CONTRACT §2/§3）每个账号清单的上限与 daemon.startJob 同款。
 const TASK_CODES_CAP = 500;
@@ -60,7 +64,7 @@ function normalizeTaskCodes(raw) {
 function normalizeSpec(spec = {}) {
   const legs = (Array.isArray(spec.legs) && spec.legs.length ? spec.legs : [...LEG_ORDER])
     .filter((l) => LEG_ORDER.includes(l))
-    .sort((a, b) => LEG_ORDER.indexOf(a) - LEG_ORDER.indexOf(b)); // 顺序固定 growth→mp→streak→buddy→travel→night
+    .sort((a, b) => LEG_ORDER.indexOf(a) - LEG_ORDER.indexOf(b)); // 顺序固定 growth→mp→campaign→streak→buddy→travel→night
   return {
     uids: Array.isArray(spec.uids) && spec.uids.length ? [...spec.uids] : null,
     legs: legs.length ? legs : [...LEG_ORDER],
@@ -413,6 +417,7 @@ export class JobRunner {
           };
           if (leg === "growth") res = await runGrowthTasks(acct, legOpts);
           else if (leg === "mp") res = await runMiniProgramTasks(acct, legOpts);
+          else if (leg === "campaign") res = await runCampaignTasks(acct, legOpts);
           else if (leg === "streak") res = await runStreakSteward(acct, legOpts);
           else if (leg === "buddy") res = await runBuddyOpen(acct, legOpts);
           else if (leg === "travel") res = await runCatTravel(acct, legOpts);

@@ -39,7 +39,7 @@ import {
   writeControl,
 } from "./lifecycle.mjs"
 
-const VERSION = "0.3.4"
+const VERSION = "0.3.5"
 const TOOL_PREFIX = "workbuddy_tasks" // 契约 §6 的工具名前缀（magpie 还会加上插件短名前缀）
 
 // 本文件自己的目录（daemon.mjs 与它同目录）
@@ -143,6 +143,7 @@ function fmtJob(j) {
     const leg =
       s.leg === "growth" ? "成长"
       : s.leg === "mp" ? "小程序"
+      : s.leg === "campaign" ? "活动"
       : s.leg === "streak" ? "连登"
       : s.leg === "buddy" ? "盲盒"
       : s.leg === "travel" ? "旅行"
@@ -165,6 +166,23 @@ function fmtStreakResult(r) {
   if (Array.isArray(d.redeemed) && d.redeemed.length) bits.push(`兑换 ${d.redeemed.join("/")}`)
   if (d.drawn) bits.push(`抽奖 ${d.drawn} 次`)
   return `  · ${r.uid}：${r.outcome === "ok" ? bits.join(" / ") : r.outcome === "skipped" ? "无可做的连登动作" : `失败（${r.message || "未知原因"}）`}${r.earned ? `，+${r.earned} 积分` : ""}`
+}
+
+// 运营活动任务一轮的回执摘要（workbuddy_tasks_campaign 的每个账号一行，
+// 契约 §11.1：「活动 N 项 · 已领 M · +X 积分」）
+function fmtCampaignResult(r) {
+  const d = r.detail ?? {}
+  const n = (d.activities ?? []).filter((a) => !a.error).length
+  const claimed = Array.isArray(d.claimed) ? d.claimed.length : 0
+  const bits = [`活动 ${n} 项`, `已领 ${claimed}`]
+  if ((d.unavailable ?? []).length) bits.push(`未下发 ${(d.unavailable ?? []).length}`)
+  const head =
+    r.outcome === "ok" || r.outcome === "skipped"
+      ? bits.join(" · ")
+      : r.outcome === "failed" && /冻结/.test(String(r.message ?? ""))
+        ? "账号已冻结（403/11140），本轮跳过"
+        : `失败（${r.message || "未知原因"}）`
+  return `  · ${r.uid}：${head}${r.earned ? `，+${r.earned} 积分` : ""}`
 }
 
 function fmtTasks(acct) {
@@ -322,7 +340,7 @@ export const WorkBuddyTasksPlugin = async (input, options) => {
           args: {
             uids: optArr().describe("要跑的账号 uid 列表；不填 = 全部可参与账号"),
             legs: optArr().describe(
-              "任务腿：growth（成长）、mp（小程序链式任务 Sequential_Tasks_1–6 + school_season，次日解锁；Sequential_Tasks_7=PC灵感功能是 web playbook 任务，走 growth 腿，不走小程序链路）、streak（连登管家：补签/档位兑换/抽奖/礼包）、buddy（Buddy 盲盒，消耗成长能量）、travel（猫猫旅行）、night（夜猫子）；不填 = 设置里的默认。growth 与 mp 同时指定时小程序任务只由 mp 腿跑一遍",
+              "任务腿：growth（成长）、mp（小程序链式任务 Sequential_Tasks_1–6 + school_season，次日解锁；Sequential_Tasks_7=PC灵感功能是 web playbook 任务，走 growth 腿，不走小程序链路）、campaign（运营活动任务：星巴克协作/记者节福利等，判据与领奖独立于成长体系）、streak（连登管家：补签/档位兑换/抽奖/礼包）、buddy（Buddy 盲盒，消耗成长能量）、travel（猫猫旅行）、night（夜猫子）；不填 = 设置里的默认。growth 与 mp 同时指定时小程序任务只由 mp 腿跑一遍",
             ),
             claim: optBool().describe("完成后自动领奖，默认跟随设置"),
             codes: optArr().describe(
@@ -446,6 +464,31 @@ export const WorkBuddyTasksPlugin = async (input, options) => {
           },
         }),
 
+        // 运营活动任务（0.3.5，CONTRACT §11.1）：星巴克协作/记者节福利等
+        // campaign_* 活动的判据发射与领奖（app 类只提示不伪造，领奖回读 claimed_at）
+        [`${TOOL_PREFIX}_campaign`]: runTool({
+          description:
+            "跑一轮 WorkBuddy 运营活动任务（星巴克协作、记者节福利等）：补 viewed、按判据上报事件（对话/专家/技能/灵感案例）、领奖并回读回执。手机端 App 类判据只提示、不伪造。已领过的自动跳过。",
+          args: {
+            uids: optArr().describe("要跑的账号 uid 列表；不填 = 全部可参与账号（已冻结的除外）"),
+          },
+          run: async (args, ctx) => {
+            const body = {}
+            if (Array.isArray(args?.uids)) body.uids = args.uids
+            const r = await client.call("POST", "/api/campaign/run", body, 55000, ctx?.abort)
+            if (r.status === 409) return "批量任务运行中，稍后再跑活动任务。"
+            if (r.status === 503) return `执行失败：${r.data?.error ?? "任务引擎不可用"}`
+            if (!r.ok) return `执行失败（HTTP ${r.status}）：${r.data?.error ?? ""}`
+            const results = r.data ?? []
+            if (!results.length) return "没有可参与任务的账号（或全部已冻结）。"
+            const lines = results.slice(0, 10).map(fmtCampaignResult)
+            if (results.length > 10) lines.push(`  … 其余 ${results.length - 10} 个略`)
+            const earned = results.reduce((s, x) => s + (Number(x?.earned) || 0), 0)
+            lines.unshift(`活动任务完成：${results.length} 个账号，共 +${earned} 积分`)
+            return lines.join("\n")
+          },
+        }),
+
         // 解冻（0.3.3，CONTRACT §10.7）：403/11140 冻结只有这里能解除
         [`${TOOL_PREFIX}_unfreeze`]: runTool({
           description:
@@ -526,6 +569,7 @@ export const _internal = {
   fmtJob,
   fmtTasks,
   fmtStreakResult,
+  fmtCampaignResult,
   makeDaemonClient,
   hereDir,
   bindHint,

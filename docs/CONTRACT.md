@@ -1151,3 +1151,87 @@ hub `v2.1.0` 口径：HTTP 403 / code 11140 不是可自动恢复的风控冷却
   文案里（「· 全年 N 天」）。
 - **`heatmap[].score` 量纲**：当天连登分（0 = 当天没连登；实测活跃日是个位到两位数，不是 0/1 布尔）。**只用于展示与「昨日是否为 0」的
   补签判断**，看板的分档着色是纯视觉（0 / 1–2 / 3–5 / 6+），不得参与任何逻辑判断。
+
+## 11. 0.3.5 新增：运营活动任务（campaign）/ skill_share 自动化 / template_5 四事件
+
+来源：hub commit `8eede085`（v2.1.3）。**参考实现逐字对照**：本仓库外的
+`<workspace>/verify-tmp/hub-v2.1.3-wb_tasks.py.diff.txt`（含未变更上下文，关键函数行号：
+`CAMPAIGN_SPECS` 28、`_task_json_request` 212、`_skill_share_market_skill` 248、
+`_create_skill_share_channel` 284、`_skill_share_channel_events` 335、`_run_skill_share_task` 395、
+`_fetch_template_scenes`/`_template_events` 415-460、`_run_template_task` 461、
+`fetch_campaign_tasks` 560、`_campaign_view` 599、`_campaign_claim` 607、`_campaign_poll` 633、
+`_campaign_chat_event` 654、`_campaign_expert_events` 673、`_campaign_skill_events` 700+、
+`_campaign_desktop_events` 720+、`_campaign_pick_expert` 741、`_campaign_fire` 768、
+`run_campaign_tasks` 807）与测试 `<workspace>/verify-tmp/hub-v2.1.3-campaign-tests.py.diff.txt`。
+**上游字段/路径/事件体一律逐字照 hub，不得自行发挥**。
+
+### 11.1 新腿 `campaign`（运营活动任务）
+
+- **独立契约**：base 用**计费域同源的 codebuddy.cn**（`billBase()`），路径
+  `GET /portal/activity/tasks?activity_code=<code>`、
+  `POST /portal/activity/tasks/<task_code>/viewed?activity_code=<code>`、
+  `POST /portal/activity/tasks/<task_code>/claim?activity_code=<code>`（code 一律先 `encodeURIComponent`）。
+  头族用 **chat 头**（`identity.chatHeaders(acct)`），与 hub 的 `account.headers("chat")` 同源。
+- **活动清单硬编码**（与 hub `CAMPAIGN_SPECS` 同源，逐字）：`campaign_starbucks_2026`（星巴克协作）、
+  `campaign_reporter_2026`（记者节福利活动）——各自的 tasks/kind/expert_id/skill_id/case_id/credit 照抄。
+  kind 取值：`chat` / `expert` / `app` / `skill` / `desktop`；**`app`（手机端 App 对话）只提示、不伪造**。
+- **幂等与确认口径**：领奖只 POST 成功**不算**成功，必须回读到 `claimed_at`；
+  进度以 `completed_at` 或 `progress >= target_count` 为准；`need_view` 为真时先 `viewed`。
+  活动任务读取失败要与「活动没下发」区分开（日志写明 HTTP 状态与正文片段）。
+- **与成长腿解耦**：成长清单为空/失败时活动照跑；活动失败不影响成长腿。两者各自记账。
+- **引擎出口**（新模块 `engine/campaign.mjs`）：
+  ```js
+  // 只读：按活动聚合任务与进度；任一活动失败不影响其余，全部失败 → {ok:false,error}
+  export async function fetchCampaignState(acct, opts = {})
+  // -> {ok:true, activities:[{code,label,page,tasks:[{taskCode,label,kind,progress,target,credit,
+  //                            completedAt,claimedAt,needView}], claimable:number, claimed:number}],
+  //     updatedISO}  (opts 若只关心某个 code 可传 {codes:[…]} —— 缺省全跑)
+  // 写：viewed / 事件上报 / 轮询 / 领奖；绝不抛（restricted 透传）
+  export async function runCampaignTasks(acct, opts = {})
+  // -> {ok, earned, restricted?, logs:string[], actions:{viewed:[], fired:[], claimed:[]}, state:<fetchCampaignState>}
+  ```
+- **daemon**：
+  - `LEGS = ["growth","mp","campaign","streak","buddy","travel","night"]`（顺序定死；
+    活动任务独立于成长体系，排在 mp 之后、streak 之前；runner 的 `LEG_ORDER` 同序）；
+    `LEG_NAMES.campaign = "活动任务"`；`SCHEDULE_HOURS_LEGS` 增 `campaign`，**默认 `[]`（留空=不排）**。
+  - `GET /api/campaign?uid=<uid>[&refresh=1]` → `{uid, cached, campaign:<11.1 state 形状>|null, error?}`；
+    缓存 `state/campaign.json`，10 分钟新鲜期，节流口径与 `/api/streak` **完全一致**（含 409 busy）。
+  - `POST /api/campaign/run {"uids":[…]}` → `{results:[{uid, outcome:"ok"|"skipped"|"failed", earned,
+    message, detail:{activities:[{code,label,viewed,fired,claimed}], claimed:[taskCode…], unavailable:[…]}}]}`；
+    缺省 uids = 未冻结且参与任务的账号；账号间隔 1500ms；冻结账号如实失败（同 §10.5 文案）。
+  - `/api/state` 每账号增 `campaign`：`11.1 state 形状 | null`（**只读投影 `state/campaign.json`，
+    绝不为它打上游**）；顶层 `enterpriseSkipped` 等字段不动。
+  - `campaign` 腿走 job 时，runner 与「成长/小程序」一样按账号顺序、受全局 ≥1s 节流与账号间隔约束。
+- **MCP**：新工具 `workbuddy_tasks_campaign`（args `{uids?}` → `POST /api/campaign/run`，
+  回一句人话摘要：每个账号「活动 N 项 · 已领 M · +X 积分」）。
+
+### 11.2 `skill_share` 改为可自动化（原「不可自动化」结论作废）
+
+- `constants.TASK_SPECS.skill_share` 改为 `{ kind:"skillshare", target:1, reward:100, name:"分享一个技能给好友" }`，
+  **移出 unforgeable**；注释改为「官方 Open Platform 路径（hub 8eede085）；创建渠道会在上游真实生成分享链接」。
+- 流程（**逐字**照 hub）：市场技能目录 `POST billBase()/v2/operation-platform/market/skill/list`
+  `{"page":1,"page_size":20}`（chat 头）→ 选技能（偏好 `skill_2097350077599879168`，否则第一个可用）
+  → `POST https://open.workbuddy.cn/api/v2/open-platform/asset-shares/c2c/channels`
+  （body/头逐字照 hub：`asset_kind/asset_source/asset_ref/ways/extra`；头在 chat 头基础上
+  `Content-Type/Accept/User-Agent=desktop/X-User-Id/X-Domain: copilot.tencent.com`）
+  → **必须同时拿到 `share_code` 与 `ways[share_way=="link"].resource_ref`** 才继续
+  → 上报两条 `skill_share_channel_action`（`click` / `success`，字段逐字照 hub）到 **chat 域** `/v2/report`
+  → 轮询成长任务进度（4 次 × 3s）→ 领奖（复用现有 `claimTask`，回读确认）。
+- **诚实口径**：市场/渠道/事件任一步失败 → 记一行原因、跳过、不领奖、不伪造；`restricted` 照常透传冻结。
+- 该 code 属于成长体系，**由 growth 腿执行**（不进 campaign 腿）；看板无需新入口（任务行照常显示）。
+
+### 11.3 `template_5` 四事件 + 真实场景
+
+- 场景表：`GET https://www.workbuddy.cn/console/as/support/scenes?locale=zh-CN`（chat 头）→ `data.scenes[]`；
+  请求失败/为空才回落 hub 的内置表 `[("0","幻灯片"),("4","深度研究"),("8","数据分析"),("16","设计"),("20","日常开发")]`。
+- 按**缺口**逐组上报四事件：`agent_task_created` → `agent_task_created_with_template` →
+  `template_used` → `playbook_prompt_send`（字段逐字照 hub `_template_events`）。
+- 现有 `kind:"template"` 的单事件实现（`agent_task_created_with_template` + 硬编码「幻灯片」）**替换**为本实现；
+  进度未确认不提前领奖。
+
+### 11.4 顺带核对（默认不改行为）
+
+- 签到：核对我们的 `/api/checkin` 分类是否已覆盖 hub `a576ab7a`「重复签到不再冒充成功(+100积分)」；
+  已覆盖 → 只在报告里说明，不动代码。
+- 积分明细：核对 hub `d9805d5f`「拉全状态 + 官方累计口径」与 `engine/credits.mjs` 的差异；
+  仅当我们的「已消耗/累计」口径与官方不一致时，按 hub 口径修展示层（只读，不改查询语义之外的字段名）。

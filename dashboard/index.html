@@ -6,7 +6,7 @@
   <meta name="robots" content="noindex">
   <!-- 静态文件版本：必须与 package.json 的 version 一致（后端测试比对四处：
        package.json / index.mjs 的 VERSION / page 页脚 / 这个 meta）。app.js 读它做版本一致性检查。 -->
-  <meta name="wb-version" content="0.3.4">
+  <meta name="wb-version" content="0.3.5">
   <title>WorkBuddy 任务 · 看板</title>
   <link rel="icon" href="logo-mark.png" type="image/png">
   <link rel="stylesheet" href="style.css">
@@ -174,6 +174,7 @@
         <fieldset class="segments" id="legsBox">
           <legend class="sr-only">任务腿</legend>
           <label class="segment" title="成长任务（含微信小程序链式任务 Sequential_Tasks_1–6；小程序任务随成长任务一起跑）"><input type="checkbox" class="leg-check" value="growth"><span>成长任务</span></label>
+          <label class="segment" title="活动任务：运营活动专用链路（星巴克协作 / 记者节福利等）。与成长任务解耦 —— 独立跑、独立记账，成长清单为空/失败时活动照跑"><input type="checkbox" class="leg-check" value="campaign"><span>活动任务</span></label>
           <label class="segment" title="连登管家：补签昨日 → 领新手礼包/活动补偿 → 兑换可用连登档位 → 抽奖（幂等、纯收益，已领的静默跳过）"><input type="checkbox" class="leg-check" value="streak"><span>连登管家</span></label>
           <label class="segment" title="Buddy 盲盒：消耗成长能量开盲盒（不是领奖）；无能量时后端会跳过"><input type="checkbox" class="leg-check" value="buddy"><span>Buddy 盲盒</span></label>
           <label class="segment"><input type="checkbox" class="leg-check" value="travel"><span>猫猫旅行</span></label>
@@ -253,6 +254,11 @@
               <span class="hint">北京时间小时；留空 = 不排程；只跑 Sequential_Tasks 系列小程序任务</span>
             </div>
             <div class="hour-row">
+              <span class="field-label">活动任务</span>
+              <input class="input input-mono" id="hoursCampaign" inputmode="numeric" placeholder="留空" aria-label="活动任务小时窗口">
+              <span class="hint">北京时间小时；留空 = 不排程；运营活动专用链路，与成长任务解耦、独立记账</span>
+            </div>
+            <div class="hour-row">
               <span class="field-label">连登管家</span>
               <input class="input input-mono" id="hoursStreak" inputmode="numeric" placeholder="留空" aria-label="连登管家小时窗口">
               <span class="hint">北京时间小时；留空 = 不排程；幂等（补签 / 领礼包 / 兑换档位 / 抽奖），重复跑不会重复领</span>
@@ -278,7 +284,7 @@
               <button type="button" class="ghost-btn" id="saveHoursBtn">保存窗口</button>
             </div>
           </div>
-          <p class="hint hours-note">北京时间（UTC+8）小时；留空 = 不排程。小程序任务按天解锁，连登管家幂等（不会重复领），Buddy 盲盒消耗成长能量，夜猫子仅 23:00–08:00 计数。</p>
+          <p class="hint hours-note">北京时间（UTC+8）小时；留空 = 不排程。小程序任务按天解锁，活动任务与成长任务解耦（独立跑、独立记账），连登管家幂等（不会重复领），Buddy 盲盒消耗成长能量，夜猫子仅 23:00–08:00 计数。</p>
 
           <div class="sched-cols">
             <div class="sched-block">

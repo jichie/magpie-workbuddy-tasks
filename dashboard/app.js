@@ -52,8 +52,22 @@
 //        missing = 本来就没冻结（幂等）。冻结不再自动解除，只有这个接口（或看板「恢复」）能解。
 //        accounts[].frozen = {at:ISO, code:number|string, message} | null；
 //        顶层 frozen = [{uid, nickname, at, code, message}]（冻结总览）。
+//   GET  /api/campaign?uid=<uid>[&refresh=1]
+//                                         -> {uid, cached, campaign:<活动任务状态>|null, error?}
+//        活动任务状态 = {ok, activities:[{code,label,page,tasks:[{taskCode,label,kind,progress,
+//        target,credit,completedAt,claimedAt,needView}], claimable, claimed}], updatedISO}
+//        （CONTRACT §11.1）；缓存 state/campaign.json 新鲜期 10 分钟，refresh=1 强制拉
+//        （job 在跑 → 409 busy）。accounts[].campaign 是同一形状的只读投影
+//        （state/campaign.json），没查过 = null。后端尚未落地/字段缺失（undefined）时一律
+//        按 null 处理 —— 显示「未查询」，不抛错、不白屏。
+//   POST /api/campaign/run  {uids?}       -> {results:[{uid, outcome:"ok"|"skipped"|"failed",
+//                                                   earned, message, detail:{activities:[…],
+//                                                   claimed:[…], unavailable:[…]}}]}
+//        缺省/空 uids = 全部「未冻结 + tasksEnabled」账号；账号间隔 1500ms；
+//        冻结账号 → outcome "failed" + 冻结提示（CONTRACT §11.1/§10.5）。
+//        活动任务与成长任务解耦：独立跑、独立记账（成长清单为空/失败时活动照跑）。
 //   POST /api/settings    (部分字段)       -> 完整 settings {scheduler,claim,legs,gapMs,hours,host}
-//        hours 键集合 mp|buddy|streak|travel|night（streak = 连登管家）；留空 = 不排程。
+//        hours 键集合 mp|buddy|campaign|streak|travel|night（campaign = 活动任务）；留空 = 不排程。
 //   POST /api/accounts                    -> {count,eligible,added,removed}（重扫本地文件，无副作用）
 //   POST /api/account/toggle {uid,tasksEnabled:bool} -> 200 该账号的最新行（accounts[] 元素同形状）
 //                                            | 400/404 {error:"…"}（中文）
@@ -81,7 +95,7 @@ const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
 // ---- 文案映射（领域词汇对齐 daemon/engine 与 CONTRACT） -----------------------
 
-const LEG_NAMES = { growth: "成长任务", mp: "小程序链式任务", streak: "连登管家", buddy: "Buddy 盲盒", travel: "猫猫旅行", night: "夜猫子" };
+const LEG_NAMES = { growth: "成长任务", mp: "小程序链式任务", campaign: "活动任务", streak: "连登管家", buddy: "Buddy 盲盒", travel: "猫猫旅行", night: "夜猫子" };
 const ACCEPT_NAMES = {
   not_accepted: "未接取",
   accepted: "已接取",
@@ -123,6 +137,10 @@ const state = {
   streakErrors: new Map(), // uid -> string：查询失败原因（显示在连登区的说明行里，不弹错）
   streakRuns: new Map(), // uid -> {ok, text}：最近一次「连登管家」结果（跨重绘保留，不静默）
   heatOpen: new Set(), // 展开连登日历的 uid（默认折叠；轮询重绘不丢状态）
+  campaignBusy: new Set(), // 活动任务查询/运行正在请求中的 uid（防重复并发）
+  campaignErrors: new Map(), // uid -> string：活动任务查询失败原因（显示在活动任务条里，不弹错）
+  campaignRuns: new Map(), // uid -> {ok, text}：最近一次「活动任务」结果（跨重绘保留，不静默）
+  campaignOpen: new Set(), // 展开「活动任务明细」小列表的 uid（默认折叠；轮询重绘不丢状态）
   unfreezing: new Set(), // 「恢复」正在请求中的 uid（期间禁用该行按钮）
   busy: false, // 批量操作进行中
   lastFinished: null, // 最近一个结束的 job（SSE 收尾广播）
@@ -1264,6 +1282,9 @@ async function refreshSnap(uid, btn) {
     // （GET /api/streak?uid=<uid>&refresh=1），只更新该账号的连登区。
     // 静默口径：不弹任何 toast；批量任务在跑时 daemon 回 409 busy，直接跳过（刷新快照本身不失败）。
     await queryStreak(uid);
+    // 0.3.5：活动任务同款 —— accounts[].campaign 为 null 时不自动打上游，只在「刷新快照」后
+    // 顺带静默补查一次（GET /api/campaign?uid=<uid>&refresh=1），结果写进本地缓存。
+    await queryCampaign(uid);
   } catch (e) {
     humanErr(e, "刷新快照失败");
     const b = $(`[data-snap-refresh="${uid}"]`);
@@ -1579,13 +1600,15 @@ function accountRow(a) {
       "div",
       { class: "acct-grid" },
       el("div", { class: "acct-cell acct-pick" }, el("label", { class: "check" }, check)),
-      // 账号单元格横向：左边昵称，右边紧跟两行连登信息（数字 + 三档状态）。
+      // 账号单元格横向：左边昵称，右边紧跟连登两行 + 活动任务条（0.3.5）。
+      // .acct-id-stack 把「连登条 + 活动任务条」竖排（活动任务条在连登条下面）；
+      // 它只是包一层，不改连登条自身内容，也不动账号行其它列。
       // 原来横跨整行的 .acct-streak（含按钮与日历）已取消。
       el(
         "div",
         { class: "acct-cell acct-id" },
         el("span", { class: "acct-name", text: name, title: nameTitle }),
-        streakCellBlock(a),
+        el("div", { class: "acct-id-stack" }, streakCellBlock(a), campaignCellBlock(a)),
       ),
       statusCell,
       progressCell,
@@ -2964,6 +2987,310 @@ function unfreezeButton(uid) {
   });
 }
 
+// ---- 运营活动任务（0.3.5，CONTRACT §11.1） ------------------------------------------------
+// 数据面（后端并行实现期间按「字段可能缺席」处理）：
+//   GET  /api/campaign?uid=<uid>&refresh=0|1 -> {uid, cached, campaign|null, error?}
+//   POST /api/campaign/run {uids?}           -> {results:[{uid,outcome,earned,message,detail}]}
+//   /api/state：accounts[].campaign 是只读投影。
+// 容错铁律：campaign 为 undefined（后端还没落地）一律按 null 处理 —— 显示「未查询」，
+// 绝不抛错、绝不白屏；每个形状先过 typeof / Array.isArray 守卫，缺字段不猜。
+// 与连登同款纪律：查询失败写进条内说明行（不弹错）；运行结果进 state.campaignRuns
+// + toast，轮询重绘后仍看得见；活动任务与成长任务解耦（独立契约，不进任务快照）。
+
+// 本地已查到的活动任务状态：跨 /api/state 轮询保留（后端投影为 null / 尚未落地时，
+// 不会把刚查到的值刷回「未查询」）。
+const campaignCache = new Map(); // uid -> 活动任务状态
+
+function campaignNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+// accounts[i].campaign 的对象形状，或本地缓存；undefined / null / 非对象 → null（= 未查询）
+function campaignOf(a) {
+  const c = a?.campaign;
+  if (c && typeof c === "object") return c;
+  const cached = campaignCache.get(String(a?.uid ?? ""));
+  return cached && typeof cached === "object" ? cached : null;
+}
+
+// 活动列表（只读契约字段 activities[]，缺字段归一 []）
+function campaignActivities(st) {
+  return Array.isArray(st?.activities)
+    ? st.activities.filter((x) => x && typeof x === "object")
+    : [];
+}
+
+// 一行汇总文案：`活动任务：星巴克协作 2/3 · 记者节福利 0/3 · 可领 1`。
+// 每个活动显示「已领 / 总数」（claimed 优先，缺字段时按任务 claimedAt 计数）；末尾附可领合计。
+// 没有任何活动 = 「活动任务：未查询」（诚实口径 —— 绝不显示成 0/0 假装查过）。
+// 纯函数（导出仅供 Node 下校验）。
+export function campaignSummaryText(st) {
+  const acts = campaignActivities(st);
+  if (!acts.length) return "活动任务：未查询";
+  const parts = acts.map((act) => {
+    const label = String(act?.label ?? act?.code ?? "活动").trim() || "活动";
+    const tasks = Array.isArray(act?.tasks) ? act.tasks : [];
+    // claimed 是数字就用它；null / "" / 缺失（没给）退回按任务的 claimedAt 计数 —— 不把「没给」当 0
+    const hasCount = act?.claimed != null && act.claimed !== "" && Number.isFinite(Number(act.claimed));
+    const claimed = hasCount
+      ? campaignNum(act.claimed)
+      : tasks.filter((t) => String(t?.claimedAt ?? "").trim()).length;
+    return `${label} ${claimed}/${tasks.length}`;
+  });
+  const claimable = acts.reduce((n, act) => n + campaignNum(act?.claimable), 0);
+  return `活动任务：${parts.join(" · ")} · 可领 ${claimable}`;
+}
+
+// 活动任务明细小列表（默认折叠）：活动 → 任务名 + 进度 / 奖励 + 已领标记。
+// 展开状态按 uid 记在 state.campaignOpen —— 3 秒轮询重建 DOM 不会把它折回去。
+function campaignListBlock(a, st) {
+  const uid = String(a.uid ?? "");
+  const acts = campaignActivities(st);
+  if (!acts.length) return null;
+  const details = el("details", { class: "campaign-list", dataset: { campaignList: uid } });
+  if (state.campaignOpen.has(uid)) details.open = true;
+  const taskCount = acts.reduce((n, act) => n + (Array.isArray(act?.tasks) ? act.tasks.length : 0), 0);
+  const summary = el(
+    "summary",
+    {
+      class: "campaign-list-summary",
+      title: "活动任务明细：每个活动下的任务名 / 进度 / 奖励 / 是否已领（活动任务是独立契约，不在任务快照里）",
+    },
+    el("span", { class: "campaign-list-label", text: `活动任务明细 · ${acts.length} 个活动 / ${taskCount} 项` }),
+  );
+  const body = el("div", { class: "campaign-list-body" });
+  for (const act of acts) {
+    const tasks = Array.isArray(act?.tasks) ? act.tasks : [];
+    const actLabel = String(act?.label ?? act?.code ?? "活动").trim() || "活动";
+    body.append(
+      el("div", { class: "campaign-act" },
+        el("span", { class: "campaign-act-label", text: actLabel }),
+        el("span", { class: "campaign-act-meta", text: `可领 ${campaignNum(act?.claimable)}` }),
+      ),
+    );
+    if (!tasks.length) {
+      body.append(el("div", { class: "campaign-task campaign-task-empty", text: "该活动暂无任务" }));
+      continue;
+    }
+    for (const t of tasks) {
+      const claimed = String(t?.claimedAt ?? "").trim() !== "";
+      const reward = campaignNum(t?.credit);
+      body.append(
+        el("div", { class: "campaign-task" },
+          el("span", {
+            class: "campaign-task-name",
+            text: String(t?.label ?? t?.taskCode ?? "任务"),
+            title: `任务码：${String(t?.taskCode ?? "")}`,
+          }),
+          el("span", { class: "campaign-task-prog", text: `${campaignNum(t?.progress)}/${campaignNum(t?.target)}` }),
+          reward > 0 ? el("span", { class: "campaign-task-reward", text: `+${fmtNum(reward)}` }) : null,
+          claimed ? el("span", { class: "campaign-task-claimed", text: "已领" }) : null,
+        ),
+      );
+    }
+  }
+  details.append(summary, body);
+  details.addEventListener("toggle", () => {
+    if (details.open) state.campaignOpen.add(uid);
+    else state.campaignOpen.delete(uid);
+  });
+  return details;
+}
+
+// 账号单元格里的活动任务条（0.3.5）：与连登条同级别、同风格，紧跟在连登条下面。
+// 锚点 [data-campaign-cell="uid"] 供 updateCampaignArea() replaceWith 局部重绘（一账号一个）。
+// 额外说明行（最近一次结果 / 查询失败）只在有内容时追加，正常情况就是干净的一行 + 按钮。
+function campaignCellBlock(a) {
+  const uid = String(a.uid ?? "");
+  const st = campaignOf(a);
+  const err = state.campaignErrors.get(uid);
+  const run = state.campaignRuns.get(uid);
+  const busy = state.campaignBusy.has(uid);
+  const kids = [];
+
+  // 第 1 行：汇总文案（未查询 / 各活动 已领/总数 · 可领 N）
+  kids.push(
+    el("span", {
+      class: st && campaignActivities(st).length ? "campaign-line" : "campaign-line campaign-empty",
+      text: st ? campaignSummaryText(st) : "活动任务：未查询",
+      title: st
+        ? "活动任务（CONTRACT §11.1）：每个活动显示「已领 / 总数」，可领 = 当前可领奖项数"
+        : "活动任务：还没查过（点账号行「刷新快照」会顺带补查一次）",
+    }),
+  );
+  // 第 2 行：运行按钮（单账号 → POST /api/campaign/run {uids:[uid]}）
+  kids.push(
+    el("div", { class: "campaign-actions" },
+      el("button", {
+        type: "button",
+        class: "mini-btn campaign-btn",
+        dataset: { campaignRun: uid },
+        text: busy ? "运行中…" : "跑一轮活动任务",
+        disabled: busy,
+        title: "POST /api/campaign/run {uids:[uid]}：只对这一个账号跑一轮运营活动任务（真实写动作）。活动任务与成长任务解耦，独立跑、独立记账。",
+        onclick: () => runCampaignOne(uid),
+      }),
+    ),
+  );
+  // 最近一次活动任务结果（含失败原因）：轮询重绘后仍看得见，绝不静默
+  if (run) {
+    kids.push(
+      el("span", {
+        class: run.ok ? "campaign-note campaign-run" : "campaign-note campaign-run warn-text",
+        text: run.text,
+        title: run.text,
+      }),
+    );
+  }
+  // 全部子请求都失败时 campaign 里带 ok:false + error（部分失败仍是 ok:true）——如实说出来
+  if (st?.ok === false && st.error) {
+    kids.push(el("span", { class: "campaign-note campaign-err warn-text", text: `活动任务读取失败：${String(st.error)}` }));
+  }
+  // 查询失败（含「刷新快照」顺带补查时失败）：失败原因落在这里，不弹错也不吞掉
+  if (err) {
+    const t = `活动任务查询失败：${err}`;
+    kids.push(el("span", { class: "campaign-note campaign-err warn-text", text: t, title: t }));
+  }
+  // 可折叠的明细小列表（默认折叠）
+  const list = campaignListBlock(a, st);
+  if (list) kids.push(list);
+  return el("div", { class: "acct-campaign", dataset: { campaignCell: uid } }, ...kids);
+}
+
+// 只重绘活动任务条（同 updateStreakArea 的理由：不打散任务勾选 / 折叠 / 输入焦点）。
+function updateCampaignArea(uid) {
+  const acct = accountByUid(uid);
+  if (!acct) return;
+  const box = $(`[data-campaign-cell="${uid}"]`);
+  if (box) box.replaceWith(campaignCellBlock(acct));
+}
+
+function applyCampaign(uid, campaign) {
+  const acct = accountByUid(uid);
+  if (acct) acct.campaign = campaign;
+  if (campaign && typeof campaign === "object") campaignCache.set(uid, campaign);
+  state.campaignErrors.delete(uid);
+  updateCampaignArea(uid);
+}
+
+// HTTP 错误 / 空返回统一转成可渲染结果，绝不抛（调用方不用 try/catch）。
+async function requestCampaign(uid, refresh) {
+  try {
+    const d = await api("api/campaign", { params: { uid, refresh: refresh ? 1 : 0 } });
+    const c = d?.campaign;
+    if (c && typeof c === "object") return { ok: true, campaign: c };
+    // campaign:null + error = 上游读不到；campaign:null 无 error = 该账号还没查过（后端也没缓存）
+    return { ok: false, kind: "empty", error: humanizeApiErr(String(d?.error || "上游没有返回活动任务状态"), d?.hint) };
+  } catch (e) {
+    if (e instanceof ApiError) {
+      if (e.status === 409) return { ok: false, kind: "busy", error: "批量任务运行中，稍后再查" };
+      if (e.status === 404) {
+        const hasBody = e.message && e.message !== "HTTP 404";
+        return {
+          ok: false,
+          kind: "absent",
+          error: hasBody
+            ? humanizeApiErr(e.message, e.data?.hint)
+            : "账号不存在，或 /api/campaign 还没实现（后端需 0.3.5）",
+        };
+      }
+      return { ok: false, kind: "http", error: humanizeApiErr(e.message || `HTTP ${e.status}`, e.data?.hint) };
+    }
+    if (e && e.network) return { ok: false, kind: "network", error: "连不上守护进程" };
+    return { ok: false, kind: "error", error: humanizeApiErr(String((e && e.message) || e)) };
+  }
+}
+
+// 查询活动任务状态（refresh=1；是否真打上游由 daemon 的 10 分钟缓存定）。
+// 与连登完全同款：唯一触发点是单账号「刷新快照」的顺带补查（默认 silent）；
+// 批量任务在跑时 daemon 回 409 busy → 静默跳过（连错误行都不留）。
+// 其它失败仍如实写进 state.campaignErrors，由活动任务条那行显示（不弹错 ≠ 吞掉）。
+async function queryCampaign(uid, { silent = true } = {}) {
+  if (state.campaignBusy.has(uid)) return { ok: false, kind: "pending", error: "正在查询活动任务" };
+  state.campaignBusy.add(uid);
+  updateCampaignArea(uid);
+  try {
+    const r = await requestCampaign(uid, true);
+    if (r.ok) {
+      applyCampaign(uid, r.campaign);
+      return r;
+    }
+    if (silent && r.kind === "busy") return r;
+    state.campaignErrors.set(uid, r.error);
+    return r;
+  } finally {
+    state.campaignBusy.delete(uid);
+    updateCampaignArea(uid);
+  }
+}
+
+// 「活动任务」结果 → 一行中文（CONTRACT §11.1 的 results[i]）。
+// 只认契约字段：outcome ok|skipped|failed、earned、message、detail{activities[],claimed[],unavailable[]}；
+// 缺字段不猜、不抛。纯函数（导出仅供 Node 下校验）。
+export function campaignResultText(r, who) {
+  const name = String(who || r?.uid || "账号");
+  const outcome = String(r?.outcome ?? "");
+  const detail = r?.detail && typeof r.detail === "object" ? r.detail : {};
+  const bits = [];
+  const earned = campaignNum(r?.earned);
+  if (earned > 0) bits.push(`+${fmtNum(earned)} 积分`);
+  const claimed = Array.isArray(detail.claimed) ? detail.claimed.length : 0;
+  if (claimed > 0) bits.push(`新领 ${claimed} 项`);
+  const unavailable = Array.isArray(detail.unavailable) ? detail.unavailable.length : 0;
+  if (unavailable > 0) bits.push(`${unavailable} 项不可用`);
+  // 活动明细计数（形状未定，容错）：activities[].viewed/fired/claimed 是数字时汇总
+  const acts = Array.isArray(detail.activities) ? detail.activities : [];
+  const fired = acts.reduce((n, act) => n + campaignNum(act?.fired), 0);
+  if (fired > 0) bits.push(`点亮 ${fired} 项`);
+  // outcome 只认契约三值；其它/缺失一律「结果未知」—— 绝不把未知说成成功
+  const head = outcome === "failed" ? "失败" : outcome === "skipped" ? "跳过" : outcome === "ok" ? "完成" : "结果未知";
+  const tail = bits.length ? `：${bits.join(" · ")}` : "";
+  const msg = String(r?.message ?? "").trim();
+  // 失败 / 跳过时 message 是重点（冻结原因…）；成功且有明细时不重复 message
+  const msgPart = msg && (outcome !== "ok" || !bits.length) ? `（${msg}）` : "";
+  return `${name}：活动任务${head}${tail}${msgPart}`;
+}
+
+function rememberCampaignRun(uid, row, who) {
+  const key = String(uid ?? "").trim();
+  // 没有 row（后端没给这个账号的结果）不算成功：如实标红，不静默
+  const ok = !!row && String(row.outcome ?? "") !== "failed";
+  const text = row ? campaignResultText(row, who) : `${who}：活动任务没有返回结果`;
+  if (key) state.campaignRuns.set(key, { ok, text });
+  return { ok, text };
+}
+
+// 单账号「跑一轮活动任务」：POST /api/campaign/run {uids:[uid]}。
+// 结果进行内说明行 + toast（成功 / 失败都显示，绝不静默）；失败也要显示原因。
+async function runCampaignOne(uid) {
+  const who = accountByUid(uid)?.nickname || uid;
+  if (state.campaignBusy.has(uid)) return;
+  state.campaignBusy.add(uid);
+  updateCampaignArea(uid);
+  try {
+    const r = await api("api/campaign/run", { method: "POST", body: { uids: [uid] } });
+    const list = Array.isArray(r?.results) ? r.results : [];
+    const row = list.find((x) => String(x?.uid ?? "") === uid) ?? list[0] ?? null;
+    const { ok, text } = rememberCampaignRun(uid, row, who);
+    toast(text, ok ? "info" : "warn", ok ? 6500 : 9000);
+    await loadState();
+  } catch (e) {
+    // 失败也要显示原因（别静默）：连不上的网络错误也如实说
+    const msg = e instanceof ApiError
+      ? humanizeApiErr(e.message || `HTTP ${e.status}`, e.data?.hint)
+      : e && e.network
+        ? "连不上守护进程"
+        : humanizeApiErr(String((e && e.message) || e));
+    const text = `${who}：活动任务失败 —— ${msg}`;
+    state.campaignRuns.set(uid, { ok: false, text });
+    toast(text, "warn", 9000);
+  } finally {
+    state.campaignBusy.delete(uid);
+    updateCampaignArea(uid);
+  }
+}
+
 // 「批量接任务」按钮旁的常驻说明（规则 4）：勾选范围内有多少未接取项被引擎判定为
 // 不可自动接取（桌面端 / 未收录）。数字只来自后端 canAccept 字段；老后端没给字段、
 // 或计数为 0 时不显示（不猜、不静默少接）。
@@ -4059,10 +4386,11 @@ function renderScheduler() {
   const settings = d.settings ?? {};
 
   setChecked($("#schedEnabled"), sch.enabled);
-  // 小时窗口只保留 Buddy 盲盒 / 小程序链式任务 / 猫猫旅行 / 夜猫子；
+  // 小时窗口只保留 Buddy 盲盒 / 小程序链式任务 / 活动任务 / 连登管家 / 猫猫旅行 / 夜猫子；
   // settings.hours.growth 即使老后端还带也一律忽略。mp 默认 []（不排程）。
   const hours = settings.hours ?? {};
   setVal($("#hoursMp"), (hours.mp ?? []).join(","));
+  setVal($("#hoursCampaign"), (hours.campaign ?? []).join(","));
   setVal($("#hoursStreak"), (hours.streak ?? []).join(","));
   setVal($("#hoursBuddy"), (hours.buddy ?? []).join(","));
   setVal($("#hoursTravel"), (hours.travel ?? []).join(","));
@@ -4143,12 +4471,14 @@ function parseHoursInput(v) {
 }
 
 async function saveHours() {
-  // 排程服务五条无任务码的腿：小程序链式任务 / 连登管家 / Buddy 盲盒 / 猫猫旅行 / 夜猫子；
+  // 排程服务六条无任务码的腿：小程序链式任务 / 活动任务 / 连登管家 / Buddy 盲盒 / 猫猫旅行 / 夜猫子；
   // 成长任务已从排程里移除（手工运行仍可选它）。所有输入框留空 = []（不排程）；
-  // mp 默认不排程（按天解锁），streak 是幂等的纯收益（默认不排，需要时显式配小时窗口），
+  // mp 默认不排程（按天解锁），campaign 默认不排程（独立记账的活动任务），
+  // streak 是幂等的纯收益（默认不排，需要时显式配小时窗口），
   // buddy 会消耗成长能量（是否真正开盒由后端决定）。
   const hours = {
     mp: parseHoursInput($("#hoursMp").value),
+    campaign: parseHoursInput($("#hoursCampaign").value),
     streak: parseHoursInput($("#hoursStreak").value),
     buddy: parseHoursInput($("#hoursBuddy").value),
     travel: parseHoursInput($("#hoursTravel").value),
@@ -4495,6 +4825,12 @@ async function loadState({ quiet = false } = {}) {
       if (a.streak == null) {
         const cached = streakCache.get(String(a.uid ?? ""));
         if (cached) a.streak = cached;
+      }
+      // 活动任务同理（0.3.5 后端未落地时 campaign 恒为 undefined）：本地已查到的值兜底，
+      // 否则 3s 轮询会把活动任务条刷回「未查询」（后端的 null 绝不能盖掉刚查到的结果）。
+      if (a.campaign == null) {
+        const cached = campaignCache.get(String(a.uid ?? ""));
+        if (cached) a.campaign = cached;
       }
     }
     if (state.conn !== "stopped") state.conn = "online";

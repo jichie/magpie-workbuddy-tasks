@@ -1,5 +1,47 @@
 # 更新日志
 
+## 0.3.5 — 2026-11-13
+
+来源：workbuddy2api-hub commit `8eede085`（v2.1.3）的三项任务自动化，以及一次插件加载故障的修复。
+
+### 新增
+
+- **运营活动任务（新任务腿 `campaign`）**：活动任务走**独立于成长清单**的 `/portal/activity/*` 契约
+  （计费域 codebuddy.cn）：读取任务与进度 → `viewed` → 事件上报 → `claim`，并**回读 `claimed_at`**
+  才算领到（只 POST 成功不算）。当前两个活动：
+  **星巴克协作**（与 AI 对话 3 次 / 召唤专家并对话 / 解锁 App 强大能力）与
+  **记者节福利活动**（体验「媒体工作助理」专家 / 体验「采访素材整理」技能 / 体验「内容发布排期」灵感），
+  两账号合计 500 积分可拿。**手机端 App 对话任务只提示、不伪造**；活动读取失败与「活动没下发」
+  在日志与状态里严格区分。与成长腿**解耦**：成长清单为空或读取失败时活动照跑。
+  看板账号行新增「活动任务」条（活动进度 / 可领数 / 「跑一轮活动任务」），批量条与排程都可勾选，
+  `GET /api/campaign`（10 分钟缓存）与 `POST /api/campaign/run` 与连登管家同款口径；
+  新工具 `workbuddy_tasks_campaign`。
+- **`skill_share`（分享一个技能给好友）改为可自动化**：原判断「需电脑端 5.9.0+ 手动分享、
+  无事件可伪造」**作废** —— hub 找到了官方 Open Platform 路径：从市场技能目录取可分享技能 →
+  `POST open.workbuddy.cn/api/v2/open-platform/asset-shares/c2c/channels` **创建真实分享渠道** →
+  同时拿到 `share_code` 与 `link` 才上报两条 `skill_share_channel_action`（click / success）→
+  等成长任务进度落账后领奖。**创建渠道会在上游真实生成分享链接**（这是任务的真实动作，不是伪造事件）；
+  市场、渠道、事件任一步失败都如实跳过、不领奖。
+- **`template_5` 换成四事件链 + 真实场景 ID**：从 `/console/as/support/scenes` 读取真实场景，
+  按缺口逐组上报 `agent_task_created` → `agent_task_created_with_template` → `template_used` →
+  `playbook_prompt_send`（服务不可用才回落内置场景表）；旧实现只发一条硬编码「幻灯片」事件，已删除。
+- 「不可自动化」的原因文案随之更新（`skill_share` 移出该列表）。
+
+### 修复
+
+- **插件加载不再被宿主 SDK 的导入拖住**（magpie 报 `the plugin's load didn't finish in 20s`）：
+  `@opencode-ai/plugin` 在本地文件夹安装下不在磁盘上，Bun 对缺失的裸导入会**联网自动安装** ——
+  冷缓存时经容器代理拉取能卡满 20 秒加载预算。现在该导入包了 6 秒硬超时（超时只少工具注册，
+  绝不影响插件加载与看板），后台那条导入的失败不会变成 unhandledRejection。
+- 引擎新增 `init.replaceHeaders` 内部通道（活动事件需要「不带桌面身分」的最小头族）：
+  **Authorization 一律由引擎注入**，外部写法（任意大小写）一律剥掉，凭据红线不变（两条用例钉死）。
+
+### 测试
+
+- 457 个测试全绿，零真实网络。新增 `tests/campaign.test.mjs`（13）、`tests/skillshare.test.mjs`（8）、
+  `tests/template-scenes.test.mjs`（9）、`tests-shell/campaign-routes.test.mjs`（8）、
+  `tests/sdk-import.test.mjs`（5）与 `replaceHeaders` 凭据边界的 2 条。
+
 ## 0.3.4 — 2026-11-11
 
 ### 修复

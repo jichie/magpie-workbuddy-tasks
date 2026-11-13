@@ -589,7 +589,7 @@ input[type="radio"] { accent-color: var(--accent); width: 14px; height: 14px; ma
 .segment span {
   display: inline-flex;
   align-items: center;
-  padding: 4px 11px;
+  padding: 4px 10px;
   border: 1px solid var(--line);
   border-radius: 999px;
   background: var(--surface);
@@ -1064,8 +1064,10 @@ details[open] > .acct-tasks-summary { color: var(--ink-2); border-bottom: 1px so
 .batch-buttons { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 /* 一行装得下（2026-11-11）：批量条 1190 宽里「任务腿 + 自动领奖 + 提示 + 5 个按钮」
    原本差约 27px，被 .batchbar 的 flex-wrap 挤到第二行 —— 左侧任务腿与右侧按钮不在
-   同一行了。收窄条内间距与按钮内边距把这 27px 找回来；窄屏仍由 flex-wrap 正常换行。 */
-.batchbar { gap: 10px 14px; }
+   同一行了。收窄条内间距与按钮内边距把这 27px 找回来；窄屏仍由 flex-wrap 正常换行。
+   2026-11-13：新增「活动任务」任务腿（0.3.5）又要多占约 76px，这里再把列间距从 14px
+   收到 12px、任务腿胶囊左右内边距 11px 收到 10px，找回足够余量，保住一行。 */
+.batchbar { gap: 10px 12px; }
 .batch-buttons .ghost-btn, .batch-buttons .btn { padding-left: 9px; padding-right: 9px; }
 
 .batch-status {
@@ -1721,6 +1723,108 @@ dialog::backdrop { background: rgba(8, 10, 14, .5); }
 .streak-note.warn-text { color: var(--warn); }
 .streak-run { color: var(--ink-2); }
 .streak-run.warn-text { color: var(--warn); }
+
+/* 账号单元格里「连登条 + 活动任务条」的竖排容器（0.3.5）。只是把两块竖起来，
+   活动任务条因此紧跟在连登条下面；连登条自身内容与样式一律不动。 */
+.acct-id-stack {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 3px;
+  min-width: 0;
+}
+
+/* 活动任务条（0.3.5，CONTRACT §11.1）：与连登条同级别、同风格（同一字号 / 色阶 / 行距）。
+   锚点 [data-campaign-cell] 供 updateCampaignArea() replaceWith 局部重绘（一账号一个）。 */
+.acct-campaign {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  min-width: 0;
+  font-size: 10.5px;
+  color: var(--ink-3);
+}
+/* 第 1 行汇总：一行到底，超出就省略号（不换行、不撑破账号列），与 .streak-line 同款 */
+.campaign-line {
+  display: block;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.campaign-empty { color: var(--ink-3); }
+.campaign-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+/* 条内按钮：沿用 .mini-btn 的配色/圆角，只缩字号与内边距（账号列窄） */
+.campaign-btn { font-size: 10.5px; padding: 2px 8px; }
+/* 说明行（最近一次结果 / 查询失败）：限两行 + 省略号，全文在 title 里，不把账号行顶高 */
+.campaign-note {
+  max-width: 100%;
+  font-size: 10.5px;
+  color: var(--ink-3);
+  line-height: 1.55;
+  word-break: break-word;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+/* 警示色必须显式保住（.campaign-note 的颜色在本表更后面会盖掉 .warn-text） */
+.campaign-note.warn-text { color: var(--warn); }
+.campaign-run { color: var(--ink-2); }
+.campaign-run.warn-text { color: var(--warn); }
+
+/* 活动任务明细小列表（默认折叠）：活动 → 任务名 + 进度 / 奖励 + 已领标记。
+   折叠状态记在 state.campaignOpen，3 秒轮询重建 DOM 不会把它折回去。 */
+.campaign-list { max-width: 100%; min-width: 0; }
+.campaign-list-summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 10.5px;
+  color: var(--ink-3);
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+}
+.campaign-list-summary::-webkit-details-marker { display: none; }
+.campaign-list-summary::marker { content: ""; }
+.campaign-list-summary::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  flex: none;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform .15s ease;
+  margin-top: -2px;
+}
+.campaign-list[open] > .campaign-list-summary::before { transform: rotate(45deg); margin-top: 0; }
+.campaign-list-summary:hover { color: var(--ink); }
+.campaign-list-label { font-weight: 600; color: var(--ink-2); }
+.campaign-list-body { padding-top: 4px; display: flex; flex-direction: column; gap: 2px; }
+.campaign-act { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; margin-top: 2px; }
+.campaign-act-label { font-weight: 600; color: var(--ink-2); font-size: 10.5px; }
+.campaign-act-meta { font-family: var(--font-mono); font-size: 10px; color: var(--ink-3); }
+.campaign-task {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding-left: 8px;
+  font-size: 10.5px;
+  color: var(--ink-3);
+}
+.campaign-task-name { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.campaign-task-prog { font-family: var(--font-mono); font-variant-numeric: tabular-nums; color: var(--ink-2); }
+.campaign-task-reward { font-family: var(--font-mono); color: var(--ok); }
+.campaign-task-claimed { color: var(--ok); font-weight: 600; }
+.campaign-task-empty { color: var(--ink-3); font-style: italic; }
 
 /* 连登日历：7 列小格子（周一…周日），只画最近 28 天（4–5 行、约 75px 高）。
    每格 12px，score=0 用中性色，>0 用强调色 + 透明度分 3 档
