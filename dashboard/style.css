@@ -1792,8 +1792,11 @@ dialog::backdrop { background: rgba(8, 10, 14, .5); }
        组头   .tgroup-head  12.5px/700/ink + .06em 字距 + 等宽计数 + hairline 下划线（不可点、恒展开）
        活动头 .tact-head    11.5px/600/ink-2，缩进 34px（组头与任务行之间），等宽 meta
        任务行 .trow          12.5px/500 标题 + 10.5px 等宽 code，行分隔 hairline，hover 轻底
-   · 所有 .trow 共用同一份 grid 模板（六格定宽 + 弹性主列），列跨行、跨组自然对齐；
-   · 数字全部等宽 tabular-nums，奖励右对齐；
+   · 所有 .trow 共用同一份 grid 模板（六格**全是定值宽**：主列 minmax(0, 上限) + 右侧四列
+     按内容定宽），列跨行、跨组自然对齐；剩余宽度不塞进主列，而是留在操作列之后
+     （justify-content: start，清单整体靠左聚合）—— 详见 .trow 的规则注释；
+   · 数字全部等宽 tabular-nums；宽屏清单里奖励列内左对齐（四列左缘齐平），
+     ≤820px 卡片里仍靠右；
    · 组内未完成在上、已领奖沉底进「已完成 N 项」（.tdone，默认收起，标题整体压暗一档）。 */
 
 .tgroup + .tgroup { margin-top: 14px; }
@@ -1839,12 +1842,41 @@ dialog::backdrop { background: rgba(8, 10, 14, .5); }
 }
 
 /* 任务行：六格网格（勾选 | 主 | 状态 | 进度 | 奖励 | 操作）。
-   定宽列跨行对齐；主列 minmax(0,1fr) 吃剩余宽度，长标题 overflow-wrap 换行不溢出。 */
+   2026-11-13 用户实机反馈「右边的内容太靠右了 挤在一起了」后的收敛口径（1280px 实测：
+   面板内容宽 1190、行内容宽 1150；改前主列 minmax(0,1fr) 独占 610px，而标题文字只有
+   ~76px → 标题与状态之间是 500px 的空洞，右侧四列全被顶到最右，操作列贴着面板边）：
+   · **主列不再吃满剩余宽度**：minmax(0, --trow-main-w) 封顶 220px。实测 32 行的主列
+     max-content 中位数只有 104px、最长 304.6px（= 标题 + code + 两行上游说明，本来就
+     是 -webkit-line-clamp:2 的引用块）；220px 能单行放下最长标题（187px）与最长 code
+     （wb_wechat_oa_subscribe_task 170px），超长的说明/徽章组优雅换行，不再撑出空洞。
+   · **剩余宽度全部留在操作列之后**：justify-content: start —— 清单整体靠左聚合。
+     1280px 下六格 + 列距合计 936px（26+220+4×150+5×18），行内容宽 1150 → 行内尾部
+     留白 214px、到面板内容右缘 234px（含行自身的 20px 右内边距）：留白与面板 padding
+     同侧，读起来是「清单没占满面板」，而不是「标题和状态之间裂开一条缝」。
+   · **右侧四列等宽（150px）+ 统一列距（18px）**：等宽 = 四列左缘严格等距（实测 pitch
+     恒为 168px），内容一律靠左 = 内容左缘就是轨道左缘，彼此有呼吸、不挤成一团。
+     150px 对每一列都够：状态最长徽章「已完成 · 待领奖」92.3、进度条 flex 撑到 112、
+     奖励最长「+200 积分 · +10 能量」111.6、操作按钮行「接取 + 复制深链」112.2
+     （说明文字另起一行，最长 100）。
+   · 列宽**必须是定值**（px / 上限 px），绝不能是 auto / max-content：每个 .trow 都是
+     独立的 grid 容器，按内容各自算一套列宽就会跨行错位（列对齐是这份清单的基本要求）。
+   · 主列用 minmax(0, …) 而不是固定 px：面板变窄时它先让位，右侧四列的定宽永不被压，
+     因此 821–1280px 之间任何宽度都不会横向溢出（≤820px 换成三行紧凑卡片，见下方）。 */
 .trow {
+  --trow-gap: 18px;
+  --trow-pick-w: 26px;
+  --trow-main-w: 220px;
+  --trow-col-w: 150px; /* 状态 / 进度 / 奖励 / 操作四列的最小宽度（等宽下限 → 左缘等距） */
   display: grid;
-  grid-template-columns: 26px minmax(0, 1fr) 100px 118px 96px 150px;
+  /* 右四列用 minmax(150px, 1fr)：等宽**且**吃掉剩余宽度 —— 行铺满面板（右缘与组头下划线对齐），
+     列内内容左对齐、间距均匀；定死 150px 时 1280 下会在行尾留下 235px 空洞（2026-11-13 实测）。 */
+  grid-template-columns:
+    var(--trow-pick-w) minmax(0, var(--trow-main-w))
+    minmax(var(--trow-col-w), 1fr) minmax(var(--trow-col-w), 1fr)
+    minmax(var(--trow-col-w), 1fr) minmax(var(--trow-col-w), 1fr);
   grid-template-areas: "pick main status prog reward act";
-  gap: 4px 10px;
+  gap: 4px var(--trow-gap);
+  justify-content: start;
   align-items: center;
   padding: 7px 20px;
   border-bottom: 1px solid var(--line);
@@ -1872,17 +1904,38 @@ dialog::backdrop { background: rgba(8, 10, 14, .5); }
 .trow-status { grid-area: status; min-width: 0; }
 .trow-prog { grid-area: prog; min-width: 0; }
 .trow-prog .prog-cell { min-width: 0; }
+/* 奖励：「+100 积分 · +5 能量」必须**单行**读完（改前 96px 列宽 + overflow-wrap:anywhere
+   把「能量」二字挤到了第二行）。列宽 --trow-col-w 150px（≤1100px 档 126px）≥ 实测最长
+   内容 111.6px，再用 white-space: nowrap 兜住 —— 数字/单位/间隔号绝不拆行；上游真给出
+   更长的金额时最多吃掉 18px 列距，不会压到操作列。
+   对齐：宽屏清单里**列内统一左对齐**（与状态/进度/操作三列一样，内容左缘 = 轨道左缘，
+   四列左缘等距）；等宽 + tabular-nums 保证金额纵向可比。≤820px 的卡片布局里轨道是
+   auto（贴内容），仍由 justify-self: end 靠右，两种布局各自内部一致。 */
 .trow-reward {
   grid-area: reward;
-  text-align: right;
+  min-width: 0;
+  text-align: left;
+  white-space: nowrap;
   font-family: var(--font-mono);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
   color: var(--ink-2);
-  overflow-wrap: anywhere;
 }
 .trow-act { grid-area: act; min-width: 0; }
-.trow-act .row-actions { justify-content: flex-end; }
+/* 操作列：按钮/链接靠左（左缘 = 轨道左缘，与其余三列齐平），列内间距 8px
+   （需求：文本与按钮之间 ≥8px，且不与奖励列贴死 —— 两列之间还有 18px 列距）。
+   说明文字（.muted：「引擎暂不点亮这项」/「不参与自动做任务」/「待跑一轮活动任务」…）
+   用 order + flex-basis:100% 落到按钮**下一行**独占一行：按钮之间不再被长文案挤开
+   （改前 150px 列宽下 [接取][引擎暂不点亮这项] 挤满一行、「复制深链」被甩到第二行
+   右缘，实测操作列内容宽 216px），行高也不变（主列本来就有标题 + code + 徽章 2–3 行）。
+   :only-child 时不介入 —— 操作列里只有一句说明（活动任务未跑的「待跑一轮活动任务」、
+   缺 jumpUrl 的「—」）就照常单行显示，不需要为它腾一行。 */
+.trow-act .row-actions { justify-content: flex-start; gap: 8px; }
+.trow-act .row-actions > .muted:not(:only-child) {
+  order: 9;
+  flex: 1 1 100%;
+  min-width: 0;
+}
 
 /* 「已完成 N 项」折叠块（默认收起）：比分组标题更轻，无底色；块内行整体压暗一档 */
 .tdone > .tdone-summary {
@@ -1977,6 +2030,16 @@ details[open] > .heat-summary::before { transform: rotate(45deg); margin-top: 0;
   .workbench { grid-template-columns: minmax(0, 1fr); }
   .acct-table { --acct-cols: 26px minmax(0, 1.3fr) 108px minmax(112px, 1fr) 112px 52px 94px; }
   .acct-head, .acct-grid { gap: 0 14px; }
+  /* 任务清单同档收窄（与 .acct-table 的 --acct-cols 一个套路）：四列等宽 150 → 126px
+     （仍等宽 = 左缘仍等距，pitch 140px），列距 18 → 14px；主列上限不动 —— minmax(0,220px)
+     会让它先让位，四列定宽永不被压。实测最长徽章 92.3 / 最长奖励 111.6 / 操作按钮行
+     112.2 在 126px 里仍各自单行放得下。822px（紧凑卡片断点前一格）主列让到 ~119px：
+     标题折两行但不溢出，再窄一格（≤820px）就整体换成三行紧凑卡片。 */
+  .trow {
+    --trow-gap: 14px;
+    --trow-pick-w: 24px;
+    --trow-col-w: 126px;
+  }
 }
 
 @media (max-width: 820px) {
@@ -2040,7 +2103,11 @@ details[open] > .heat-summary::before { transform: rotate(45deg); margin-top: 0;
 
   /* 任务清单窄屏（≤820px）：六格网格压成三行紧凑条目 ——
      ① 勾选 + 标题 + 状态徽章；② 进度 + 奖励（右对齐）；③ 操作。
-     勾选格纵跨三行；无横向溢出（主列 minmax(0,1fr)，长标题/code 换行）。 */
+     勾选格纵跨三行；无横向溢出（主列 minmax(0,1fr)，长标题/code 换行）。
+     第三列是 auto = 贴内容（状态徽章与奖励取较宽的那个）：奖励 nowrap 后仍单行，
+     420px 下实测进度列还剩 178px，不会挤出横向滚动条。
+     宽屏那条 justify-content: start 在这里是惰性的（minmax(0,1fr) 已把剩余宽度吃光），
+     --trow-* 变量也不再参与模板，无需重置。 */
   .trow {
     grid-template-columns: 24px minmax(0, 1fr) auto;
     grid-template-areas:
