@@ -190,3 +190,65 @@ test("runner：只勾活动任务时 growth 腿整腿跳过（绝不传空数组
     "跳过时连成长任务清单都不该拉（这是「空数组=全部」的反向放大防护）",
   );
 });
+
+// ---- 三套命名空间各归各腿（CONTRACT §11.6；2026-11-14 实测修正）-------------------
+// 之前把「非冒号码」一律当成 growth/mp 共用，结果：只勾了一个成长任务，mp 腿也拿到那串码
+// → 空跑一遍却显示「完成」，用户以为小程序任务被跑了。现在：mp 腿只接 MP 专属码
+// （isMPCode 同一判定源），且当本次 job 含 mp 腿时 growth 不再重复拿 MP 码。
+
+test("runner：只勾成长任务时 mp 腿整腿跳过（不再空跑成「完成」）", async () => {
+  const clock = fakeClock(DAY);
+  const backend = backendFor(clock, { chat_request_send: "chat_5" });
+  const runner = new JobRunner({
+    accounts: [makeAcct({ uid: "uid-A", nickname: "A" })],
+    now: clock.now,
+    sleep: clock.sleep,
+    fetch: backend.fetchImpl,
+  });
+  const job = runner.start({
+    legs: ["growth", "mp", "campaign"],
+    taskCodes: { "uid-A": ["chat_5"] },
+  });
+  const done = await runner.wait(job.id);
+
+  const mpStep = done.steps.find((s) => s.leg === "mp");
+  assert.equal(mpStep?.state, "skip", "mp 腿不该被跑（选中的码里没有 MP 专属码）");
+  assert.match(String(mpStep?.detail ?? ""), /不属于这条腿/);
+  const growthStep = done.steps.find((s) => s.leg === "growth");
+  assert.equal(growthStep?.state, "ok", "growth 腿照常做选中的成长任务");
+});
+
+test("runner：只勾 MP 专属码时 —— mp 腿跑、growth 腿跳过（MP 码不再被 growth 重复拿）", async () => {
+  const clock = fakeClock(DAY);
+  const backend = backendFor(clock, {});
+  const runner = new JobRunner({
+    accounts: [makeAcct({ uid: "uid-A", nickname: "A" })],
+    now: clock.now,
+    sleep: clock.sleep,
+    fetch: backend.fetchImpl,
+  });
+  const job = runner.start({
+    legs: ["growth", "mp"],
+    taskCodes: { "uid-A": ["Sequential_Tasks_1"] },
+  });
+  const done = await runner.wait(job.id);
+  const mpStep = done.steps.find((s) => s.leg === "mp");
+  const growthStep = done.steps.find((s) => s.leg === "growth");
+  assert.equal(growthStep?.state, "skip", "job 含 mp 腿时，MP 码交给 mp 腿，growth 跳过");
+  assert.notEqual(mpStep?.state, "skip", "mp 腿应当拿到这条 MP 码（因下游清单无此任务，结果可能是 ok/完成）");
+});
+
+test("runner：job 不含 mp 腿时，MP 码仍交给 growth 腿（2b 分支在同腿内处理小程序任务）", async () => {
+  const clock = fakeClock(DAY);
+  const backend = backendFor(clock, {});
+  const runner = new JobRunner({
+    accounts: [makeAcct({ uid: "uid-A", nickname: "A" })],
+    now: clock.now,
+    sleep: clock.sleep,
+    fetch: backend.fetchImpl,
+  });
+  const job = runner.start({ legs: ["growth"], taskCodes: { "uid-A": ["Sequential_Tasks_1"] } });
+  const done = await runner.wait(job.id);
+  const growthStep = done.steps.find((s) => s.leg === "growth");
+  assert.ok(growthStep && growthStep.state !== "skip", "没有 mp 腿时 MP 码归 growth（其 2b 分支负责）");
+});

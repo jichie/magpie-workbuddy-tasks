@@ -25,7 +25,7 @@ import { runCampaignTasks } from "./campaign.mjs"; // 运营活动任务腿（CO
 import { DEFAULT_GAP_MS, REFRESH_LEAD_MS } from "./constants.mjs";
 import { reportDailyActivity } from "./daily.mjs"; // 每日活跃（点亮成长中心连登，CONTRACT §7）
 import { uuidHex } from "./fingerprint.mjs";
-import { runMiniProgramTasks } from "./miniprogram.mjs"; // 小程序链式任务腿（CONTRACT §7）
+import { runMiniProgramTasks, isMPCode } from "./miniprogram.mjs"; // 小程序链式任务腿（CONTRACT §7）
 import { runStreakSteward } from "./streak.mjs"; // 连登管家腿（CONTRACT §10.1）
 import { accountGapMs } from "./schedule.mjs";
 import { eligibleAccounts } from "./store.mjs";
@@ -397,8 +397,18 @@ export class JobRunner {
           const all = job.spec.taskCodes?.[acct.uid];
           if (!Array.isArray(all) || !all.length) return null; // 未勾选 = 全部
           const isCampaignCode = (c) => String(c).includes(":");
+          // 三套命名空间各归各腿，别把别人的码当自己的（2026-11-14 实测：只勾了一个成长任务，
+          // mp 腿也拿到那串码 → 空跑一遍却显示「完成」，用户以为小程序任务被跑了）：
+          //   campaign 腿 = 含冒号的 `<活动>:<任务>`
+          //   mp 腿       = MP 专属码（Sequential_Tasks_* / school_season，走 isMPCode 同一判定源）
+          //   growth 腿   = 其余（**但当本次 job 含 mp 腿时，MP 专属码让给 mp 腿**，
+          //                 否则给 growth —— 那时它内部的 2b 分支会处理小程序任务）
           if (leg === "campaign") return all.filter(isCampaignCode);
-          if (leg === "growth" || leg === "mp") return all.filter((c) => !isCampaignCode(c));
+          if (leg === "mp") return all.filter((c) => !isCampaignCode(c) && isMPCode(c));
+          if (leg === "growth") {
+            const mpLegInJob = Array.isArray(job.spec.legs) && job.spec.legs.includes("mp");
+            return all.filter((c) => !isCampaignCode(c) && !(mpLegInJob && isMPCode(c)));
+          }
           return null; // 其它腿（streak/buddy/travel/night）没有任务码
         })();
 
