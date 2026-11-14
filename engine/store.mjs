@@ -126,6 +126,7 @@ export function loadAccounts(cfg) {
       key,
       provider,
       uid,
+      accountId: typeof entry.accountId === "string" ? entry.accountId : "",
       nickname: typeof entry.accountId === "string" && entry.accountId ? entry.accountId : uid,
       access,
       refresh: typeof entry.refresh === "string" ? entry.refresh : "",

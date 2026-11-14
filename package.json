@@ -13,7 +13,8 @@
     "page",
     "README.md",
     "CHANGELOG.md",
-    "install.md"
+    "install.md",
+    "docs/ACCOUNT_PROXY.md"
   ],
   "keywords": [
     "opencode",
@@ -30,9 +31,20 @@
       "title": "WorkBuddy 任务",
       "file": "page/index.html",
       "icon": "page/logo-mark.png",
-      "titles": { "zh": "WorkBuddy 任务" }
+      "titles": {
+        "zh": "WorkBuddy 任务"
+      }
     },
     "permissions": [],
-    "options": { "dashboardUrl": "", "listenAddress": "" }
+    "options": {
+      "dashboardUrl": "",
+      "listenAddress": ""
+    }
+  },
+  "dependencies": {
+    "http-proxy-agent": "7.0.2",
+    "https-proxy-agent": "7.0.6",
+    "node-fetch": "3.3.2",
+    "socks-proxy-agent": "8.0.5"
   }
 }

@@ -27,6 +27,7 @@
 // 铁律：账号 access/refresh token 永不出现在任何响应、SSE 或日志里
 //（只出现 uid / 昵称 / 「已登录」掩码）；对外文本一律过 scrub()。
 
+import { accountProxyFetch } from "./engine/account-proxy.mjs"
 import http from "node:http"
 import net from "node:net"
 import crypto from "node:crypto"
@@ -899,7 +900,9 @@ export async function startDaemon(opts = {}) {
       : null
 
   // ---- runner（settings 就绪后再构造；ctx 只依赖契约 §2 + runner 的可选 opts） ----
+  const fetchForAccount = (acct) => opts.fetch ?? accountProxyFetch(cfgDir, acct)
   const runnerCtx = {
+    fetchForAccount,
     cfgDir,
     stateDir,
     settings: () => readSettings(),
@@ -1141,7 +1144,7 @@ export async function startDaemon(opts = {}) {
   // 路径 —— 任何调用点新建 opts 都自动带上同一个 spacer，不存在「新 ctx 忘了对齐」。
   function engineOpts(acct = null) {
     return {
-      ...(opts.fetch ? { fetch: opts.fetch } : {}),
+      fetch: fetchForAccount(acct),
       now,
       sleep: sleepFn,
       gap: settings.gapMs,
@@ -1801,7 +1804,7 @@ export async function startDaemon(opts = {}) {
         continue
       }
       try {
-        const r = await up.callJSON(acct, "billing", `${up.billBase()}/billing/meter/daily-checkin`, { method: "POST" }, engineOpts())
+        const r = await up.callJSON(acct, "billing", `${up.billBase()}/billing/meter/daily-checkin`, { method: "POST" }, engineOpts(acct))
         if (r?.ok && r?.code === 0) {
           const d = r.data ?? {}
           const already = d.already === true || d.signed === true || /已签/.test(String(r.msg ?? ""))
@@ -1875,7 +1878,7 @@ export async function startDaemon(opts = {}) {
     }
     creditsBusy = true
     try {
-      const r = await fn(acct, engineOpts())
+      const r = await fn(acct, engineOpts(acct))
       if (r?.ok && r?.credits && typeof r.credits === "object") {
         creditsCache[uid] = r.credits
         saveCredits()
@@ -2331,6 +2334,7 @@ export async function startDaemon(opts = {}) {
     const entSkipped = enterpriseSkippedCountOf(all)
     const cur = runner?.current?.() ?? null
     const payload = {
+      accountProxyMode: "magpie-account-proxies-v1",
       // 绑定信息（B）：bindHost 是真实监听 host，绑定 0.0.0.0/:: 时 reachableHint
       // 提示 SSH 隧道/局域网地址（否则空串）。口径与 lifecycle.bindHint 一致；
       // 两个字段原样保留（向后兼容），但不再是前端显示地址的来源。

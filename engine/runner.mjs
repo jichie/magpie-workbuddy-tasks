@@ -253,7 +253,7 @@ export class JobRunner {
     if (!acct.refresh || !acct.expires) return;
     if (acct.expires - this._now() > REFRESH_LEAD_MS) return;
     const res = await refreshAccount(acct, {
-      fetch: this.opts.fetch,
+      fetch: this.opts.fetchForAccount?.(acct) ?? this.opts.fetch,
       now: this.opts.now,
       sleep: this.opts.sleep,
       env: this.opts.env,
@@ -357,7 +357,7 @@ export class JobRunner {
         const daily = await reportDailyActivity(acct, {
           now: this.opts.now,
           sleep: this.opts.sleep,
-          fetch: this.opts.fetch,
+          fetch: this.opts.fetchForAccount?.(acct) ?? this.opts.fetch,
           env: this.opts.env,
           base: this.opts.base,
           bases: this.opts.bases,
@@ -411,6 +411,7 @@ export class JobRunner {
         try {
           const legOpts = {
             ...this.opts,
+            fetch: this.opts.fetchForAccount?.(acct) ?? this.opts.fetch,
             log: logFn,
             claim: job.spec.claim,
             signal: ctrl.signal,

@@ -205,6 +205,10 @@ magpie plugin add /path/to/magpie-workbuddy-tasks
 - 夜猫子 `black_cat` 只在 23:00–08:00 计数，每天 1 次、累计 3 天。
 - 每日活跃在每个 job 的每个账号开跑前执行一次；同一北京日不重发。
 
+## 账户代理
+
+Tasks 自动复用 Magpie 中对应 WorkBuddy 账户的 HTTP(S)/SOCKS5(H) 代理，任务、手动操作和 Token 刷新均按账户路由；配置修改后下一次请求生效，代理失败不回退直连。原有安装/升级入口与 fetch 注入接口不变，详见 [账户代理与兼容说明](docs/ACCOUNT_PROXY.md)。
+
 ## 数据与隐私
 
 - **不采集、不上报**：没有遥测、没有分析、没有第三方请求。唯一的出站流量是你要它发的 WorkBuddy 上游请求，以及 magpie 自己负责的 GitHub 更新检查。
