@@ -79,9 +79,9 @@ import { beijingDateKey, beijingHour, DEFAULT_GAP_MS, MIN_UPSTREAM_GAP_MS } from
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const VERSION = (() => {
   try {
-    return String(JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf8")).version || "0.4.0")
+    return String(JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf8")).version || "0.4.1")
   } catch {
-    return "0.4.0"
+    return "0.4.1"
   }
 })()
 
@@ -1445,21 +1445,41 @@ export async function startDaemon(opts = {}) {
   // magpie 本体的签到账本 → 今日（北京日）每个账号的签到积分。
   // `/config/magpie/plugin-checkin.json`，形如
   // `{ "workbuddy|workbuddy#abc": { day, outcome, credit } }`：
-  //   · 键的右半是 plugin-auth.json 的条目名（"workbuddy" / "workbuddy#xxxx"），
-  //     老版本（plugins#254 之前）用的是展示名，magpie 自带的签到用 uid —— 三种都认；
+  //   · 键的右半是 plugin-auth.json 的条目名（"workbuddy" / "workbuddy#xxxx"）；
+  //     实测（2026-11-24 生产账本）确认右半与 plugin-auth.json 的条目键逐字一致，
+  //     另兼容按 uid / 展示名（nickname）写的条目，三种都认；
   //   · 只认 day = 北京今日、outcome = claimed/done、credit > 0 的条目；
   //   · 只认 vendor 是 workbuddy 的（Trae/Qoder 的签到不属于本插件的积分口径）；
   //   · 认不出来的条目一律不计 —— 宁可少算，绝不把别人的分数记到某个账号头上。
   // 只读：这个文件是 magpie 的，本插件绝不写它。
-  function magpieCheckinCreditsByUid(today) {
+  //
+  // 读盘节流（看板 3 秒轮询 /api/state 会反复调 computeStats）：账本是 magpie
+  // 自己的写入点、本插件只读，按 mtime+size 做签名缓存 —— 文件没变就不重复解析，
+  // 也不重复 loadAccountsAll()。签名变化（magpie 刚签完）立刻重读，不靠 TTL 猜。
+  let checkinLedgerCache = { sig: "", raw: null }
+  function readCheckinLedger() {
+    let st = null
+    try {
+      st = statSync(magpieCheckinFile)
+    } catch {
+      checkinLedgerCache = { sig: "", raw: null }
+      return null // 文件不存在 = 不启用该口径（本插件手签历史行仍然有效）
+    }
+    const sig = `${st.mtimeMs}:${st.size}`
+    if (checkinLedgerCache.sig === sig) return checkinLedgerCache.raw
     const raw = readJson(magpieCheckinFile, null)
+    checkinLedgerCache = { sig, raw }
+    return raw
+  }
+
+  function magpieCheckinCreditsByUid(today) {
+    const raw = readCheckinLedger()
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return new Map()
     const byLogin = new Map()
     for (const a of loadAccountsAll()) {
       if (a.key) {
         byLogin.set(String(a.key), a.uid)
-        // "workbuddy#abc" 的裸后缀也要能对上（老版本账本的键是展示名/uid，
-        // 有的写入方只留 # 后那截）
+        // "workbuddy#abc" 的裸后缀也要能对上（有的写入方只留 # 后那截）
         const hash = String(a.key).indexOf("#")
         if (hash >= 0) byLogin.set(String(a.key).slice(hash + 1), a.uid)
       }

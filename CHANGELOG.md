@@ -21,6 +21,22 @@
 - 全量 **686 用例**全绿（新增 `tests-shell/checkin-stats.test.mjs` 4 例：手签落账 / pending 不入账 / 本体账本计入 / 两边去重）。
 - `node --check daemon.mjs`、`node --check dashboard/app.js` 通过。
 
+### 合并后的维护者补充（PR #7 by @tonkevip 之后）
+
+- **版本号补齐六处**：PR 只改了 4 处（`package.json` / `index.mjs` / `page` 页脚 / `dashboard` meta），
+  漏了 `daemon.mjs` 的两处兜底字面量 —— 那两处是「`package.json` 读不到时 `/api/hello` 报什么版本」，
+  漏了会在异常路径上报旧版本、看板误挂「守护进程版本落后」胶囊。
+- **`docs/CONTRACT.md` 补三处**：§3 的 `stats` 加 `checkinCreditsToday`；`/api/history` 补 `leg:"checkin"`
+  行口径（不进 `LEGS`、不带 `jobId`、`trigger` 恒 manual）；§10.4 新增「签到收益归位」小节
+  （手签落历史 / 并读 magpie `plugin-checkin.json` 的匹配与过滤规则 / 按账号取较大值去重 /
+  只读不写 magpie 文件）。
+- **账本读盘节流**（PR 里的 P2）：看板 3 秒轮询 `/api/state` 会反复调 `computeStats`，原先每次
+  都重新 `readJson` 账本并 `loadAccountsAll()`。现在按 **`mtime+size` 签名缓存**：文件没变不重复
+  解析；magpie 刚写完（签名变）立刻重读，不靠 TTL 猜。附 2 条回归（缓存命中不叠加 / 变更立刻生效）。
+- 顺手把注释里无法验证的外部版本断言（「plugins#254 之前」）换成实测口径（2026-11-24 生产账本
+  确认键右半 = `plugin-auth.json` 条目键）。
+- 全量 **688 用例**全绿（+2）。
+
 ## 0.4.0 — 2026-11-17
 
 **界面优化版**：由用户提供的一版 UI 方案，本仓库实装、跑通全部测试并部署验证。**纯界面改动，行为与接口零变化** —— `engine/` 全部模块、`lifecycle.mjs`、`page/app.js` 与 0.3.9 逐字节一致（已逐文件比对确认）；`daemon.mjs`/`index.mjs`/`package.json` 只有版本字面量 0.3.9 → 0.4.0。

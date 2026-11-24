@@ -188,4 +188,61 @@ describe("签到收益进「今日积分」（issue #6）", () => {
       env.cleanup()
     }
   })
+
+  // 生产账本的真实形状（2026-11-24 实测）：键是 "<vendor>|<plugin-auth 条目键>"，
+  // 条目里除 day/outcome/credit 还带 at/streak/claimed 等字段 —— 多出来的字段不能
+  // 影响判定。这条用例把真实账本的整体形状搬进沙箱，防止"只在合成数据上对"。
+  test("生产账本真实形状（含 at/streak/claimed 等额外字段）照常计入", async () => {
+    const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai" }).format(new Date())
+    const env = await boot([{ ok: true, status: 200, code: 0, msg: "签到成功", data: { credit: 100 } }], {
+      "workbuddy|workbuddy": {
+        day: today,
+        at: new Date().toISOString(),
+        outcome: "claimed",
+        credit: 100,
+        streak: 55,
+        claimed: new Date().toISOString(),
+      },
+      "workbuddy|ck02": { day: today, at: new Date().toISOString(), outcome: "claimed", credit: 100, streak: 55 },
+      "doubao|doubao": { day: today, at: new Date().toISOString(), outcome: "failed", msg: "豆包返回未知错误" },
+      "loomy|loomy": { day: today, at: new Date().toISOString(), outcome: "done", msg: "每日赠送积分已刷新" },
+    })
+    try {
+      const st = await get(env.h.port, "/api/state")
+      assert.equal(st.stats.checkinCreditsToday, 200, "只算两个 workbuddy 账号；doubao/loomy 不计")
+    } finally {
+      await env.h.stop()
+      env.cleanup()
+    }
+  })
+
+  // 看板 3 秒轮询 /api/state 会反复调 computeStats：账本按 mtime+size 签名缓存，
+  // 文件没变不重复解析；magpie 刚写完（签名变）必须立刻看到新值，不能靠 TTL 等。
+  test("账本读盘按签名缓存：未变更不重复解析，变更后立刻生效", async () => {
+    const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai" }).format(new Date())
+    const env = await boot([{ ok: true, status: 200, code: 0, msg: "签到成功", data: { credit: 100 } }], {
+      "workbuddy|workbuddy": { day: today, outcome: "claimed", credit: 100 },
+    })
+    try {
+      const a = await get(env.h.port, "/api/state")
+      assert.equal(a.stats.checkinCreditsToday, 100)
+      // 再读两次：命中缓存，值不变（且不会因为重复解析而叠加）
+      assert.equal((await get(env.h.port, "/api/state")).stats.checkinCreditsToday, 100)
+      assert.equal((await get(env.h.port, "/api/state")).stats.checkinCreditsToday, 100)
+      // magpie 又给第二个账号签了（签名变）→ 立刻反映，无需等 TTL
+      writeFileSync(
+        join(env.cfg.dir, "plugin-checkin.json"),
+        JSON.stringify({
+          "workbuddy|workbuddy": { day: today, outcome: "claimed", credit: 100 },
+          "workbuddy|ck02": { day: today, outcome: "claimed", credit: 100 },
+        }),
+        "utf8",
+      )
+      const b = await get(env.h.port, "/api/state")
+      assert.equal(b.stats.checkinCreditsToday, 200, "账本变更后必须立刻重读，不靠 TTL")
+    } finally {
+      await env.h.stop()
+      env.cleanup()
+    }
+  })
 })
