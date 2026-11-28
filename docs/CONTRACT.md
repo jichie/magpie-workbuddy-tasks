@@ -85,7 +85,7 @@ callJSON(acct, kind, url, init, opts) -> {ok, status, code, data, msg, raw}
   // kind: 'chat'|'billing'|'web'；统一 {code,msg,data} 信封；code===0 为成功
   // 3 次线性退避重试；403/11140 → {restricted:true}（由 runner 冻结账号，§10.5）
   // 例外（§10.5 良性 403 白名单）：403 且 msg 归一后**精确全等**命中已知业务拒绝
-  // （"no active buddy" / "连续登录天数不足"）→ 不置 restricted，按普通业务失败
+  // （"no active buddy" / "连续登录天数不足" / "no unclaimed travel"）→ 不置 restricted，按普通业务失败
   // 返回并带 benign403:true（绝不模糊包含；白名单外的 403 行为完全不变）
   // chat 主机失败（TLS reset）→ 回退到 https://www.workbuddy.cn，X-Domain 不变
   // 重试/回退也是「两次上游调用」：任意相邻两次 HTTP 尝试间隔 ≥ gap（铁律 4）
