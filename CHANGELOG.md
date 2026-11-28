@@ -1,5 +1,24 @@
 # 更新日志
 
+## 0.4.4 — 2026-11-28
+
+**修复猫猫旅行 `no unclaimed travel` 误冻结账号 + 看板顶栏 GitHub 入口**（社区 issue #10 / PR #11 by `@WW-shan`）。
+
+### 修
+
+- **猫猫旅行领奖遇到 `no unclaimed travel` 不再冻结账号**（issue #10 / PR #11 by `@WW-shan`）：
+  - `engine/upstream.mjs` 将精确文案 `"no unclaimed travel"` 加入良性 403 白名单 `BENIGN_403_MSGS`（保持 `trim().toLowerCase()` 精确全等匹配；若信封带 `code: 11140` 仍按风控处理）。
+  - `engine/travel.mjs` 的 `travel/claim` 分支在确认未触发 `restricted` 后识别该良性 403，返回正常跳过结果（`ok: true, action: "idle"`：「没有可领取的旅行奖励，本轮跳过」），不再触发永久冻结。
+
+### 新增
+
+- **看板顶栏新增 GitHub 项目主页快捷按钮**：
+  - `dashboard/index.html` 与 `dashboard/style.css` 在右上角主题切换按钮左侧新增 GitHub 图标入口，点击在新标签页打开仓库主页。
+
+### 自查
+
+- 全量测试 699 项用例（82 suites）全部通过，含 `release-consistency` 与 `BENIGN_403_MSGS` 精确全等 / `code: 11140` 反例回归。
+
 ## 0.4.3 — 2026-11-27
 
 **修复插件宿主重启或其它插件自动更新后守护进程被误关的问题**（社区 issue #9）。
